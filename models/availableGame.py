@@ -1,6 +1,8 @@
 from sqlalchemy import Column, Integer, String, ForeignKey
 from sqlalchemy.orm import relationship
 from db.extensions import db
+from .vendor import Vendor  # Replace .vendor with the correct path to Vendor
+
 
 class AvailableGame(db.Model):
     __tablename__ = 'available_games'
@@ -11,6 +13,8 @@ class AvailableGame(db.Model):
     total_slot = Column(Integer, nullable=False)
     single_slot_price = Column(Integer, nullable=False)
     
+    vendor = relationship('Vendor', back_populates='available_games')
+
     # Relationship with Slot (one-to-many)
     slots = relationship('Slot', back_populates='available_game', cascade="all, delete-orphan")
 
@@ -22,5 +26,6 @@ class AvailableGame(db.Model):
             'game_id': self.id,
             'vendor_id': self.vendor_id,
             'game_name': self.game_name,
-            'single_slot_price': self.single_slot_price
+            'single_slot_price': self.single_slot_price,
+            'cafe_name':self.vendor.to_dict_for_booking()
         }
