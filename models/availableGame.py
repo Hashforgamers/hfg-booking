@@ -1,7 +1,15 @@
-from sqlalchemy import Column, Integer, String, ForeignKey
+from sqlalchemy import Column, Integer, String, ForeignKey, Table
 from sqlalchemy.orm import relationship
 from db.extensions import db
-from .vendor import Vendor  # Replace .vendor with the correct path to Vendor
+from models.vendor import Vendor  # Replace .vendor with the correct path to Vendor+
+
+# ✅ Define the association table before using it in the models
+available_game_console = Table(
+    'available_game_console',
+    db.Model.metadata,
+    Column('available_game_id', Integer, ForeignKey('available_games.id'), primary_key=True),
+    Column('console_id', Integer, ForeignKey('consoles.id'), primary_key=True)
+)
 
 
 class AvailableGame(db.Model):

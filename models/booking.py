@@ -21,6 +21,9 @@ class Booking(db.Model):
     # Relationship with Slot (many-to-one)
     slot = relationship('Slot', back_populates='bookings')
 
+    # Add relationship to transactions
+    transaction = relationship('Transaction', back_populates='booking', uselist=False)
+
     def __repr__(self):
         return f"<Booking user_id={self.user_id} game_id={self.game_id}>"
 

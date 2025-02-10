@@ -4,3 +4,13 @@ Flask-Migrate==4.0.4
 psycopg2-binary==2.9.6
 Werkzeug==2.3.4
 Flask-Mail
+Flask-SocketIO
+python-socketio
+flask-cors
+gevent
+redis
+gevent-websocket
+rq
+rq-scheduler
+rq-dashboard
+redis-cli

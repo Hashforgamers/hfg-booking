@@ -1,14 +1,18 @@
 version: '3.8'
+
 services:
   booking_service:
     build: .
     ports:
-      - "5053:5053"
+      - "5054:5054"   # Flask App
+      - "9182:9181"   # RQ Dashboard
     environment:
       - FLASK_APP=app.py
       - FLASK_RUN_HOST=0.0.0.0
       - DATABASE_URI=postgresql://neondb_owner:Od9UnVJ2Wvfr@ep-rapid-lake-a8yqbhfk.eastus2.azure.neon.tech/neondb?sslmode=require
       - DEBUG_MODE=true
+      - REDIS_URL=rediss://red-cuckobin91rc73ehre70:jwU46zf0vCNpNu1PJsVAQzps4DhIIgV2@singapore-redis.render.com:6379
     volumes:
       - .:/app
-    command: ["python", "app.py"]
+    command: >
+      sh -c "python app.py & rq worker --url $$REDIS_URL booking_tasks & rq-dashboard --redis-url $$REDIS_URL --port 9181 & rqscheduler --url $$REDIS_URL --interval 60"
