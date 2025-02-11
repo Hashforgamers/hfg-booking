@@ -54,6 +54,8 @@ def create_app():
 
     # Initialize Redis connection
     redis_conn = Redis.from_url(app.config['REDIS_URL'])
+    redis_conn.set('key', 'redis-py')
+    redis_conn.get('key')
     app.logger.info(f"Ping Redis: {redis_conn.ping()}") 
 
     # Create RQ Queue & Scheduler
