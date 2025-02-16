@@ -14,6 +14,7 @@ from models.vendor import Vendor
 from models.user import User
 from models.contactInfo import ContactInfo
 from models.console import Console
+from models.contactInfo import ContactInfo
 
 from sqlalchemy.sql import text
 from sqlalchemy.orm import joinedload
@@ -23,45 +24,6 @@ from sqlalchemy.exc import SQLAlchemyError
 
 
 booking_blueprint = Blueprint('bookings', __name__)
-
-# @booking_blueprint.route('/bookings', methods=['POST'])
-# def create_booking():
-#     current_app.logger.info(f"Current App in Blueprint {current_app}")
-#     data = request.json
-#     slot_id = data.get("slot_id")
-#     user_id = data.get("user_id")
-#     game_id = data.get("game_id")
-
-#     if not slot_id or not user_id or not game_id:
-#         return jsonify({"message": "slot_id, game_id, and user_id are required"}), 400
-
-#     slot = Slot.query.get(slot_id)
-
-#     if not slot:
-#         return jsonify({"message": "Slot not found"}), 404
-
-#     if not slot.is_available or slot.available_slot <= 0:
-#         return jsonify({"message": "Slot is fully booked"}), 400
-
-#     try:
-#         # Decrease available slots by 1
-#         slot.available_slot -= 1
-#         if slot.available_slot == 0:
-#             slot.is_available = False
-
-#         socketio = current_app.extensions['socketio']
-        
-#         booking = BookingService.create_booking(slot_id,game_id,user_id,socketio)
-#         db.session.commit()
-
-#         # Pass only the slot_id, the job will set up the app context
-#         scheduler = current_app.extensions['scheduler']
-#         scheduler.enqueue_in(timedelta(seconds=10), BookingService.release_slot, slot_id, booking.id)
-
-#         return jsonify({"message": "Slot frozen for 10 seconds", "slot_id": slot_id}), 200
-#     except Exception as e:
-#         db.session.rollback()
-#         return jsonify({"message": "Failed to freeze slot", "error": str(e)}), 500
 
 @booking_blueprint.route('/bookings', methods=['POST'])
 def create_booking():
@@ -163,7 +125,7 @@ def confirm_booking():
                 booking_id=booking.id,
                 vendor_id=vendor.id,
                 user_id=user.id,
-                booking_date=datetime.utcnow().date(),
+                booked_date=datetime.utcnow().date(),
                 booking_time=datetime.utcnow().time(),
                 user_name=user.name,
                 amount=available_game.single_slot_price,
@@ -207,7 +169,7 @@ def direct_booking():
 
     user_id = data.get("user_id")
     game_id = data.get("game_id")
-    booking_date = data.get("booking_date")
+    booked_date = data.get("booked_date")
     selected_slots = data.get("selected_slots", [])
     console_type = data.get("console_type")
     system_number = data.get("system_number")
@@ -218,8 +180,8 @@ def direct_booking():
     user = db.session.query(User).filter(User.id == user_id).first()
     user_name = user.name
 
-    if not user_id or not game_id or not booking_date or not selected_slots:
-        return jsonify({"message": "user_id, game_id, booking_date, and selected_slots are required"}), 400
+    if not user_id or not game_id or not booked_date or not selected_slots:
+        return jsonify({"message": "user_id, game_id, booked_date, and selected_slots are required"}), 400
 
     try:
         socketio = current_app.extensions['socketio']
@@ -236,9 +198,9 @@ def direct_booking():
                 SELECT slot_id, available_slot, is_available
                 FROM VENDOR_{vendor_id}_SLOT
                 WHERE slot_id IN (SELECT id FROM slots WHERE start_time IN :selected_slots)
-                AND date = :booking_date
+                AND date = :booked_date
             """),
-            {"selected_slots": tuple(selected_slots), "booking_date": booking_date}
+            {"selected_slots": tuple(selected_slots), "booked_date": booked_date}
         ).fetchall()
 
         # ✅ Check if all slots are available
@@ -270,9 +232,9 @@ def direct_booking():
                     SET available_slot = available_slot - 1,
                         is_available = CASE WHEN available_slot - 1 = 0 THEN FALSE ELSE is_available END
                     WHERE slot_id = :slot_id
-                    AND date = :booking_date;
+                    AND date = :booked_date;
                 """),
-                {"slot_id": slot_id, "booking_date": booking_date}
+                {"slot_id": slot_id, "booked_date": booked_date}
             )
 
         db.session.commit()  # ✅ Commit only after all bookings succeed
@@ -283,7 +245,7 @@ def direct_booking():
                 booking_id=booking.id,  # Linking each booking
                 vendor_id=vendor_id,
                 user_id=user_id,
-                booking_date=datetime.strptime(booking_date, "%Y-%m-%d").date(),
+                booked_date=datetime.strptime(booked_date, "%Y-%m-%d").date(),
                 booking_time=datetime.utcnow().time(),
                 user_name=user_name,
                 amount=available_game.single_slot_price,  # Assuming the amount is per slot
@@ -346,9 +308,9 @@ def reject_booking():
             text(f"""
                 UPDATE VENDOR_{booking.transaction.vendor_id}_SLOT
                 SET available_slot = available_slot + 1, is_available = TRUE
-                WHERE slot_id = :slot_id AND date = :booking_date
+                WHERE slot_id = :slot_id AND date = :booked_date
             """),
-            {"slot_id": booking.slot_id, "booking_date": booking.transaction.booking_date}
+            {"slot_id": booking.slot_id, "booked_date": booking.transaction.booked_date}
         )
 
         # Update booking status
@@ -359,7 +321,7 @@ def reject_booking():
             booking_id=booking.id,
             vendor_id=booking.transaction.vendor_id,
             user_id=booking.user_id,
-            booking_date=datetime.utcnow().date(),
+            booked_date=datetime.utcnow().date(),
             booking_time=datetime.utcnow().time(),
             user_name=f"{booking.transaction.user_name} {repayment_type.upper()}-{booking.transaction.id}",
             amount=-booking.transaction.amount,  # Negative amount for refund
@@ -430,7 +392,7 @@ def get_booking_details(booking_id):
             "success": True,
             "booking": {
                 "booking_id": f"BK-{booking.id}",  
-                "date": transaction.booking_date.strftime("%Y-%m-%d"),
+                "date": transaction.booked_date.strftime("%Y-%m-%d"),
                 "time_slot": {
                     "start_time": slot.start_time.strftime("%H:%M"),
                     "end_time": slot.end_time.strftime("%H:%M")
@@ -465,13 +427,13 @@ def update_booking(booking_id):
         transactions = db.session.query(Transaction).filter(Transaction.booking_id == booking.id).all()
 
         vendor_id = available_game_id.vendor_id  # Get vendor ID from booking
-        booking_date = transactions[0].booking_date  # Assuming transactions have a booking_date, use the first one
+        booked_date = transactions[0].booked_date  # Assuming transactions have a booked_date, use the first one
 
         # ✅ Fetch associated slots from `VENDOR_{vendor_id}_SLOT`
         vendor_slot_table = f'VENDOR_{vendor_id}_SLOT'
-        existing_slots_query = text(f"SELECT slot_id, is_available FROM {vendor_slot_table} WHERE date = :booking_date AND vendor_id = :vendor_id")
+        existing_slots_query = text(f"SELECT slot_id, is_available FROM {vendor_slot_table} WHERE date = :booked_date AND vendor_id = :vendor_id")
         existing_slots = db.session.execute(existing_slots_query, {
-            "booking_date": booking_date, "vendor_id": vendor_id
+            "booked_date": booked_date, "vendor_id": vendor_id
         }).fetchall()
         existing_slot_ids = {slot.slot_id for slot in existing_slots}
 
@@ -521,12 +483,12 @@ def update_booking(booking_id):
                             UPDATE {vendor_slot_table} 
                             SET is_available = TRUE, available_slot = available_slot + 1
                             WHERE slot_id = :slot_id 
-                            AND date = :booking_date
+                            AND date = :booked_date
                             AND vendor_id = :vendor_id
                         """)
                         db.session.execute(release_slot_query, {
                             "slot_id": slot_id,
-                            "booking_date": booking_date,
+                            "booked_date": booked_date,
                             "vendor_id": vendor_id
                         })
 
@@ -536,12 +498,12 @@ def update_booking(booking_id):
                             UPDATE {vendor_slot_table} 
                             SET is_available = FALSE, available_slot = available_slot - 1
                             WHERE slot_id = :slot_id 
-                            AND date = :booking_date
+                            AND date = :booked_date
                             AND vendor_id = :vendor_id
                         """)
                         db.session.execute(assign_slot_query, {
                             "slot_id": slot_id,
-                            "booking_date": booking_date,
+                            "booked_date": booked_date,
                             "vendor_id": vendor_id
                         })
 
@@ -594,3 +556,200 @@ def get_vendor_bookings(vendor_id):
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@booking_blueprint.route('/newBooking/vendor/<int:vendor_id>/', methods=['POST'])
+def new_booking(vendor_id):
+    """
+    Creates a new booking for the given vendor, checking for existing users or creating a new one.
+    """
+    try:
+        current_app.logger.info("New Booking Triggered")
+        data = request.json
+
+        console_type = data.get("consoleType")
+        name = data.get("name")
+        email = data.get("email")
+        phone = data.get("phone")
+        booked_date = data.get("bookedDate")
+        slot_ids = data.get("slotId")  # List of slot IDs
+        payment_type = data.get("paymentType")
+
+        if not all([name, email, phone, booked_date, slot_ids, payment_type]):
+            return jsonify({"message": "Missing required fields"}), 400
+
+        # Check if user already exists
+        user = db.session.query(User).join(ContactInfo).filter(ContactInfo.email == email).first()
+
+        if not user:
+            # Create a new user
+            user = User(
+                fid=email,
+                avatar_path="Not defined",
+                name=name,
+                game_username=name.lower().replace(" ", "_"),
+                parent_type="user"
+            )
+
+            contact_info = ContactInfo(
+                phone=phone,
+                email=email,
+                parent_id=user.id,
+                parent_type="user"
+            )
+
+            user.contact_info = contact_info
+
+            db.session.add(user)
+            db.session.flush()
+
+        # Fetch the available game details
+        available_game = db.session.query(AvailableGame).filter_by(vendor_id=vendor_id).first()
+
+        if not available_game:
+            return jsonify({"message": "Game not found for this vendor"}), 404
+
+        # Check slot availability for all requested slots
+        placeholders = ", ".join([f":slot_id_{i}" for i in range(len(slot_ids))])
+        slot_params = {f"slot_id_{i}": slot_id for i, slot_id in enumerate(slot_ids)}
+
+        slot_entries = db.session.execute(
+            text(f"""
+                SELECT slot_id, available_slot, is_available
+                FROM VENDOR_{vendor_id}_SLOT
+                WHERE slot_id IN ({placeholders})
+                AND date = :booked_date
+            """),
+            {"booked_date": booked_date, **slot_params}
+        ).fetchall()
+
+        # Ensure all requested slots exist and are available
+        if len(slot_entries) != len(slot_ids):
+            return jsonify({"message": "One or more slots not found or unavailable"}), 400
+
+        for slot in slot_entries:
+            if slot[1] <= 0 or not slot[2]:  # available_slot <= 0 or is_available = False
+                return jsonify({"message": f"Slot {slot[0]} is fully booked"}), 400
+
+        # Begin transaction
+        bookings = []
+        for slot_id in slot_ids:
+            slot_obj = db.session.query(Slot).filter_by(id=slot_id).first()
+            available_game = db.session.query(AvailableGame).filter_by(id=slot_obj.gaming_type_id).first()
+            
+            booking = Booking(
+                slot_id=slot_id,
+                game_id=available_game.id,
+                user_id=user.id,
+                status="confirmed"
+            )
+            db.session.add(booking)
+            db.session.flush()  # Get the booking ID
+            bookings.append(booking)
+
+        # Decrease available slot count for all booked slots
+        db.session.execute(
+            text(f"""
+                UPDATE VENDOR_{vendor_id}_SLOT
+                SET available_slot = available_slot - 1,
+                    is_available = CASE WHEN available_slot - 1 = 0 THEN FALSE ELSE is_available END
+                WHERE slot_id IN ({placeholders})
+                AND date = :booked_date;
+            """),
+            {"booked_date": booked_date, **slot_params}
+        )
+
+        db.session.commit()  # Commit all bookings before creating transactions
+
+        # Create transactions for each booking
+        transactions = []
+        for booking in bookings:
+            transaction = Transaction(
+                booking_id=booking.id,
+                vendor_id=vendor_id,
+                user_id=user.id,
+                booked_date=datetime.strptime(booked_date, "%Y-%m-%d").date(),
+                booking_time=datetime.utcnow().time(),
+                user_name=user.name,
+                amount=available_game.single_slot_price,
+                mode_of_payment=payment_type,
+                booking_type="direct",
+                settlement_status="NA" if payment_type != "paid" else "completed"
+            )
+            db.session.add(transaction)
+            transactions.append(transaction)
+
+        db.session.commit()
+
+        socketio = current_app.extensions['socketio']
+
+        # Emit event for each booked slot
+        for booking in bookings:
+            socketio.emit('slot_booked', {
+                'slot_id': booking.slot_id,
+                'booking_id': booking.id,
+                'status': 'booked'
+            })
+
+        return jsonify({
+            "message": "Booking confirmed successfully",
+            "booking_ids": [b.id for b in bookings],
+            "transaction_ids": [t.id for t in transactions]
+        }), 200
+
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"Failed to process booking: {str(e)}")
+        return jsonify({"message": "Failed to process booking", "error": str(e)}), 500
+
+@booking_blueprint.route('/getAllBooking/vendor/<int:vendor_id>/<string:date>/', methods=['GET'])
+def get_all_booking(vendor_id, date):
+    """
+    Retrieves all booking details for a given vendor from the given date onwards.
+    """
+    try:
+        current_app.logger.info("Fetching all bookings for vendor_id=%s from date=%s onwards", vendor_id, date)
+
+        # Convert date format (YYYYMMDD → YYYY-MM-DD)
+        formatted_date = datetime.strptime(date, "%Y%m%d").date()
+
+        # Query to fetch booking details for given vendor from the date onwards
+        results = db.session.query(
+            Booking.id.label("bookingId"),
+            Transaction.booked_date.label("bookingDate"),
+            Transaction.booking_time.label("bookingTime"),
+            User.name.label("userName"),
+            AvailableGame.game_name.label("consoleType"),
+            AvailableGame.id.label("consoleTypeId"),
+            Transaction.booked_date.label("bookedDate"),
+            Slot.start_time.label("startTime"),
+            Slot.end_time.label("endTime"),
+            Booking.status.label("status"),
+            Transaction.booking_type.label("type")
+        ).join(Transaction, Booking.id == Transaction.booking_id) \
+         .join(User, Booking.user_id == User.id) \
+         .join(AvailableGame, Booking.game_id == AvailableGame.id) \
+         .join(Slot, Booking.slot_id == Slot.id) \
+         .filter(Transaction.vendor_id == vendor_id, Transaction.booked_date >= formatted_date) \
+         .order_by(Transaction.booked_date.asc()) \
+         .all()
+
+        # Convert results into a structured list
+        bookings = [{
+            "bookingId": row.bookingId,
+            "bookingDate": row.bookingDate.strftime("%Y-%m-%d"),
+            "bookingTime": row.bookingTime.strftime("%H:%M:%S"),
+            "userName": row.userName,
+            "consoleType": row.consoleType,
+            "consoleTypeId": row.consoleTypeId,
+            "bookedDate": row.bookedDate.strftime("%Y-%m-%d"),
+            "startTime": row.startTime.strftime("%H:%M:%S"),
+            "endTime": row.endTime.strftime("%H:%M:%S"),
+            "status": row.status,
+            "type": row.type
+        } for row in results]
+
+        return jsonify(bookings), 200
+
+    except Exception as e:
+        current_app.logger.error(f"Failed to fetch bookings: {str(e)}")
+        return jsonify({"message": "Failed to fetch bookings", "error": str(e)}), 500
