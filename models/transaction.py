@@ -10,6 +10,7 @@ class Transaction(db.Model):
     booking_id = Column(Integer, ForeignKey('bookings.id'), nullable=False)
     vendor_id = Column(Integer, ForeignKey('vendors.id'), nullable=False)
     user_id = Column(Integer, nullable=False)
+    booked_date = Column(Date, default=datetime.utcnow().date(), nullable=False)
     booking_date = Column(Date, default=datetime.utcnow().date(), nullable=False)
     booking_time = Column(Time, default=datetime.utcnow().time(), nullable=False)
     user_name = Column(String(255), nullable=False)

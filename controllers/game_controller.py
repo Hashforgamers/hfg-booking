@@ -96,3 +96,26 @@ def cancel_booking(booking_id):
         return jsonify({"message": "Booking canceled successfully."})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
+
+
+@game_blueprint.route('/getAllConsole/vendor/<int:vendor_id>', methods=['GET'])
+def get_all_console_by_vendor_id(vendor_id):
+
+    # Query games by vendor_id
+    games = AvailableGame.query.filter_by(vendor_id=vendor_id).all()
+
+    # If no games found, return an appropriate message
+    if not games:
+        return jsonify({
+            "message": "No games found for this vendor",
+            "shop_open": True,
+            "game_count": 0
+        }), 200
+
+    # Return the game details along with the vendor's open days in JSON format
+    return jsonify({
+        "games": [{
+            "id": game.id,
+            "console_name": game.game_name
+        } for game in games],
+    })

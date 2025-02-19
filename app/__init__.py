@@ -27,7 +27,7 @@ def create_app():
     socketio = SocketIO(app, cors_allowed_origins="*", transports=['websocket', 'polling'], async_mode="gevent", logger=True, engineio_logger=True)
 
     app.config.from_object(Config)
-    app.config['REDIS_URL'] = "redis://red-culflulds78s73bqveqg:6379"
+    app.config['REDIS_URL'] = os.getenv("REDIS_URL", "rediss://red-culflulds78s73bqveqg:h6uqD1Bivbn7K5y3RRSECELE2Jwp2us3@oregon-redis.render.com:6379")
 
     # Initialize CORS
     CORS(app, resources={r"/*": {"origins": "*"}})
