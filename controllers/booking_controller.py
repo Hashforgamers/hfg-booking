@@ -573,6 +573,8 @@ def new_booking(vendor_id):
         booked_date = data.get("bookedDate")
         slot_ids = data.get("slotId")  # List of slot IDs
         payment_type = data.get("paymentType")
+        console_id = data.get("consoleId")
+        is_rapid_booking = data.get("isRapidBooking")
 
         if not all([name, email, phone, booked_date, slot_ids, payment_type]):
             return jsonify({"message": "Missing required fields"}), 400
@@ -678,6 +680,22 @@ def new_booking(vendor_id):
             db.session.add(transaction)
             transactions.append(transaction)
 
+        if is_rapid_booking:
+            # ✅ Define the dynamic console availability table name
+            console_table_name = f"VENDOR_{vendor_id}_CONSOLE_AVAILABILITY"
+
+            # ✅ Update the status to false (occupied)
+            sql_update_status = text(f"""
+                UPDATE {console_table_name}
+                SET is_available = FALSE
+                WHERE console_id = :console_id AND game_id = :game_id
+            """)
+
+            db.session.execute(sql_update_status, {
+                "console_id": console_id,
+                "game_id": available_game.id
+            })
+        
         db.session.commit()
 
         socketio = current_app.extensions['socketio']
