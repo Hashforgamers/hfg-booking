@@ -8,6 +8,8 @@ from db.extensions import db
 from datetime import datetime
 from sqlalchemy.sql import text
 from flask import current_app
+from models.transaction import Transaction
+from models.user import User
 
 
 class BookingService:
@@ -163,3 +165,42 @@ class BookingService:
             finally:
                 db.session.remove()  # Ensure DB session cleanup
 
+    @staticmethod
+    def insert_into_vendor_dashboard_table(trans_id, console_id):
+        """Inserts booking and transaction details into the vendor dashboard table."""
+        
+        # Fetch required objects
+        trans_obj = Transaction.query.filter_by(id=trans_id).first()
+        if not trans_obj:
+            raise ValueError(f"Transaction with ID {trans_id} not found.")
+
+        user_obj = User.query.filter_by(id=trans_obj.user_id).first()
+        book_obj = Booking.query.filter_by(id=trans_obj.booking_id).first()
+        slot_obj = Slot.query.filter_by(id=book_obj.slot_id).first()
+        available_game_obj = AvailableGame.query.filter_by(id=book_obj.game_id).first()
+
+        vendor_id = trans_obj.vendor_id
+        table_name = f"VENDOR_{vendor_id}_DASHBOARD"
+
+        # SQL Query for insertion
+        sql_insert = text(f"""
+            INSERT INTO {table_name} 
+            (username, user_id, start_time, end_time, date, book_id, game_id, game_name, console_id)
+            VALUES (:username, :user_id, :start_time, :end_time, :date, :book_id, :game_id, :game_name, :console_id)
+        """)
+
+        # Execute query with parameter binding
+        db.session.execute(sql_insert, {
+            "username": user_obj.name,
+            "user_id": user_obj.id,
+            "start_time": slot_obj.start_time,
+            "end_time": slot_obj.end_time,
+            "date": trans_obj.booked_date,
+            "book_id": trans_obj.booking_id,
+            "game_id": book_obj.game_id,
+            "game_name": available_game_obj.game_name,
+            "console_id": console_id
+        })
+
+        db.session.commit()
+        current_app.logger.info(f"Inserted transaction {trans_id} into {table_name}")

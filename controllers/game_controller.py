@@ -7,7 +7,7 @@ from datetime import datetime
 game_blueprint = Blueprint('game', __name__)
 
 # Get all available games
-@game_blueprint.route('/games/', methods=['GET'])
+@game_blueprint.route('/games', methods=['GET'])
 def get_all_games():
     games = AvailableGame.query.all()
     return jsonify([{
@@ -65,7 +65,7 @@ def get_games_by_vendor_id(vendor_id):
     })
 
 # Create a new booking for a game
-@game_blueprint.route('/bookings/', methods=['POST'])
+@game_blueprint.route('/bookings', methods=['POST'])
 def create_booking():
     data = request.get_json()
     try:
