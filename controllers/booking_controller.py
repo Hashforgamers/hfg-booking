@@ -723,7 +723,7 @@ def new_booking(vendor_id):
         current_app.logger.error(f"Failed to process booking: {str(e)}")
         return jsonify({"message": "Failed to process booking", "error": str(e)}), 500
 
-@booking_blueprint.route('/getAllBooking/vendor/<int:vendor_id>/<string:date>', methods=['GET'])
+@booking_blueprint.route('/getAllBooking/vendor/<int:vendor_id>/<string:date>/', methods=['GET'])
 def get_all_booking(vendor_id, date):
     """
     Retrieves all booking details for a given vendor from the given date onwards.
