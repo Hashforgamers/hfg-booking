@@ -398,6 +398,7 @@ def get_booking_details(booking_id):
                     "end_time": slot.end_time.strftime("%H:%M")
                 },
                 "system": console.model_number if console else "Unknown System",
+                "game_id": booking.game_id,
                 "customer": {
                     "name": user.name,
                     "email": contact_info.email if contact_info else "",
