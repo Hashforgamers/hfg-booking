@@ -178,6 +178,7 @@ class BookingService:
         book_obj = Booking.query.filter_by(id=trans_obj.booking_id).first()
         slot_obj = Slot.query.filter_by(id=book_obj.slot_id).first()
         available_game_obj = AvailableGame.query.filter_by(id=book_obj.game_id).first()
+        book_status = "upcoming"
 
         vendor_id = trans_obj.vendor_id
         table_name = f"VENDOR_{vendor_id}_DASHBOARD"
@@ -185,8 +186,8 @@ class BookingService:
         # SQL Query for insertion
         sql_insert = text(f"""
             INSERT INTO {table_name} 
-            (username, user_id, start_time, end_time, date, book_id, game_id, game_name, console_id)
-            VALUES (:username, :user_id, :start_time, :end_time, :date, :book_id, :game_id, :game_name, :console_id)
+            (username, user_id, start_time, end_time, date, book_id, game_id, game_name, console_id, book_status)
+            VALUES (:username, :user_id, :start_time, :end_time, :date, :book_id, :game_id, :game_name, :console_id, :book_status)
         """)
 
         # Execute query with parameter binding
@@ -199,7 +200,8 @@ class BookingService:
             "book_id": trans_obj.booking_id,
             "game_id": book_obj.game_id,
             "game_name": available_game_obj.game_name,
-            "console_id": console_id
+            "console_id": console_id,
+            "book_status":book_status
         })
 
         db.session.commit()
