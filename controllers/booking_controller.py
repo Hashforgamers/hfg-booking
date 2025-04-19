@@ -334,6 +334,8 @@ def reject_booking():
         db.session.add(new_transaction)
         db.session.commit()
 
+        BookingService.update_dashboard_booking_status(booking.transaction.id, booking.transaction.vendor_id, "rejected")
+
         return jsonify({
             "message": f"Booking {booking_id} rejected successfully",
             "status": booking.status,
@@ -519,7 +521,6 @@ def update_booking(booking_id):
 
     except Exception as e:
         return jsonify({"message": f"Error updating booking: {str(e)}"}), 500
-
 
 @booking_blueprint.route('/vendor/<int:vendor_id>/bookings', methods=['GET'])
 def get_vendor_bookings(vendor_id):
