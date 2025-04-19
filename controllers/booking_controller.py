@@ -21,6 +21,7 @@ from sqlalchemy.orm import joinedload
 
 from sqlalchemy import and_
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import func, distinct
 
 
 booking_blueprint = Blueprint('bookings', __name__)
@@ -753,7 +754,8 @@ def get_all_booking(vendor_id, date):
          .join(AvailableGame, Booking.game_id == AvailableGame.id) \
          .join(Slot, Booking.slot_id == Slot.id) \
          .filter(Transaction.vendor_id == vendor_id, Transaction.booked_date >= formatted_date) \
-         .order_by(Transaction.booked_date.asc()) \
+         .distinct(Booking.id) \
+         .order_by(Booking.id, Transaction.booking_time.desc()) \
          .all()
 
         # Convert results into a structured list
