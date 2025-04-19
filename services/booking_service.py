@@ -206,3 +206,23 @@ class BookingService:
 
         db.session.commit()
         current_app.logger.info(f"Inserted transaction {trans_id} into {table_name}")
+
+    @staticmethod
+    def update_dashboard_booking_status(trans_id, vendor_id, new_status):
+        """Updates the booking status in the vendor dashboard table for a given transaction."""
+        table_name = f"VENDOR_{vendor_id}_DASHBOARD"
+
+        sql_update = text(f"""
+            UPDATE {table_name}
+            SET book_status = :new_status
+            WHERE book_id = (
+                SELECT booking_id FROM transaction WHERE id = :trans_id
+            )
+        """)
+
+        db.session.execute(sql_update, {
+            "trans_id": trans_id,
+            "new_status": new_status
+        })
+        db.session.commit()
+        current_app.logger.info(f"Updated booking status to '{new_status}' for transaction {trans_id} in {table_name}")
