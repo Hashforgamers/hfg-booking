@@ -208,6 +208,51 @@ class BookingService:
         current_app.logger.info(f"Inserted transaction {trans_id} into {table_name}")
 
     @staticmethod
+    def insert_into_vendor_promo_table(trans_id, console_id):
+        """Inserts promo details into the vendor-specific promo table."""
+
+        # Fetch transaction, booking
+        trans_obj = Transaction.query.filter_by(id=trans_id).first()
+        if not trans_obj:
+            raise ValueError(f"Transaction with ID {trans_id} not found.")
+
+        booking_obj = Booking.query.filter_by(id=trans_obj.booking_id).first()
+        if not booking_obj:
+            raise ValueError(f"Booking with ID {trans_obj.booking_id} not found.")
+
+        # Fetch promo data — assume it's in the transaction metadata or external source
+        promo_code = "LAUNCH10"
+        discount_applied = "10"
+        actual_price = trans_obj.amount if trans_obj.amount else 0.0
+
+        if not promo_code or discount_applied is None:
+            current_app.logger.warning(f"No promo data found for transaction {trans_id}. Skipping promo insertion.")
+            return
+
+        # Compose table name
+        vendor_id = trans_obj.vendor_id
+        table_name = f"VENDOR_{vendor_id}_PROMO_DETAIL"
+
+        # SQL insert
+        sql_insert = text(f"""
+            INSERT INTO {table_name} 
+            (booking_id, transaction_id, promo_code, discount_applied, actual_price)
+            VALUES 
+            (:booking_id, :transaction_id, :promo_code, :discount_applied, :actual_price)
+        """)
+
+        db.session.execute(sql_insert, {
+            "booking_id": trans_obj.booking_id,
+            "transaction_id": trans_obj.id,
+            "promo_code": promo_code,
+            "discount_applied": discount_applied,
+            "actual_price": actual_price
+        })
+
+        db.session.commit()
+        current_app.logger.info(f"Inserted promo detail for transaction {trans_id} into {table_name}")
+
+    @staticmethod
     def update_dashboard_booking_status(trans_id, vendor_id, new_status):
         """Updates the booking status in the vendor dashboard table for a given transaction."""
         table_name = f"VENDOR_{vendor_id}_DASHBOARD"

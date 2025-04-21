@@ -714,6 +714,7 @@ def new_booking(vendor_id):
         for trans in transactions:
             console_id_val = console_id if console_id is not None else -1
             BookingService.insert_into_vendor_dashboard_table(trans.id, console_id_val)
+            BookingService.insert_into_vendor_promo_table(trans.id, console_id_val)
             
         return jsonify({
             "message": "Booking confirmed successfully",
