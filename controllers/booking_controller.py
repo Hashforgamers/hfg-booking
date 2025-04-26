@@ -750,7 +750,9 @@ def get_all_booking(vendor_id, date):
             Slot.start_time.label("startTime"),
             Slot.end_time.label("endTime"),
             Booking.status.label("status"),
-            Transaction.booking_type.label("type")
+            Transaction.booking_type.label("type"),
+            Transaction.user_id.label("userId"),
+            Transaction.booked_date.label("bookedDate")
         ).join(Transaction, Booking.id == Transaction.booking_id) \
          .join(User, Booking.user_id == User.id) \
          .join(AvailableGame, Booking.game_id == AvailableGame.id) \
@@ -772,7 +774,9 @@ def get_all_booking(vendor_id, date):
             "startTime": row.startTime.strftime("%H:%M:%S"),
             "endTime": row.endTime.strftime("%H:%M:%S"),
             "status": row.status,
-            "type": row.type
+            "type": row.type,
+            "userId":row.userId,
+            "bookedDate":row.bookedDate
         } for row in results]
 
         return jsonify(bookings), 200
