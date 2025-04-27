@@ -261,7 +261,7 @@ class BookingService:
             UPDATE {table_name}
             SET book_status = :new_status
             WHERE book_id = (
-                SELECT booking_id FROM transaction WHERE id = :trans_id
+                SELECT booking_id FROM transactions WHERE id = :trans_id
             )
         """)
 
