@@ -727,6 +727,78 @@ def new_booking(vendor_id):
         current_app.logger.error(f"Failed to process booking: {str(e)}")
         return jsonify({"message": "Failed to process booking", "error": str(e)}), 500
 
+@booking_blueprint.route('/extraBooking', methods=['POST'])
+def extra_booking():
+    """
+    Records extra booking (time extended) played by the user in a gaming cafe.
+    """
+    try:
+        data = request.json
+
+        required_fields = ["consoleNumber", "consoleType", "date", "slotId", "userId", "username", "amount", "gameId", "modeOfPayment","vendorId"]
+        if not all(data.get(field) is not None for field in required_fields):
+            return jsonify({"message": "Missing required fields"}), 400
+
+        # Extract values
+        console_number = data["consoleNumber"]
+        console_type = data["consoleType"]
+        booked_date = datetime.strptime(data["date"], "%Y-%m-%d").date()
+        slot_id = data["slotId"]
+        user_id = data["userId"]
+        username = data["username"]
+        amount = data["amount"]
+        game_id = data["gameId"]
+        mode_of_payment = data["modeOfPayment"]
+        vendor_id = data["vendorId"] 
+
+        # Optional: verify user and slot exist
+        user = db.session.query(User).filter_by(id=user_id).first()
+        slot = db.session.query(Slot).filter_by(id=slot_id).first()
+
+        if not user or not slot:
+            return jsonify({"message": "User or slot not found"}), 404
+
+        # Create a record in Booking table for extra booking (status='extra')
+        extra_booking = Booking(
+            slot_id=slot_id,
+            game_id=game_id,
+            user_id=user_id,
+            status="extra"
+        )
+        db.session.add(extra_booking)
+        db.session.flush()
+
+        # Create a transaction for extra booking
+        transaction = Transaction(
+            booking_id=extra_booking.id,
+            vendor_id=vendor_id,
+            user_id=user_id,
+            booked_date=booked_date,
+            booking_time=datetime.utcnow().time(),
+            user_name=username,
+            amount=amount,
+            mode_of_payment=mode_of_payment,
+            booking_type="extra",
+            settlement_status="completed" if mode_of_payment == "paid" else "NA"
+        )
+        db.session.add(transaction)
+        db.session.commit()
+
+        # Optional: Push to dashboard/promo tables
+        BookingService.insert_into_vendor_dashboard_table(transaction.id, console_number)
+        BookingService.insert_into_vendor_promo_table(transaction.id, console_number)
+
+        return jsonify({
+            "message": "Extra booking recorded successfully",
+            "booking_id": extra_booking.id,
+            "transaction_id": transaction.id
+        }), 201
+
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"Error recording extra booking: {str(e)}")
+        return jsonify({"message": "Failed to record extra booking", "error": str(e)}), 500
+
 @booking_blueprint.route('/getAllBooking/vendor/<int:vendor_id>/<string:date>/', methods=['GET'])
 def get_all_booking(vendor_id, date):
     """
