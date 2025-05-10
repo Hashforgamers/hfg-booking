@@ -721,9 +721,14 @@ def new_booking(vendor_id):
         booking_details = []
         for booking in bookings:
             slot_obj = db.session.query(Slot).filter_by(id=booking.slot_id).first()
+            if slot_obj:
+                slot_time = f"{str(slot_obj.start_time)} - {str(slot_obj.end_time)}"  # Format as start_time - end_time
+            else:
+                slot_time = 'N/A'  # In case slot_obj is None (just as a fallback)
+            
             booking_details.append({
                 "booking_id": booking.id,
-                "slot_time": getattr(slot_obj, 'time_slot', 'N/A')
+                "slot_time": slot_time
             })
 
         # Send confirmation email
