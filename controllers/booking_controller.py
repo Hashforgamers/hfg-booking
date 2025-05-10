@@ -22,6 +22,7 @@ from sqlalchemy.orm import joinedload
 from sqlalchemy import and_
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy import func, distinct
+from services.mail_service import booking_mail, reject_booking_mail
 
 
 booking_blueprint = Blueprint('bookings', __name__)
@@ -715,7 +716,29 @@ def new_booking(vendor_id):
             console_id_val = console_id if console_id is not None else -1
             BookingService.insert_into_vendor_dashboard_table(trans.id, console_id_val)
             BookingService.insert_into_vendor_promo_table(trans.id, console_id_val)
-            
+
+        # Extract slot times for the email
+        booking_details = []
+        for booking in bookings:
+            slot_obj = db.session.query(Slot).filter_by(id=booking.slot_id).first()
+            booking_details.append({
+                "booking_id": booking.id,
+                "slot_time": getattr(slot_obj, 'time_slot', 'N/A')
+            })
+
+        # Send confirmation email
+        cafe_name = db.session.query(Vendor).filter_by(id=vendor_id).first().cafe_name
+        booking_mail(
+            gamer_name=name,
+            gamer_phone=phone,
+            gamer_email=email,
+            cafe_name=cafe_name,
+            booking_date=datetime.utcnow().strftime("%Y-%m-%d"),
+            booked_for_date=booked_date,
+            booking_details=booking_details,
+            price_paid=available_game.single_slot_price
+        )
+
         return jsonify({
             "message": "Booking confirmed successfully",
             "booking_ids": [b.id for b in bookings],
