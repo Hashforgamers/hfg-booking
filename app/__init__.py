@@ -13,7 +13,7 @@ from rq import Queue  # Import RQ Queue
 from rq_scheduler import Scheduler  # Import RQ Scheduler
 from datetime import datetime, timedelta
 
-from db.extensions import db, migrate
+from db.extensions import db, migrate, mail
 from controllers.booking_controller import booking_blueprint
 from controllers.slot_controller import slot_blueprint
 from controllers.game_controller import game_blueprint
@@ -35,6 +35,9 @@ def create_app():
     # Initialize extensions
     db.init_app(app)
     migrate.init_app(app, db)
+
+    # Initialize Mail Server
+    mail.init_app(app)
 
     # Initialize SocketIO with the app
     socketio.init_app(app, message_queue=app.config['REDIS_URL'])
