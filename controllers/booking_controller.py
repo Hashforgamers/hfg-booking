@@ -14,7 +14,6 @@ from models.vendor import Vendor
 from models.user import User
 from models.contactInfo import ContactInfo
 from models.console import Console
-from models.contactInfo import ContactInfo
 
 from sqlalchemy.sql import text
 from sqlalchemy.orm import joinedload
@@ -343,11 +342,13 @@ def reject_booking():
         # Fallback if user or email not found
         gamer_email = user.contact_info.email if user and user.contact_info else "no-reply@example.com"
 
+        vendor_contact = ContactInfo.query.filter_by(parent_id=booking.transaction.vendor_id, parent_type="vendor").first()
+
         # Send rejection email
         reject_booking_mail(
             gamer_name=booking.transaction.user_name,
             gamer_email=gamer_email,
-            cafe_name=booking.transaction.vendor_name,
+            cafe_name=vendor_contact.email if vendor_contact else "N/A",
             reason=rejection_reason
         )
 
