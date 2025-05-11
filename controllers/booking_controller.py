@@ -285,6 +285,7 @@ def reject_booking():
         booking_id = data.get("booking_id")
         rejection_reason = data.get("rejection_reason", "No reason provided")
         repayment_type = data.get("repayment_type")  # refund, credit, reschedule
+        user_email = data.get("user_email")
 
         if not booking_id or not repayment_type:
             return jsonify({"message": "booking_id and repayment_type are required"}), 400
@@ -336,23 +337,18 @@ def reject_booking():
 
         BookingService.update_dashboard_booking_status(booking.transaction.id, booking.transaction.vendor_id, "rejected")
 
-        # Fetch the user from the DB properly
-        user = db.session.get(User, booking.transaction.user_id)
-
-        # Fallback if user or email not found
-        gamer_email = user.contact_info.email if user and user.contact_info else "no-reply@example.com"
-
         vendor_contact = ContactInfo.query.filter_by(parent_id=booking.transaction.vendor_id, parent_type="vendor").first()
+        vendor = Vendor.query.filter_by(id=booking.transaction.vendor_id).first()
 
         current_app.logger.info(
-            f"gamer Email {gamer_email}; gamer name :{booking.transaction.user_name}; cafe_name: {vendor_contact.email if vendor_contact else 'N/A'} ; rejection {rejection_reason}"
+            f"gamer Email {user_email}; gamer name :{booking.transaction.user_name}; cafe_name: {vendor_contact.email if vendor_contact else 'N/A'} ; rejection {rejection_reason}"
         )
 
         # Send rejection email
         reject_booking_mail(
             gamer_name=booking.transaction.user_name,
-            gamer_email=gamer_email,
-            cafe_name=vendor_contact.email if vendor_contact else "N/A",
+            gamer_email=user_email,
+            cafe_name=vendor.cafe_name if vendor else "N/A",
             reason=rejection_reason
         )
 
