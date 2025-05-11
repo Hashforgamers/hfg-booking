@@ -22,7 +22,7 @@ from sqlalchemy.orm import joinedload
 from sqlalchemy import and_
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy import func, distinct
-from services.mail_service import booking_mail, reject_booking_mail
+from services.mail_service import booking_mail, reject_booking_mail, extra_booking_time_mail
 
 
 booking_blueprint = Blueprint('bookings', __name__)
@@ -336,6 +336,20 @@ def reject_booking():
         db.session.commit()
 
         BookingService.update_dashboard_booking_status(booking.transaction.id, booking.transaction.vendor_id, "rejected")
+
+        # Fetch the user from the DB properly
+        user = db.session.get(User, booking.transaction.user_id)
+
+        # Fallback if user or email not found
+        gamer_email = user.contact_info.email if user and user.contact_info else "no-reply@example.com"
+
+        # Send rejection email
+        reject_booking_mail(
+            gamer_name=booking.transaction.user_name,
+            gamer_email=gamer_email,
+            cafe_name=booking.transaction.vendor_name,
+            reason=rejection_reason
+        )
 
         return jsonify({
             "message": f"Booking {booking_id} rejected successfully",
@@ -815,6 +829,27 @@ def extra_booking():
         # Optional: Push to dashboard/promo tables
         BookingService.insert_into_vendor_dashboard_table(transaction.id, console_number)
         BookingService.insert_into_vendor_promo_table(transaction.id, console_number)
+
+        # Fallback if user or email not found
+        gamer_email = user.contact_info.email if user and user.contact_info else "no-reply@example.com"
+
+        if not slot or not slot.start_time or not slot.end_time:
+            slot_time_str = "N/A"
+        else:
+            slot_time_str = f"{slot.start_time.strftime('%-I:%M %p')} to {slot.end_time.strftime('%-I:%M %p')}"
+            # Use '%#I' on Windows instead of '%-I' for removing leading zeros
+            
+        # ✅ Send the extra booking email
+        extra_booking_time_mail(
+            username=username,
+            user_email=gamer_email,
+            booked_date=booked_date.strftime("%Y-%m-%d"),
+            slot_time=slot_time_str,
+            console_type=console_type,
+            console_number=console_number,
+            amount=amount,
+            mode_of_payment=mode_of_payment
+        )
 
         return jsonify({
             "message": "Extra booking recorded successfully",

@@ -84,8 +84,6 @@ def booking_mail(gamer_name, gamer_phone, gamer_email, cafe_name, booking_date, 
         </html>"""
     )
 
-
-
 def reject_booking_mail(gamer_name, gamer_email, cafe_name, reason="No reason provided"):
     send_email(
         subject="❌ Booking Not Confirmed – Hash Gaming Café",
@@ -127,6 +125,69 @@ def reject_booking_mail(gamer_name, gamer_email, cafe_name, reason="No reason pr
             </div>
 
         </div>
+        </body>
+        </html>"""
+    )
+
+def extra_booking_time_mail(username, user_email, booked_date, slot_time, console_type, console_number, amount, mode_of_payment):
+    send_email(
+        subject="🎮 Extra Playtime – Payment Receipt from Hash Gaming Café",
+        recipients=[user_email],
+        body="Thanks for staying longer and gaming with us! Here's your payment receipt.",
+        html=f"""<!DOCTYPE html>
+        <html lang="en">
+        <head>
+          <meta charset="UTF-8">
+          <title>Additional Payment Receipt</title>
+        </head>
+        <body style="font-family: 'Segoe UI', sans-serif; background-color: #f6f6f6; margin: 0; padding: 0;">
+          <div style="max-width: 640px; margin: auto; background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 10px rgba(0, 0, 0, 0.05);">
+
+            <div style="background: linear-gradient(to right, #000000, #550000); color: #fff; text-align: center; padding: 30px 20px;">
+              <h1 style="margin: 0; font-size: 24px;">🎮 Extra Playtime Payment</h1>
+              <div style="font-size: 14px; color: #ccc; margin-top: 10px;">Thanks for staying longer!</div>
+            </div>
+
+            <div style="padding: 30px; color: #333;">
+              <p>Hi <strong>{username}</strong>,</p>
+              <p>You enjoyed some extra gaming time on your recent visit! Here's a summary of the additional amount charged:</p>
+
+              <table style="width: 100%; border-collapse: collapse; margin-top: 20px;">
+                <tr>
+                  <td style="padding: 8px; font-weight: bold; color: #555;">Date of Booking:</td>
+                  <td style="padding: 8px;">{booked_date}</td>
+                </tr>
+                <tr style="background-color: #f9f9f9;">
+                  <td style="padding: 8px; font-weight: bold; color: #555;">Slot Time:</td>
+                  <td style="padding: 8px;">{slot_time}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 8px; font-weight: bold; color: #555;">Console Type:</td>
+                  <td style="padding: 8px;">{console_type}</td>
+                </tr>
+                <tr style="background-color: #f9f9f9;">
+                  <td style="padding: 8px; font-weight: bold; color: #555;">Console Number:</td>
+                  <td style="padding: 8px;">#{console_number}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 8px; font-weight: bold; color: #555;">Amount Paid:</td>
+                  <td style="padding: 8px;">₹{amount}</td>
+                </tr>
+                <tr style="background-color: #f9f9f9;">
+                  <td style="padding: 8px; font-weight: bold; color: #555;">Mode of Payment:</td>
+                  <td style="padding: 8px;">{mode_of_payment}</td>
+                </tr>
+              </table>
+
+              <p style="margin-top: 20px;">We appreciate your time with us. Keep gaming and have fun!</p>
+              <p>Cheers,<br><strong>The Hash Team</strong></p>
+            </div>
+
+            <div style="text-align: center; padding: 20px; font-size: 12px; color: #888; background-color: #fafafa;">
+              &copy; 2025 Hash Platform. All rights reserved.
+            </div>
+
+          </div>
         </body>
         </html>"""
     )
