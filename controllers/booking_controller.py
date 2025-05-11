@@ -344,6 +344,8 @@ def reject_booking():
 
         vendor_contact = ContactInfo.query.filter_by(parent_id=booking.transaction.vendor_id, parent_type="vendor").first()
 
+        current_app.logger.info(f"gamer Email {gamer_email}; gamer name :{booking.transaction.user_name}; cafe_name: {vendor_contact.email if vendor_contact else "N/A"} ; rejection {rejection_reason}")
+
         # Send rejection email
         reject_booking_mail(
             gamer_name=booking.transaction.user_name,
