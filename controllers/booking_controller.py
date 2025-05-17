@@ -941,7 +941,8 @@ def get_user_details(vendor_id):
 
         user_list = []
         for user in users:
-            contact = user.contact_info
+            contact = ContactInfo.query.filter_by(parent_id=user.id, parent_type="user").first()
+            
             user_data = {
                 "id": user.id,
                 "name": user.name,
