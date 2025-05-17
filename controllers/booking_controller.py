@@ -920,3 +920,42 @@ def get_all_booking(vendor_id, date):
     except Exception as e:
         current_app.logger.error(f"Failed to fetch bookings: {str(e)}")
         return jsonify({"message": "Failed to fetch bookings", "error": str(e)}), 500
+
+@booking_blueprint.route('/vendor/<string:vendor_id>/users', methods=['GET'])
+def get_user_details(vendor_id):
+    try:
+        table_name = f"VENDOR_{vendor_id}_DASHBOARD"
+
+        # Step 1: Get all unique user_ids from the vendor dashboard table
+        user_id_query = text(f"""
+            SELECT DISTINCT user_id FROM {table_name}
+        """)
+        result = db.session.execute(user_id_query)
+        user_ids = [row[0] for row in result]
+
+        if not user_ids:
+            return jsonify({"message": "No users found for this vendor."}), 404
+
+        # Step 2: Fetch User and ContactInfo
+        users = User.query.filter(User.id.in_(user_ids)).all()
+
+        user_list = []
+        for user in users:
+            contact = user.contact_info
+            user_data = {
+                "id": user.id,
+                "name": user.name,
+                "game_username": user.game_username,
+                "avatar_path": user.avatar_path,
+                "gender": user.gender,
+                "dob": user.dob.isoformat() if user.dob else None,
+                "email": contact.email if contact else None,
+                "phone": contact.phone if contact else None
+            }
+            user_list.append(user_data)
+
+        return jsonify(user_list), 200
+
+    except Exception as e:
+        current_app.logger.error(f"Error fetching user details: {e}")
+        return jsonify({"error": str(e)}), 500
