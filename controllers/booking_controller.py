@@ -30,48 +30,52 @@ booking_blueprint = Blueprint('bookings', __name__)
 def create_booking():
     current_app.logger.info(f"Current App in Blueprint {current_app}")
     data = request.json
-    slot_id = data.get("slot_id")
+    slot_ids = data.get("slot_id")  # Now expects a list
     user_id = data.get("user_id")
     game_id = data.get("game_id")
-    book_date = data.get("book_date")  # ✅ Get `book_date` from request
+    book_date = data.get("book_date")
 
-    if not slot_id or not user_id or not game_id or not book_date:
+    if not slot_ids or not user_id or not game_id or not book_date:
         return jsonify({"message": "slot_id, game_id, user_id, and book_date are required"}), 400
 
     try:
         socketio = current_app.extensions['socketio']
-
+        scheduler = current_app.extensions['scheduler']
         available_game = db.session.query(AvailableGame).filter(AvailableGame.id == game_id).first()
+        booking_ids = []
 
-        # ✅ Check if there is at least one available slot before booking
-        slot_entry = db.session.execute(text(f"""
-            SELECT available_slot, is_available
-            FROM VENDOR_{available_game.vendor_id}_SLOT
-            WHERE slot_id = :slot_id AND date = :book_date
-        """), {"slot_id": slot_id, "book_date": book_date}).fetchone()
+        for slot_id in slot_ids:
+            slot_entry = db.session.execute(text(f"""
+                SELECT available_slot, is_available
+                FROM VENDOR_{available_game.vendor_id}_SLOT
+                WHERE slot_id = :slot_id AND date = :book_date
+            """), {"slot_id": slot_id, "book_date": book_date}).fetchone()
 
-        if slot_entry is None or slot_entry[0] <= 0 or not slot_entry[1]:
-            return jsonify({"message": "Slot is not available for booking"}), 400
-        
-        # ✅ Create the booking
-        booking = BookingService.create_booking(slot_id, game_id, user_id, socketio, book_date)
+            if slot_entry is None or slot_entry[0] <= 0 or not slot_entry[1]:
+                continue  # Skip if not available
+
+            booking = BookingService.create_booking(slot_id, game_id, user_id, socketio, book_date)
+            db.session.flush()
+            booking_ids.append(booking.id)
+
+            scheduler.enqueue_in(
+                timedelta(seconds=360),
+                BookingService.release_slot,
+                slot_id,
+                booking.id,
+                book_date
+            )
+
         db.session.commit()
 
-        # Schedule auto-release after 10 seconds
-        scheduler = current_app.extensions['scheduler']
-        scheduler.enqueue_in(
-            timedelta(seconds=360),
-            BookingService.release_slot,
-            slot_id,
-            booking.id,
-            book_date  # ✅ Pass `book_date`
-        )
+        if not booking_ids:
+            return jsonify({"message": "No slots available for booking"}), 400
 
-        return jsonify({"message": "Slot frozen for 10 seconds", "slot_id": slot_id}), 200
+        return jsonify({"message": "Slots frozen", "booking_ids": booking_ids}), 200
 
     except Exception as e:
         db.session.rollback()
-        return jsonify({"message": "Failed to freeze slot", "error": str(e)}), 500
+        return jsonify({"message": "Failed to freeze slot(s)", "error": str(e)}), 500
 
 # @booking_blueprint.route('/bookings/confirm', methods=['POST'])
 # def confirm_booking():
@@ -153,86 +157,83 @@ def create_booking():
 def confirm_booking():
     try:
         data = request.get_json()
-        booking_id = data.get('booking_id')
+        booking_ids = data.get('booking_id')  # Now expects a list
+        payment_id = data.get('payment_id')  # Optional
 
-        booking = db.session.query(Booking).filter_by(id=booking_id).first()
-        if not booking:
-            return jsonify({'message': 'Booking not found'}), 404
+        if not booking_ids:
+            return jsonify({'message': 'No booking IDs provided'}), 400
 
-        if booking.status == 'confirmed':
-            return jsonify({'message': 'Booking already confirmed'}), 400
+        confirmed_ids = []
+        for booking_id in booking_ids:
+            booking = db.session.query(Booking).filter_by(id=booking_id).first()
+            if not booking or booking.status == 'confirmed':
+                continue
 
-        # Mark the booking as confirmed
-        booking.status = 'confirmed'
-        booking.updated_at = datetime.utcnow()
+            booking.status = 'confirmed'
+            booking.updated_at = datetime.utcnow()
 
-        # Create Transaction
-        transaction = Transaction(
-            booking_id=booking.id,
-            amount=booking.amount,
-            payment_status="paid",
-            payment_method=booking.payment_method or "online",
-            created_at=datetime.utcnow()
-        )
-        db.session.add(transaction)
+            transaction = Transaction(
+                booking_id=booking.id,
+                amount=booking.amount,
+                payment_status="paid",
+                payment_method=booking.payment_method or "online",
+                created_at=datetime.utcnow()
+            )
+            db.session.add(transaction)
+            db.session.flush()
 
-        # Fetch vendor, slot, and available game details
-        vendor = db.session.query(Vendor).filter_by(id=booking.vendor_id).first()
-        slot_obj = db.session.query(Slot).filter_by(id=booking.slot_id).first()
-        available_game = db.session.query(AvailableGame).filter_by(id=booking.available_game_id).first()
-        user = db.session.query(User).filter_by(id=booking.user_id).first()
+            vendor = db.session.query(Vendor).filter_by(id=booking.vendor_id).first()
+            slot_obj = db.session.query(Slot).filter_by(id=booking.slot_id).first()
+            available_game = db.session.query(AvailableGame).filter_by(id=booking.available_game_id).first()
+            user = db.session.query(User).filter_by(id=booking.user_id).first()
 
-        if not all([vendor, slot_obj, available_game, user]):
-            return jsonify({'message': 'Booking data incomplete'}), 500
+            if not all([vendor, slot_obj, available_game, user]):
+                continue
 
-        # Update Slot Availability
-        db.session.execute(text(f"""
-            UPDATE VENDOR_{vendor.id}_SLOT
-            SET available_slot = available_slot - 1,
-                is_available = CASE WHEN available_slot - 1 = 0 THEN FALSE ELSE is_available END
-            WHERE slot_id = :slot_id AND date = :book_date
-        """), {
-            "slot_id": booking.slot_id,
-            "book_date": booking.book_date
-        })
-
-        # Insert into Vendor Dashboard and Promo Tables
-        console_id_val = booking.console_id if booking.console_id else -1
-        db.session.flush()  # Ensure transaction.id is generated
-        BookingService.insert_into_vendor_dashboard_table(transaction.id, console_id_val)
-        BookingService.insert_into_vendor_promo_table(transaction.id, console_id_val)
-
-        # Optional: Update Console Availability if rapid booking
-        if booking.console_id:  # Only update if console assigned
             db.session.execute(text(f"""
-                UPDATE VENDOR_{vendor.id}_CONSOLE_AVAILABILITY
-                SET is_available = FALSE
-                WHERE console_id = :console_id AND game_id = :game_id
+                UPDATE VENDOR_{vendor.id}_SLOT
+                SET available_slot = available_slot - 1,
+                    is_available = CASE WHEN available_slot - 1 = 0 THEN FALSE ELSE is_available END
+                WHERE slot_id = :slot_id AND date = :book_date
             """), {
-                "console_id": booking.console_id,
-                "game_id": available_game.id
+                "slot_id": booking.slot_id,
+                "book_date": booking.book_date
             })
 
-        # Commit all changes
+            console_id_val = booking.console_id if booking.console_id else -1
+            BookingService.insert_into_vendor_dashboard_table(transaction.id, console_id_val)
+            BookingService.insert_into_vendor_promo_table(transaction.id, console_id_val)
+
+            if booking.console_id:
+                db.session.execute(text(f"""
+                    UPDATE VENDOR_{vendor.id}_CONSOLE_AVAILABILITY
+                    SET is_available = FALSE
+                    WHERE console_id = :console_id AND game_id = :game_id
+                """), {
+                    "console_id": booking.console_id,
+                    "game_id": available_game.id
+                })
+
+            # Optional: Send mail per booking
+            slot_time = f"{str(slot_obj.start_time)} - {str(slot_obj.end_time)}"
+            booking_mail(
+                gamer_name=user.name,
+                gamer_phone=user.contact_info.phone,
+                gamer_email=user.contact_info.email,
+                cafe_name=vendor.cafe_name,
+                booking_date=datetime.utcnow().strftime("%Y-%m-%d"),
+                booked_for_date=str(booking.book_date),
+                booking_details=[{
+                    "booking_id": booking.id,
+                    "slot_time": slot_time
+                }],
+                price_paid=available_game.single_slot_price
+            )
+
+            confirmed_ids.append(booking.id)
+
         db.session.commit()
-
-        # Send Booking Confirmation Email
-        slot_time = f"{str(slot_obj.start_time)} - {str(slot_obj.end_time)}"
-        booking_mail(
-            gamer_name=user.name,
-            gamer_phone=user.contact_info.phone,
-            gamer_email=user.contact_info.email,
-            cafe_name=vendor.cafe_name,
-            booking_date=datetime.utcnow().strftime("%Y-%m-%d"),
-            booked_for_date=str(booking.book_date),
-            booking_details=[{
-                "booking_id": booking.id,
-                "slot_time": slot_time
-            }],
-            price_paid=available_game.single_slot_price
-        )
-
-        return jsonify({'message': 'Booking confirmed successfully'}), 200
+        return jsonify({'message': 'Bookings confirmed successfully', 'confirmed_ids': confirmed_ids}), 200
 
     except Exception as e:
         db.session.rollback()
