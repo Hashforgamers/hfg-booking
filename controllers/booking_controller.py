@@ -594,6 +594,10 @@ def new_booking(vendor_id):
         payment_type = data.get("paymentType")
         console_id = data.get("consoleId")
         is_rapid_booking = data.get("isRapidBooking")
+        booking_type = data.get("bookingType")
+
+        if booking_type is None:
+            booking_type = "direct"
 
         if not all([name, email, phone, booked_date, slot_ids, payment_type]):
             return jsonify({"message": "Missing required fields"}), 400
@@ -693,7 +697,7 @@ def new_booking(vendor_id):
                 user_name=user.name,
                 amount=available_game.single_slot_price,
                 mode_of_payment=payment_type,
-                booking_type="direct",
+                booking_type=booking_type,
                 settlement_status="NA" if payment_type != "paid" else "completed"
             )
             db.session.add(transaction)
