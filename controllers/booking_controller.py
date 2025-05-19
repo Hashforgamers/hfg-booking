@@ -217,7 +217,7 @@ def confirm_booking():
             BookingService.insert_into_vendor_dashboard_table(transaction.id, console_id_val)
             BookingService.insert_into_vendor_promo_table(transaction.id, console_id_val)
 
-            if booking.console_id:
+            if console_id_val != -1:
                 db.session.execute(text(f"""
                     UPDATE VENDOR_{vendor.id}_CONSOLE_AVAILABILITY
                     SET is_available = FALSE
