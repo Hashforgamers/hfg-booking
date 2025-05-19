@@ -157,13 +157,14 @@ def create_booking():
 def confirm_booking():
     try:
         data = request.get_json()
-        booking_ids = data.get('booking_id')  # Now expects a list
-        payment_id = data.get('payment_id')  # Optional
+        booking_ids = data.get('booking_id')  # Expects a list
+        payment_id = data.get('payment_id')   # Optional
 
         if not booking_ids:
             return jsonify({'message': 'No booking IDs provided'}), 400
 
         confirmed_ids = []
+
         for booking_id in booking_ids:
             booking = db.session.query(Booking).filter_by(id=booking_id).first()
             if not booking or booking.status == 'confirmed':
@@ -172,9 +173,14 @@ def confirm_booking():
             booking.status = 'confirmed'
             booking.updated_at = datetime.utcnow()
 
+            # Correct: Use your defined AvailableGame model
+            available_game = db.session.query(AvailableGame).filter_by(id=booking.available_game_id).first()
+            if not available_game:
+                continue
+
             transaction = Transaction(
                 booking_id=booking.id,
-                amount=booking.amount,
+                amount=available_game.single_slot_price,
                 payment_status="paid",
                 payment_method=booking.payment_method or "online",
                 created_at=datetime.utcnow()
@@ -184,12 +190,12 @@ def confirm_booking():
 
             vendor = db.session.query(Vendor).filter_by(id=booking.vendor_id).first()
             slot_obj = db.session.query(Slot).filter_by(id=booking.slot_id).first()
-            available_game = db.session.query(AvailableGame).filter_by(id=booking.available_game_id).first()
             user = db.session.query(User).filter_by(id=booking.user_id).first()
 
-            if not all([vendor, slot_obj, available_game, user]):
+            if not all([vendor, slot_obj, user]):
                 continue
 
+            # Update VENDOR-specific slot table
             db.session.execute(text(f"""
                 UPDATE VENDOR_{vendor.id}_SLOT
                 SET available_slot = available_slot - 1,
@@ -214,7 +220,7 @@ def confirm_booking():
                     "game_id": available_game.id
                 })
 
-            # Optional: Send mail per booking
+            # Send mail (optional)
             slot_time = f"{str(slot_obj.start_time)} - {str(slot_obj.end_time)}"
             booking_mail(
                 gamer_name=user.name,
@@ -238,6 +244,7 @@ def confirm_booking():
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 500
+
 
 @booking_blueprint.route('/users/<int:user_id>/bookings', methods=['GET'])
 def get_user_bookings(user_id):
