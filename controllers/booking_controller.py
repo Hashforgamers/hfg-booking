@@ -182,7 +182,7 @@ def confirm_booking():
                 booking_id=booking.id,
                 amount=available_game.single_slot_price,
                 payment_status="paid",
-                payment_method=booking.payment_method or "online",
+                payment_method="hash",
                 created_at=datetime.utcnow()
             )
             db.session.add(transaction)
