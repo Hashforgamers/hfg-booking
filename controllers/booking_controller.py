@@ -193,7 +193,7 @@ def confirm_booking():
             db.session.add(transaction)
             db.session.flush()
 
-            vendor = db.session.query(Vendor).filter_by(id=booking.vendor_id).first()
+            vendor = db.session.query(Vendor).filter_by(id=available_game.vendor_id).first()
             slot_obj = db.session.query(Slot).filter_by(id=booking.slot_id).first()
             user = db.session.query(User).filter_by(id=booking.user_id).first()
 
