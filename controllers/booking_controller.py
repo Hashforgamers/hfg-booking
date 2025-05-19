@@ -60,7 +60,7 @@ def create_booking():
         # Schedule auto-release after 10 seconds
         scheduler = current_app.extensions['scheduler']
         scheduler.enqueue_in(
-            timedelta(seconds=10),
+            timedelta(seconds=360),
             BookingService.release_slot,
             slot_id,
             booking.id,
@@ -237,7 +237,7 @@ def confirm_booking():
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 500
-        
+
 @booking_blueprint.route('/users/<int:user_id>/bookings', methods=['GET'])
 def get_user_bookings(user_id):
     bookings = BookingService.get_user_bookings(user_id)
