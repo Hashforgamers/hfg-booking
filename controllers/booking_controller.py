@@ -159,6 +159,7 @@ def confirm_booking():
         data = request.get_json()
         booking_ids = data.get('booking_id')  # Expects a list
         payment_id = data.get('payment_id')   # Optional
+        book_date = data.get('book_date')
 
         if not booking_ids:
             return jsonify({'message': 'No booking IDs provided'}), 400
@@ -192,8 +193,8 @@ def confirm_booking():
                 user_name=user.name,
                 amount=available_game.single_slot_price,
                 mode_of_payment="hash",
-                booking_date=booking.book_date,
-                booked_date=datetime.utcnow().date(),
+                booking_date=datetime.utcnow().date(),
+                booked_date=booking.book_date,
                 booking_time=datetime.utcnow().time()
             )
 
