@@ -178,6 +178,10 @@ def confirm_booking():
             if not available_game:
                 continue
 
+            vendor = db.session.query(Vendor).filter_by(id=available_game.vendor_id).first()
+            slot_obj = db.session.query(Slot).filter_by(id=booking.slot_id).first()
+            user = db.session.query(User).filter_by(id=booking.user_id).first()
+
             transaction = Transaction(
                 booking_id=booking.id,
                 vendor_id=available_game.vendor_id,
@@ -192,10 +196,6 @@ def confirm_booking():
 
             db.session.add(transaction)
             db.session.flush()
-
-            vendor = db.session.query(Vendor).filter_by(id=available_game.vendor_id).first()
-            slot_obj = db.session.query(Slot).filter_by(id=booking.slot_id).first()
-            user = db.session.query(User).filter_by(id=booking.user_id).first()
 
             if not all([vendor, slot_obj, user]):
                 continue
