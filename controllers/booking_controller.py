@@ -194,7 +194,7 @@ def confirm_booking():
                 amount=available_game.single_slot_price,
                 mode_of_payment="hash",
                 booking_date=datetime.utcnow().date(),
-                booked_date=booking.book_date,
+                booked_date=book_date,
                 booking_time=datetime.utcnow().time()
             )
 
@@ -210,7 +210,7 @@ def confirm_booking():
                 WHERE slot_id = :slot_id AND date = :book_date
             """), {
                 "slot_id": booking.slot_id,
-                "book_date": booking.book_date
+                "book_date": book_date
             })
 
             console_id_val = booking.console_id if booking.console_id else -1
@@ -235,7 +235,7 @@ def confirm_booking():
                 gamer_email=user.contact_info.email,
                 cafe_name=vendor.cafe_name,
                 booking_date=datetime.utcnow().strftime("%Y-%m-%d"),
-                booked_for_date=str(booking.book_date),
+                booked_for_date=str(book_date),
                 booking_details=[{
                     "booking_id": booking.id,
                     "slot_time": slot_time
