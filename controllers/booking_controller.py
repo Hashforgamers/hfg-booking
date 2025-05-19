@@ -73,82 +73,171 @@ def create_booking():
         db.session.rollback()
         return jsonify({"message": "Failed to freeze slot", "error": str(e)}), 500
 
+# @booking_blueprint.route('/bookings/confirm', methods=['POST'])
+# def confirm_booking():
+#     data = request.json
+#     booking_id = data.get("booking_id")
+#     payment_id = data.get("payment_id")
+
+#     if not booking_id or not payment_id:
+#         return jsonify({"message": "booking_id and payment_id are required"}), 400
+
+#     booking = Booking.query.get(booking_id)
+#     if not booking:
+#         return jsonify({"message": "Booking not found"}), 404
+
+#     if booking.status == 'confirmed':
+#         return jsonify({"message": "Booking is already confirmed"}), 400
+
+#     if booking.status == 'verification_failed':
+#         return jsonify({"message": "Booking is already failed"}), 400
+
+#     socketio = current_app.extensions['socketio']
+
+#     try:
+#         with db.session.begin_nested():  # Start a SAVEPOINT transaction
+#             if not BookingService.verifyPayment(payment_id):
+#                 raise ValueError("Payment not verified")
+
+#             # Confirm booking
+#             booking.status = 'confirmed'
+
+#             # 🚀 FIX: Correctly query the slot using slot_id
+#             slot = db.session.query(Slot).filter(Slot.id == booking.slot_id).first()
+#             if not slot:
+#                 raise Exception(f"Slot not found for slot_id: {slot_id}")
+
+#             # Fetch available game correctly
+#             available_game = db.session.query(AvailableGame).filter(AvailableGame.id == slot.gaming_type_id).first()
+#             if not available_game:
+#                 raise Exception("AvailableGame not found")
+
+#             # Fetch vendor correctly
+#             vendor = db.session.query(Vendor).filter(Vendor.id == available_game.vendor_id).first()
+#             if not vendor:
+#                 raise Exception("Vendor not found")
+
+#             user_id = booking.user_id
+
+#             user= db.session.query(User).filter(User.id == user_id).first()
+
+#             # Create a transaction
+#             transaction = Transaction(
+#                 booking_id=booking.id,
+#                 vendor_id=vendor.id,
+#                 user_id=user.id,
+#                 booked_date=datetime.utcnow().date(),
+#                 booking_time=datetime.utcnow().time(),
+#                 user_name=user.name,
+#                 amount=available_game.single_slot_price,
+#                 mode_of_payment="online",
+#                 booking_type="hash",
+#                 settlement_status="pending"
+#             )
+
+#             db.session.add(transaction)
+#             db.session.commit()
+        
+#         db.session.commit()  # Commit the transaction **after** exiting the block
+
+#         # ✅ Emit WebSocket event AFTER transaction commits
+#         socketio.emit('slot_booked', {'slot_id': booking.slot_id, 'booking_id': booking.id , 'status': 'booked'})
+
+#         return jsonify({"message": "Booking confirmed successfully", "booking_id": booking.id}), 200
+
+#     except Exception as e:
+#         db.session.rollback()
+#         return jsonify({"message": "Failed to confirm booking", "error": str(e)}), 500
+
 @booking_blueprint.route('/bookings/confirm', methods=['POST'])
 def confirm_booking():
-    data = request.json
-    booking_id = data.get("booking_id")
-    payment_id = data.get("payment_id")
-
-    if not booking_id or not payment_id:
-        return jsonify({"message": "booking_id and payment_id are required"}), 400
-
-    booking = Booking.query.get(booking_id)
-    if not booking:
-        return jsonify({"message": "Booking not found"}), 404
-
-    if booking.status == 'confirmed':
-        return jsonify({"message": "Booking is already confirmed"}), 400
-
-    if booking.status == 'verification_failed':
-        return jsonify({"message": "Booking is already failed"}), 400
-
-    socketio = current_app.extensions['socketio']
-
     try:
-        with db.session.begin_nested():  # Start a SAVEPOINT transaction
-            if not BookingService.verifyPayment(payment_id):
-                raise ValueError("Payment not verified")
+        data = request.get_json()
+        booking_id = data.get('booking_id')
 
-            # Confirm booking
-            booking.status = 'confirmed'
+        booking = db.session.query(Booking).filter_by(id=booking_id).first()
+        if not booking:
+            return jsonify({'message': 'Booking not found'}), 404
 
-            # 🚀 FIX: Correctly query the slot using slot_id
-            slot = db.session.query(Slot).filter(Slot.id == booking.slot_id).first()
-            if not slot:
-                raise Exception(f"Slot not found for slot_id: {slot_id}")
+        if booking.status == 'confirmed':
+            return jsonify({'message': 'Booking already confirmed'}), 400
 
-            # Fetch available game correctly
-            available_game = db.session.query(AvailableGame).filter(AvailableGame.id == slot.gaming_type_id).first()
-            if not available_game:
-                raise Exception("AvailableGame not found")
+        # Mark the booking as confirmed
+        booking.status = 'confirmed'
+        booking.updated_at = datetime.utcnow()
 
-            # Fetch vendor correctly
-            vendor = db.session.query(Vendor).filter(Vendor.id == available_game.vendor_id).first()
-            if not vendor:
-                raise Exception("Vendor not found")
+        # Create Transaction
+        transaction = Transaction(
+            booking_id=booking.id,
+            amount=booking.amount,
+            payment_status="paid",
+            payment_method=booking.payment_method or "online",
+            created_at=datetime.utcnow()
+        )
+        db.session.add(transaction)
 
-            user_id = booking.user_id
+        # Fetch vendor, slot, and available game details
+        vendor = db.session.query(Vendor).filter_by(id=booking.vendor_id).first()
+        slot_obj = db.session.query(Slot).filter_by(id=booking.slot_id).first()
+        available_game = db.session.query(AvailableGame).filter_by(id=booking.available_game_id).first()
+        user = db.session.query(User).filter_by(id=booking.user_id).first()
 
-            user= db.session.query(User).filter(User.id == user_id).first()
+        if not all([vendor, slot_obj, available_game, user]):
+            return jsonify({'message': 'Booking data incomplete'}), 500
 
-            # Create a transaction
-            transaction = Transaction(
-                booking_id=booking.id,
-                vendor_id=vendor.id,
-                user_id=user.id,
-                booked_date=datetime.utcnow().date(),
-                booking_time=datetime.utcnow().time(),
-                user_name=user.name,
-                amount=available_game.single_slot_price,
-                mode_of_payment="online",
-                booking_type="hash",
-                settlement_status="pending"
-            )
+        # Update Slot Availability
+        db.session.execute(text(f"""
+            UPDATE VENDOR_{vendor.id}_SLOT
+            SET available_slot = available_slot - 1,
+                is_available = CASE WHEN available_slot - 1 = 0 THEN FALSE ELSE is_available END
+            WHERE slot_id = :slot_id AND date = :book_date
+        """), {
+            "slot_id": booking.slot_id,
+            "book_date": booking.book_date
+        })
 
-            db.session.add(transaction)
-            db.session.commit()
-        
-        db.session.commit()  # Commit the transaction **after** exiting the block
+        # Insert into Vendor Dashboard and Promo Tables
+        console_id_val = booking.console_id if booking.console_id else -1
+        db.session.flush()  # Ensure transaction.id is generated
+        BookingService.insert_into_vendor_dashboard_table(transaction.id, console_id_val)
+        BookingService.insert_into_vendor_promo_table(transaction.id, console_id_val)
 
-        # ✅ Emit WebSocket event AFTER transaction commits
-        socketio.emit('slot_booked', {'slot_id': booking.slot_id, 'booking_id': booking.id , 'status': 'booked'})
+        # Optional: Update Console Availability if rapid booking
+        if booking.console_id:  # Only update if console assigned
+            db.session.execute(text(f"""
+                UPDATE VENDOR_{vendor.id}_CONSOLE_AVAILABILITY
+                SET is_available = FALSE
+                WHERE console_id = :console_id AND game_id = :game_id
+            """), {
+                "console_id": booking.console_id,
+                "game_id": available_game.id
+            })
 
-        return jsonify({"message": "Booking confirmed successfully", "booking_id": booking.id}), 200
+        # Commit all changes
+        db.session.commit()
+
+        # Send Booking Confirmation Email
+        slot_time = f"{str(slot_obj.start_time)} - {str(slot_obj.end_time)}"
+        booking_mail(
+            gamer_name=user.name,
+            gamer_phone=user.contact_info.phone,
+            gamer_email=user.contact_info.email,
+            cafe_name=vendor.cafe_name,
+            booking_date=datetime.utcnow().strftime("%Y-%m-%d"),
+            booked_for_date=str(booking.book_date),
+            booking_details=[{
+                "booking_id": booking.id,
+                "slot_time": slot_time
+            }],
+            price_paid=available_game.single_slot_price
+        )
+
+        return jsonify({'message': 'Booking confirmed successfully'}), 200
 
     except Exception as e:
         db.session.rollback()
-        return jsonify({"message": "Failed to confirm booking", "error": str(e)}), 500
-
+        return jsonify({'error': str(e)}), 500
+        
 @booking_blueprint.route('/users/<int:user_id>/bookings', methods=['GET'])
 def get_user_bookings(user_id):
     bookings = BookingService.get_user_bookings(user_id)
