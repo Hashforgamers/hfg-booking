@@ -213,7 +213,7 @@ def confirm_booking():
                 "book_date": book_date
             })
 
-            console_id_val = booking.console_id if booking.console_id else -1
+            console_id_val = -1
             BookingService.insert_into_vendor_dashboard_table(transaction.id, console_id_val)
             BookingService.insert_into_vendor_promo_table(transaction.id, console_id_val)
 
