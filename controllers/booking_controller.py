@@ -180,11 +180,16 @@ def confirm_booking():
 
             transaction = Transaction(
                 booking_id=booking.id,
+                vendor_id=booking.vendor_id,
+                user_id=booking.user_id,
+                user_name=user.name,
                 amount=available_game.single_slot_price,
-                payment_status="paid",
-                payment_method="hash",
-                created_at=datetime.utcnow()
+                mode_of_payment="hash",
+                booking_date=booking.book_date,
+                booked_date=datetime.utcnow().date(),
+                booking_time=datetime.utcnow().time()
             )
+
             db.session.add(transaction)
             db.session.flush()
 
