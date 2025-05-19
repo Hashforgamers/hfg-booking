@@ -180,7 +180,7 @@ def confirm_booking():
 
             transaction = Transaction(
                 booking_id=booking.id,
-                vendor_id=booking.vendor_id,
+                vendor_id=available_game.vendor_id,
                 user_id=booking.user_id,
                 user_name=user.name,
                 amount=available_game.single_slot_price,
