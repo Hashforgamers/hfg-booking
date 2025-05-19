@@ -174,7 +174,7 @@ def confirm_booking():
             booking.updated_at = datetime.utcnow()
 
             # Correct: Use your defined AvailableGame model
-            available_game = db.session.query(AvailableGame).filter_by(id=booking.available_game_id).first()
+            available_game = db.session.query(AvailableGame).filter_by(id=booking.game_id).first()
             if not available_game:
                 continue
 
