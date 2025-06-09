@@ -178,7 +178,10 @@ class BookingService:
         book_obj = Booking.query.filter_by(id=trans_obj.booking_id).first()
         slot_obj = Slot.query.filter_by(id=book_obj.slot_id).first()
         available_game_obj = AvailableGame.query.filter_by(id=book_obj.game_id).first()
-        book_status = "upcoming"
+        if book_obj.status == "extra":
+            book_status = "extra"
+        else
+            book_status = "upcoming"
 
         vendor_id = trans_obj.vendor_id
         table_name = f"VENDOR_{vendor_id}_DASHBOARD"
