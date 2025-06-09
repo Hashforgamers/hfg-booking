@@ -180,7 +180,7 @@ class BookingService:
         available_game_obj = AvailableGame.query.filter_by(id=book_obj.game_id).first()
         if book_obj.status == "extra":
             book_status = "extra"
-        else
+        else:
             book_status = "upcoming"
 
         vendor_id = trans_obj.vendor_id
