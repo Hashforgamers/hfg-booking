@@ -623,6 +623,8 @@ def new_booking(vendor_id):
         console_id = data.get("consoleId")
         is_rapid_booking = data.get("isRapidBooking")
         booking_type = data.get("bookingType")
+        # Extract user_id safely from the data
+        user_id = data.get("userId") if data.get("userId") is not None else None
 
         dashboard_status = None
 
@@ -633,7 +635,10 @@ def new_booking(vendor_id):
             return jsonify({"message": "Missing required fields"}), 400
 
         # Check if user already exists
-        user = db.session.query(User).join(ContactInfo).filter(ContactInfo.email == email).first()
+        if user_id is not None:
+            user = db.session.query(User).filter(User.id == user_id).first()
+        else:
+            user = db.session.query(User).join(ContactInfo).filter(ContactInfo.email == email).first()
 
         if not user:
             # Create a new user
