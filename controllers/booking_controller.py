@@ -23,7 +23,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy import func, distinct
 from services.mail_service import booking_mail, reject_booking_mail, extra_booking_time_mail
 
-from utils.identifiers import generate_fid
+from utils.common import generate_fid
 
 booking_blueprint = Blueprint('bookings', __name__)
 
