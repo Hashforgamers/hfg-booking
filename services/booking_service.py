@@ -166,7 +166,7 @@ class BookingService:
                 db.session.remove()  # Ensure DB session cleanup
 
     @staticmethod
-    def insert_into_vendor_dashboard_table(trans_id, console_id):
+    def insert_into_vendor_dashboard_table(trans_id, console_id, status=None):
         """Inserts booking and transaction details into the vendor dashboard table."""
         
         # Fetch required objects
@@ -178,7 +178,9 @@ class BookingService:
         book_obj = Booking.query.filter_by(id=trans_obj.booking_id).first()
         slot_obj = Slot.query.filter_by(id=book_obj.slot_id).first()
         available_game_obj = AvailableGame.query.filter_by(id=book_obj.game_id).first()
-        if book_obj.status == "extra":
+        if status!= None and status == "current":
+            book_status = "current"
+        elif book_obj.status == "extra":
             book_status = "extra"
         else:
             book_status = "upcoming"

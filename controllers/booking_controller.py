@@ -23,6 +23,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy import func, distinct
 from services.mail_service import booking_mail, reject_booking_mail, extra_booking_time_mail
 
+from utils.identifiers import generate_fid
 
 booking_blueprint = Blueprint('bookings', __name__)
 
@@ -76,82 +77,6 @@ def create_booking():
     except Exception as e:
         db.session.rollback()
         return jsonify({"message": "Failed to freeze slot(s)", "error": str(e)}), 500
-
-# @booking_blueprint.route('/bookings/confirm', methods=['POST'])
-# def confirm_booking():
-#     data = request.json
-#     booking_id = data.get("booking_id")
-#     payment_id = data.get("payment_id")
-
-#     if not booking_id or not payment_id:
-#         return jsonify({"message": "booking_id and payment_id are required"}), 400
-
-#     booking = Booking.query.get(booking_id)
-#     if not booking:
-#         return jsonify({"message": "Booking not found"}), 404
-
-#     if booking.status == 'confirmed':
-#         return jsonify({"message": "Booking is already confirmed"}), 400
-
-#     if booking.status == 'verification_failed':
-#         return jsonify({"message": "Booking is already failed"}), 400
-
-#     socketio = current_app.extensions['socketio']
-
-#     try:
-#         with db.session.begin_nested():  # Start a SAVEPOINT transaction
-#             if not BookingService.verifyPayment(payment_id):
-#                 raise ValueError("Payment not verified")
-
-#             # Confirm booking
-#             booking.status = 'confirmed'
-
-#             # 🚀 FIX: Correctly query the slot using slot_id
-#             slot = db.session.query(Slot).filter(Slot.id == booking.slot_id).first()
-#             if not slot:
-#                 raise Exception(f"Slot not found for slot_id: {slot_id}")
-
-#             # Fetch available game correctly
-#             available_game = db.session.query(AvailableGame).filter(AvailableGame.id == slot.gaming_type_id).first()
-#             if not available_game:
-#                 raise Exception("AvailableGame not found")
-
-#             # Fetch vendor correctly
-#             vendor = db.session.query(Vendor).filter(Vendor.id == available_game.vendor_id).first()
-#             if not vendor:
-#                 raise Exception("Vendor not found")
-
-#             user_id = booking.user_id
-
-#             user= db.session.query(User).filter(User.id == user_id).first()
-
-#             # Create a transaction
-#             transaction = Transaction(
-#                 booking_id=booking.id,
-#                 vendor_id=vendor.id,
-#                 user_id=user.id,
-#                 booked_date=datetime.utcnow().date(),
-#                 booking_time=datetime.utcnow().time(),
-#                 user_name=user.name,
-#                 amount=available_game.single_slot_price,
-#                 mode_of_payment="online",
-#                 booking_type="hash",
-#                 settlement_status="pending"
-#             )
-
-#             db.session.add(transaction)
-#             db.session.commit()
-        
-#         db.session.commit()  # Commit the transaction **after** exiting the block
-
-#         # ✅ Emit WebSocket event AFTER transaction commits
-#         socketio.emit('slot_booked', {'slot_id': booking.slot_id, 'booking_id': booking.id , 'status': 'booked'})
-
-#         return jsonify({"message": "Booking confirmed successfully", "booking_id": booking.id}), 200
-
-#     except Exception as e:
-#         db.session.rollback()
-#         return jsonify({"message": "Failed to confirm booking", "error": str(e)}), 500
 
 @booking_blueprint.route('/bookings/confirm', methods=['POST'])
 def confirm_booking():
@@ -251,7 +176,6 @@ def confirm_booking():
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 500
-
 
 @booking_blueprint.route('/users/<int:user_id>/bookings', methods=['GET'])
 def get_user_bookings(user_id):
@@ -700,10 +624,12 @@ def new_booking(vendor_id):
         is_rapid_booking = data.get("isRapidBooking")
         booking_type = data.get("bookingType")
 
+        dashboard_status = None
+
         if booking_type is None:
             booking_type = "direct"
 
-        if not all([name, email, phone, booked_date, slot_ids, payment_type]):
+        if not all([name, phone, booked_date, slot_ids, payment_type]):
             return jsonify({"message": "Missing required fields"}), 400
 
         # Check if user already exists
@@ -712,7 +638,7 @@ def new_booking(vendor_id):
         if not user:
             # Create a new user
             user = User(
-                fid=email,
+                fid=generate_fid(),
                 avatar_path="Not defined",
                 name=name,
                 game_username=name.lower().replace(" ", "_"),
@@ -808,6 +734,8 @@ def new_booking(vendor_id):
             transactions.append(transaction)
 
         if is_rapid_booking:
+            dashboard_status = "current"
+
             # ✅ Define the dynamic console availability table name
             console_table_name = f"VENDOR_{vendor_id}_CONSOLE_AVAILABILITY"
 
@@ -837,7 +765,7 @@ def new_booking(vendor_id):
 
         for trans in transactions:
             console_id_val = console_id if console_id is not None else -1
-            BookingService.insert_into_vendor_dashboard_table(trans.id, console_id_val)
+            BookingService.insert_into_vendor_dashboard_table(trans.id, console_id_val, dashboard_status),
             BookingService.insert_into_vendor_promo_table(trans.id, console_id_val)
 
         # Extract slot times for the email
