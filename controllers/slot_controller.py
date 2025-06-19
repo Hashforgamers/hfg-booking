@@ -4,6 +4,7 @@ from flask_socketio import emit
 from db.extensions import db
 from sqlalchemy.sql import text 
 from datetime import datetime
+from models.availableGame import AvailableGame
 
 slot_blueprint = Blueprint('slots', __name__)
 
