@@ -15,6 +15,8 @@ from models.user import User
 from models.contactInfo import ContactInfo
 from models.console import Console
 from models.voucher import Voucher
+from models.voucherRedemptionLog import VoucherRedemptionLog
+from models.paymentTransactionMapping import PaymentTransactionMapping
 
 from sqlalchemy.sql import text
 from sqlalchemy.orm import joinedload
