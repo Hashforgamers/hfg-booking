@@ -14,6 +14,7 @@ from models.vendor import Vendor
 from models.user import User
 from models.contactInfo import ContactInfo
 from models.console import Console
+from models.voucher import Voucher
 
 from sqlalchemy.sql import text
 from sqlalchemy.orm import joinedload
