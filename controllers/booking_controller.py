@@ -85,6 +85,7 @@ def confirm_booking():
         booking_ids = data.get('booking_id')  # Expects a list
         payment_id = data.get('payment_id')   # Optional
         book_date = data.get('book_date')
+        voucher_code = data.get("voucher_code")  # NEW: Get voucher code from request
 
         if not booking_ids:
             return jsonify({'message': 'No booking IDs provided'}), 400
@@ -99,7 +100,6 @@ def confirm_booking():
             booking.status = 'confirmed'
             booking.updated_at = datetime.utcnow()
 
-            # Correct: Use your defined AvailableGame model
             available_game = db.session.query(AvailableGame).filter_by(id=booking.game_id).first()
             if not available_game:
                 continue
@@ -107,27 +107,43 @@ def confirm_booking():
             vendor = db.session.query(Vendor).filter_by(id=available_game.vendor_id).first()
             slot_obj = db.session.query(Slot).filter_by(id=booking.slot_id).first()
             user = db.session.query(User).filter_by(id=booking.user_id).first()
-
             if not all([vendor, slot_obj, user]):
-                continue  # Skip this booking if any of these is missing
+                continue
 
+            # --- Voucher validation ---
+            voucher = None
+            if voucher_code:
+                voucher = db.session.query(Voucher).filter_by(code=voucher_code, user_id=user.id, is_active=True).first()
+                if not voucher:
+                    return jsonify({'message': 'Invalid or expired voucher'}), 400
+
+            # --- Create transaction ---
+            amount = 0 if voucher else available_game.single_slot_price
             transaction = Transaction(
                 booking_id=booking.id,
                 vendor_id=available_game.vendor_id,
                 user_id=booking.user_id,
                 user_name=user.name,
-                amount=available_game.single_slot_price,
+                amount=amount,
                 mode_of_payment="hash",
                 booking_date=datetime.utcnow().date(),
                 booked_date=book_date,
                 booking_time=datetime.utcnow().time()
             )
-
             db.session.add(transaction)
             db.session.flush()
 
+            # --- Mark voucher as used and log redemption ---
+            if voucher:
+                voucher.is_active = False
+                redemption_log = VoucherRedemptionLog(
+                    user_id=user.id,
+                    voucher_id=voucher.id,
+                    booking_id=booking.id
+                )
+                db.session.add(redemption_log)
 
-            # Update VENDOR-specific slot table
+            # --- Update slot availability ---
             db.session.execute(text(f"""
                 UPDATE VENDOR_{vendor.id}_SLOT
                 SET available_slot = available_slot - 1,
@@ -138,6 +154,7 @@ def confirm_booking():
                 "book_date": book_date
             })
 
+            # --- Vendor dashboard & console logic ---
             console_id_val = -1
             BookingService.insert_into_vendor_dashboard_table(transaction.id, console_id_val)
             BookingService.insert_into_vendor_promo_table(transaction.id, console_id_val)
@@ -152,7 +169,7 @@ def confirm_booking():
                     "game_id": available_game.id
                 })
 
-            # Send mail (optional)
+            # --- Send booking confirmation email ---
             slot_time = f"{str(slot_obj.start_time)} - {str(slot_obj.end_time)}"
             booking_mail(
                 gamer_name=user.name,
@@ -165,7 +182,7 @@ def confirm_booking():
                     "booking_id": booking.id,
                     "slot_time": slot_time
                 }],
-                price_paid=available_game.single_slot_price
+                price_paid=amount
             )
 
             confirmed_ids.append(booking.id)

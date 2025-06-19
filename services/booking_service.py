@@ -10,6 +10,7 @@ from sqlalchemy.sql import text
 from flask import current_app
 from models.transaction import Transaction
 from models.user import User
+from models.paymentTransactionMapping import PaymentTransactionMapping
 
 
 class BookingService:
@@ -276,3 +277,15 @@ class BookingService:
         })
         db.session.commit()
         current_app.logger.info(f"Updated booking status to '{new_status}' for transaction {trans_id} in {table_name}")
+
+    @staticmethod
+    def save_payment_transaction_mapping(booking_id, transaction_id, payment_id):
+        if not all([booking_id, transaction_id, payment_id]):
+            return  # Skip if any of the values are missing
+        
+        mapping = PaymentTransactionMapping(
+            booking_id=booking_id,
+            transaction_id=transaction_id,
+            payment_id=payment_id
+        )
+        db.session.add(mapping)
