@@ -133,6 +133,10 @@ def confirm_booking():
             db.session.add(transaction)
             db.session.flush()
 
+            # --- Save payment to transaction mapping ---
+            if payment_id:
+                BookingService.save_payment_transaction_mapping(booking.id, transaction.id, payment_id)
+                
             # --- Mark voucher as used and log redemption ---
             if voucher:
                 voucher.is_active = False
