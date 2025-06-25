@@ -17,6 +17,7 @@ from models.console import Console
 from models.voucher import Voucher
 from models.voucherRedemptionLog import VoucherRedemptionLog
 from models.paymentTransactionMapping import PaymentTransactionMapping
+from models.userHashCoin import UserHashCoin
 
 from sqlalchemy.sql import text
 from sqlalchemy.orm import joinedload
@@ -120,8 +121,21 @@ def confirm_booking():
                 if not voucher:
                     return jsonify({'message': 'Invalid or expired voucher'}), 400
 
+            # Credit 1000 Hash Coins per confirmed booking
+            user_hash_coin = db.session.query(UserHashCoin).filter_by(user_id=user.id).first()
+            if not user_hash_coin:
+                user_hash_coin = UserHashCoin(user_id=user.id, hash_coins=0)
+                db.session.add(user_hash_coin)
+
+            user_hash_coin.hash_coins += 1000
+
+            # --- Calculate Payment Amount ---
+            slot_price = available_game.single_slot_price
+            discount_percentage = voucher.discount_percentage if voucher else 0
+            discount_amount = int(slot_price * discount_percentage / 100)
+            amount = slot_price - discount_amount
+
             # --- Create transaction ---
-            amount = 0 if voucher else available_game.single_slot_price
             transaction = Transaction(
                 booking_id=booking.id,
                 vendor_id=available_game.vendor_id,
@@ -200,6 +214,43 @@ def confirm_booking():
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 500
+
+@booking_blueprint.route('/redeem-voucher', methods=['POST'])
+def redeem_voucher():
+    data = request.json
+    user_id = data.get('user_id')
+    discount = data.get('discount_percentage')  # expected: 10, 20, 30
+
+    if discount not in [10, 20, 30]:
+        return jsonify({"message": "Invalid discount value"}), 400
+
+    required_coins = discount * 1000  # 10% = 10k coins, 20% = 20k, etc.
+
+    user_hash_coin = db.session.query(UserHashCoin).filter_by(user_id=user_id).first()
+    if not user_hash_coin or user_hash_coin.hash_coins < required_coins:
+        return jsonify({"message": "Not enough Hash Coins"}), 400
+
+    # Deduct coins
+    user_hash_coin.hash_coins -= required_coins
+
+    # Generate unique voucher code
+    import random, string
+    code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
+
+    voucher = Voucher(
+        code=code,
+        user_id=user_id,
+        discount_percentage=discount,
+        is_active=True
+    )
+    db.session.add(voucher)
+    db.session.commit()
+
+    return jsonify({
+        "message": f"{discount}% voucher created successfully",
+        "voucher_code": code,
+        "hash_coins_remaining": user_hash_coin.hash_coins
+    }), 200
 
 @booking_blueprint.route('/users/<int:user_id>/bookings', methods=['GET'])
 def get_user_bookings(user_id):
