@@ -4,6 +4,7 @@ from flask_socketio import emit
 from db.extensions import db
 from sqlalchemy.sql import text 
 from datetime import datetime
+from models.availableGame import AvailableGame
 
 slot_blueprint = Blueprint('slots', __name__)
 
@@ -21,18 +22,23 @@ def get_slots():
 def get_slots_on_game_id(vendorId, gameId, date):
     """
     Fetch available slots from the dynamic VENDOR_<vendorId>_SLOT table based on date and gameId.
+    Append single_slot_price from available_games.
     """
     try:
-        # Ensure date is in YYYYMMDD format
         if len(date) != 8 or not date.isdigit():
             return jsonify({"error": "Invalid date format. Use YYYYMMDD."}), 400
 
-        formatted_date = f"{date[:4]}-{date[4:6]}-{date[6:8]}"  # Convert to YYYY-MM-DD
-        
-        # Define the dynamic table name
+        formatted_date = f"{date[:4]}-{date[4:6]}-{date[6:8]}"
         table_name = f"VENDOR_{vendorId}_SLOT"
 
-        # Prepare SQL query to fetch slots
+        # Step 1: Get price from AvailableGame
+        available_game = AvailableGame.query.filter_by(id=gameId, vendor_id=vendorId).first()
+        if not available_game:
+            return jsonify({"error": "Game not found for this vendor."}), 404
+
+        single_slot_price = available_game.single_slot_price
+
+        # Step 2: Fetch relevant slots from dynamic slot table
         sql_query = text(f"""
             SELECT slot_id, is_available, available_slot
             FROM {table_name}
@@ -41,21 +47,20 @@ def get_slots_on_game_id(vendorId, gameId, date):
             )
             ORDER BY slot_id;
         """)
-
-        # Execute query
         result = db.session.execute(sql_query, {"date": formatted_date, "gameId": gameId}).fetchall()
 
-        # Format response
-        slots = [
-            {
-                "slot_id": row[0],
-                "start_time": Slot.query.get(row[0]).start_time.strftime("%H:%M:%S"),  # Convert to string
-                "end_time": Slot.query.get(row[0]).end_time.strftime("%H:%M:%S"),      # Convert to string
-                "is_available": row[1],
-                "available_slot": row[2]
-            }
-            for row in result
-        ]
+        slots = []
+        for row in result:
+            slot = Slot.query.get(row[0])
+            if slot:
+                slots.append({
+                    "slot_id": row[0],
+                    "start_time": slot.start_time.strftime("%H:%M:%S"),
+                    "end_time": slot.end_time.strftime("%H:%M:%S"),
+                    "is_available": row[1],
+                    "available_slot": row[2],
+                    "single_slot_price": single_slot_price  # 🔥 Added here
+                })
 
         return jsonify({"slots": slots}), 200
 

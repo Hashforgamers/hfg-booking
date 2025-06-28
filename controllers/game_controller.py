@@ -116,6 +116,7 @@ def get_all_console_by_vendor_id(vendor_id):
     return jsonify({
         "games": [{
             "id": game.id,
-            "console_name": game.game_name
+            "console_name": game.game_name,
+            "console_price":game.single_slot_price
         } for game in games],
     })

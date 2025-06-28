@@ -10,6 +10,7 @@ from sqlalchemy.sql import text
 from flask import current_app
 from models.transaction import Transaction
 from models.user import User
+from models.paymentTransactionMapping import PaymentTransactionMapping
 
 
 class BookingService:
@@ -166,7 +167,7 @@ class BookingService:
                 db.session.remove()  # Ensure DB session cleanup
 
     @staticmethod
-    def insert_into_vendor_dashboard_table(trans_id, console_id):
+    def insert_into_vendor_dashboard_table(trans_id, console_id, status=None):
         """Inserts booking and transaction details into the vendor dashboard table."""
         
         # Fetch required objects
@@ -178,7 +179,12 @@ class BookingService:
         book_obj = Booking.query.filter_by(id=trans_obj.booking_id).first()
         slot_obj = Slot.query.filter_by(id=book_obj.slot_id).first()
         available_game_obj = AvailableGame.query.filter_by(id=book_obj.game_id).first()
-        book_status = "upcoming"
+        if status!= None and status == "current":
+            book_status = "current"
+        elif book_obj.status == "extra":
+            book_status = "extra"
+        else:
+            book_status = "upcoming"
 
         vendor_id = trans_obj.vendor_id
         table_name = f"VENDOR_{vendor_id}_DASHBOARD"
@@ -271,3 +277,15 @@ class BookingService:
         })
         db.session.commit()
         current_app.logger.info(f"Updated booking status to '{new_status}' for transaction {trans_id} in {table_name}")
+
+    @staticmethod
+    def save_payment_transaction_mapping(booking_id, transaction_id, payment_id):
+        if not all([booking_id, transaction_id, payment_id]):
+            return  # Skip if any of the values are missing
+        
+        mapping = PaymentTransactionMapping(
+            booking_id=booking_id,
+            transaction_id=transaction_id,
+            payment_id=payment_id
+        )
+        db.session.add(mapping)
