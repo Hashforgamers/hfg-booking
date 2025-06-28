@@ -141,6 +141,8 @@ def confirm_booking():
                 vendor_id=available_game.vendor_id,
                 user_id=booking.user_id,
                 user_name=user.name,
+                original_amount=slot_price,
+                discounted_amount=discount_amount,
                 amount=amount,
                 mode_of_payment="hash",
                 booking_date=datetime.utcnow().date(),
@@ -352,6 +354,8 @@ def direct_booking():
                 booked_date=datetime.strptime(booked_date, "%Y-%m-%d").date(),
                 booking_time=datetime.utcnow().time(),
                 user_name=user_name,
+                original_amount=available_game.single_slot_price,
+                discounted_amount=0,
                 amount=available_game.single_slot_price,  # Assuming the amount is per slot
                 mode_of_payment=payment_method,
                 booking_type="direct",
@@ -429,6 +433,8 @@ def reject_booking():
             booked_date=datetime.utcnow().date(),
             booking_time=datetime.utcnow().time(),
             user_name=f"{booking.transaction.user_name} {repayment_type.upper()}-{booking.transaction.id}",
+            original_amount=-booking.transaction.amount,
+            discounted_amount=0,
             amount=-booking.transaction.amount,  # Negative amount for refund
             mode_of_payment=booking.transaction.mode_of_payment,
             booking_type=repayment_type,  # refund, credit, reschedule
@@ -805,6 +811,8 @@ def new_booking(vendor_id):
                 booked_date=datetime.strptime(booked_date, "%Y-%m-%d").date(),
                 booking_time=datetime.utcnow().time(),
                 user_name=user.name,
+                original_amount=available_game.single_slot_price,
+                discounted_amount = Column(Float, nullable=False, default=0)
                 amount=available_game.single_slot_price,
                 mode_of_payment=payment_type,
                 booking_type=booking_type,
@@ -935,6 +943,8 @@ def extra_booking():
             booked_date=booked_date,
             booking_time=datetime.utcnow().time(),
             user_name=username,
+            original_amount=amount,
+            discounted_amount=0,
             amount=amount,
             mode_of_payment=mode_of_payment,
             booking_type="extra",

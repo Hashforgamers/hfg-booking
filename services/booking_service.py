@@ -227,8 +227,8 @@ class BookingService:
             raise ValueError(f"Booking with ID {trans_obj.booking_id} not found.")
 
         # Fetch promo data — assume it's in the transaction metadata or external source
-        promo_code = "LAUNCH10"
-        discount_applied = "10"
+        promo_code = "NOPROMO"
+        discount_applied = "0"
         actual_price = trans_obj.amount if trans_obj.amount else 0.0
 
         if not promo_code or discount_applied is None:
