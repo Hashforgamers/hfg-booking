@@ -812,7 +812,7 @@ def new_booking(vendor_id):
                 booking_time=datetime.utcnow().time(),
                 user_name=user.name,
                 original_amount=available_game.single_slot_price,
-                discounted_amount = Column(Float, nullable=False, default=0)
+                discounted_amount = 0,
                 amount=available_game.single_slot_price,
                 mode_of_payment=payment_type,
                 booking_type=booking_type,
