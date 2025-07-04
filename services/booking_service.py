@@ -11,6 +11,8 @@ from flask import current_app
 from models.transaction import Transaction
 from models.user import User
 from models.paymentTransactionMapping import PaymentTransactionMapping
+from models.hashWallet import HashWallet
+from models.hashWalletTransaction import HashWalletTransaction
 
 
 class BookingService:
@@ -289,3 +291,25 @@ class BookingService:
             payment_id=payment_id
         )
         db.session.add(mapping)
+
+    @staticmethod
+    def debit_wallet(user_id, booking_id, amount):
+        wallet = db.session.query(HashWallet).filter_by(user_id=user_id).first()
+
+        if not wallet:
+            wallet = HashWallet(user_id=user_id, balance=0)
+            db.session.add(wallet)
+            db.session.flush()
+
+        if wallet.balance < amount:
+            raise ValueError("Insufficient wallet balance")
+
+        wallet.balance -= amount
+
+        wallet_txn = HashWalletTransaction(
+            user_id=user_id,
+            amount=-amount,
+            type='booking',
+            reference_id=booking_id
+        )
+        db.session.add(wallet_txn)
