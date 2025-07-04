@@ -27,6 +27,9 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy import func, distinct
 from services.mail_service import booking_mail, reject_booking_mail, extra_booking_time_mail
 
+from models.hashWallet import HashWallet
+from models.hashWalletTransaction import HashWalletTransaction
+
 from utils.common import generate_fid
 
 booking_blueprint = Blueprint('bookings', __name__)
@@ -89,7 +92,8 @@ def confirm_booking():
         booking_ids = data.get('booking_id')  # Expects a list
         payment_id = data.get('payment_id')   # Optional
         book_date = data.get('book_date')
-        voucher_code = data.get("voucher_code")  # NEW: Get voucher code from request
+        voucher_code = data.get("voucher_code")
+        mode = data.get("payment_mode", "payment_gateway")  # Default to payment_gateway
 
         if not booking_ids:
             return jsonify({'message': 'No booking IDs provided'}), 400
@@ -105,23 +109,20 @@ def confirm_booking():
             booking.updated_at = datetime.utcnow()
 
             available_game = db.session.query(AvailableGame).filter_by(id=booking.game_id).first()
-            if not available_game:
-                continue
-
             vendor = db.session.query(Vendor).filter_by(id=available_game.vendor_id).first()
             slot_obj = db.session.query(Slot).filter_by(id=booking.slot_id).first()
             user = db.session.query(User).filter_by(id=booking.user_id).first()
             if not all([vendor, slot_obj, user]):
                 continue
 
-            # --- Voucher validation ---
+            # --- Voucher handling ---
             voucher = None
             if voucher_code:
                 voucher = db.session.query(Voucher).filter_by(code=voucher_code, user_id=user.id, is_active=True).first()
                 if not voucher:
                     return jsonify({'message': 'Invalid or expired voucher'}), 400
 
-            # Credit 1000 Hash Coins per confirmed booking
+            # --- Credit reward points ---
             user_hash_coin = db.session.query(UserHashCoin).filter_by(user_id=user.id).first()
             if not user_hash_coin:
                 user_hash_coin = UserHashCoin(user_id=user.id, hash_coins=0)
@@ -129,11 +130,21 @@ def confirm_booking():
 
             user_hash_coin.hash_coins += 1000
 
-            # --- Calculate Payment Amount ---
+            # --- Calculate price after discount ---
             slot_price = available_game.single_slot_price
             discount_percentage = voucher.discount_percentage if voucher else 0
             discount_amount = int(slot_price * discount_percentage / 100)
             amount = slot_price - discount_amount
+
+            # --- Handle payment by wallet ---
+            if mode == "wallet":
+                try:
+                    BookingService.debit_wallet(user.id, booking.id, amount)
+                    payment_mode_used = "wallet"
+                except ValueError as e:
+                    return jsonify({"message": str(e)}), 400
+            else:
+                payment_mode_used = "payment_gateway"
 
             # --- Create transaction ---
             transaction = Transaction(
@@ -144,7 +155,7 @@ def confirm_booking():
                 original_amount=slot_price,
                 discounted_amount=discount_amount,
                 amount=amount,
-                mode_of_payment="hash",
+                mode_of_payment=payment_mode_used,
                 booking_date=datetime.utcnow().date(),
                 booked_date=book_date,
                 booking_time=datetime.utcnow().time()
@@ -152,19 +163,18 @@ def confirm_booking():
             db.session.add(transaction)
             db.session.flush()
 
-            # --- Save payment to transaction mapping ---
+            # --- Map transaction to payment ID (if present) ---
             if payment_id:
                 BookingService.save_payment_transaction_mapping(booking.id, transaction.id, payment_id)
-                
-            # --- Mark voucher as used and log redemption ---
+
+            # --- Mark voucher used ---
             if voucher:
                 voucher.is_active = False
-                redemption_log = VoucherRedemptionLog(
+                db.session.add(VoucherRedemptionLog(
                     user_id=user.id,
                     voucher_id=voucher.id,
                     booking_id=booking.id
-                )
-                db.session.add(redemption_log)
+                ))
 
             # --- Update slot availability ---
             db.session.execute(text(f"""
@@ -177,23 +187,11 @@ def confirm_booking():
                 "book_date": book_date
             })
 
-            # --- Vendor dashboard & console logic ---
-            console_id_val = -1
-            BookingService.insert_into_vendor_dashboard_table(transaction.id, console_id_val)
-            BookingService.insert_into_vendor_promo_table(transaction.id, console_id_val)
+            # --- Vendor dashboards and console ---
+            BookingService.insert_into_vendor_dashboard_table(transaction.id, -1)
+            BookingService.insert_into_vendor_promo_table(transaction.id, -1)
 
-            if console_id_val != -1:
-                db.session.execute(text(f"""
-                    UPDATE VENDOR_{vendor.id}_CONSOLE_AVAILABILITY
-                    SET is_available = FALSE
-                    WHERE console_id = :console_id AND game_id = :game_id
-                """), {
-                    "console_id": booking.console_id,
-                    "game_id": available_game.id
-                })
-
-            # --- Send booking confirmation email ---
-            slot_time = f"{str(slot_obj.start_time)} - {str(slot_obj.end_time)}"
+            # --- Send confirmation email ---
             booking_mail(
                 gamer_name=user.name,
                 gamer_phone=user.contact_info.phone,
@@ -203,7 +201,7 @@ def confirm_booking():
                 booked_for_date=str(book_date),
                 booking_details=[{
                     "booking_id": booking.id,
-                    "slot_time": slot_time
+                    "slot_time": f"{slot_obj.start_time} - {slot_obj.end_time}"
                 }],
                 price_paid=amount
             )
@@ -1086,3 +1084,36 @@ def get_user_details(vendor_id):
     except Exception as e:
         current_app.logger.error(f"Error fetching user details: {e}")
         return jsonify({"error": str(e)}), 500
+
+@booking_blueprint.route('/vendor/<string:vendor_id>/getConsoleStatus/<int:console_id>', methods=['GET'])
+def get_console_status(vendor_id, console_id):
+    """Retrieve the availability status of a specific console for a vendor."""
+    try:
+        table_name = f"VENDOR_{vendor_id}_CONSOLE_AVAILABILITY"
+
+        # Construct SQL to get console details
+        sql = text(f"""
+            SELECT vendor_id, console_id, game_id, is_available
+            FROM {table_name}
+            WHERE console_id = :console_id
+        """)
+
+        result = db.session.execute(sql, {'console_id': console_id}).fetchall()
+
+        if not result:
+            return jsonify({"message": "Console not found."}), 404
+
+        consoles = [
+            {
+                "vendor_id": row.vendor_id,
+                "console_id": row.console_id,
+                "game_id": row.game_id,
+                "is_available": row.is_available
+            } for row in result
+        ]
+
+        return jsonify(consoles), 200
+
+    except Exception as e:
+        current_app.logger.error(f"Error retrieving console status: {str(e)}")
+        return jsonify({"error": "Internal Server Error"}), 500
