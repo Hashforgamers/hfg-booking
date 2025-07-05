@@ -18,6 +18,7 @@ from models.voucher import Voucher
 from models.voucherRedemptionLog import VoucherRedemptionLog
 from models.paymentTransactionMapping import PaymentTransactionMapping
 from models.userHashCoin import UserHashCoin
+from models.accessBookingCode import AccessBookingCode
 
 from sqlalchemy.sql import text
 from sqlalchemy.orm import joinedload
@@ -30,7 +31,7 @@ from services.mail_service import booking_mail, reject_booking_mail, extra_booki
 from models.hashWallet import HashWallet
 from models.hashWalletTransaction import HashWalletTransaction
 
-from utils.common import generate_fid
+from utils.common import generate_fid, generate_access_code
 
 booking_blueprint = Blueprint('bookings', __name__)
 
@@ -100,6 +101,12 @@ def confirm_booking():
 
         confirmed_ids = []
 
+        # 1. Generate new access code
+        code = generate_access_code()
+        access_code_entry = AccessBookingCode(access_code=code)
+        db.session.add(access_code_entry)
+        db.session.flush()  # ensure access_code_entry.id is populated
+
         for booking_id in booking_ids:
             booking = db.session.query(Booking).filter_by(id=booking_id).first()
             if not booking or booking.status == 'confirmed':
@@ -107,6 +114,7 @@ def confirm_booking():
 
             booking.status = 'confirmed'
             booking.updated_at = datetime.utcnow()
+            booking.access_code_id = access_code_entry.id
 
             available_game = db.session.query(AvailableGame).filter_by(id=booking.game_id).first()
             vendor = db.session.query(Vendor).filter_by(id=available_game.vendor_id).first()
@@ -771,15 +779,23 @@ def new_booking(vendor_id):
 
         # Begin transaction
         bookings = []
+        
+         # 1. Generate new access code
+        code = generate_access_code()
+        access_code_entry = AccessBookingCode(access_code=code)
+        db.session.add(access_code_entry)
+        db.session.flush()  # ensure access_code_entry.id is populated
+
         for slot_id in slot_ids:
             slot_obj = db.session.query(Slot).filter_by(id=slot_id).first()
             available_game = db.session.query(AvailableGame).filter_by(id=slot_obj.gaming_type_id).first()
-            
+        
             booking = Booking(
                 slot_id=slot_id,
                 game_id=available_game.id,
                 user_id=user.id,
-                status="confirmed"
+                status="confirmed",
+                access_code_id=access_code_entry.id
             )
             db.session.add(booking)
             db.session.flush()  # Get the booking ID

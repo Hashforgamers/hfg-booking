@@ -5,6 +5,7 @@ from db.extensions import db
 
 from .availableGame import AvailableGame
 from .slot import Slot
+from .accessBookingCode import AccessBookingCode
 
 class Booking(db.Model):
     __tablename__ = 'bookings'
@@ -23,6 +24,9 @@ class Booking(db.Model):
 
     # Add relationship to transactions
     transaction = relationship('Transaction', back_populates='booking', uselist=False)
+
+    access_code_id = Column(Integer, ForeignKey('access_booking_codes.id'), nullable=True)
+    access_code_entry = db.relationship('AccessBookingCode', back_populates='bookings')
 
     def __repr__(self):
         return f"<Booking user_id={self.user_id} game_id={self.game_id}>"
