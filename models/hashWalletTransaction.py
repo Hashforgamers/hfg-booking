@@ -10,7 +10,7 @@ class HashWalletTransaction(db.Model):
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
     amount = Column(Integer, nullable=False)  # +ve for credit, -ve for debit
     type = Column(String(50))  # e.g., 'booking', 'top-up', 'admin-credit', etc.
-    reference_id = Column(Integer, nullable=True)  # Booking ID or other context
+    reference_id = Column(String(50), nullable=True)  # Booking ID or other context
     timestamp = Column(DateTime, default=datetime.utcnow)
 
     def __repr__(self):

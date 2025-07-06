@@ -24,11 +24,11 @@ class BookingService:
 
     @staticmethod
     def get_user_bookings(user_id):
-        return Booking.query.filter_by(user_id=user_id).all()
+        return [booking.to_dict() for booking in Booking.query.filter_by(user_id=user_id).all()]
 
-    @staticmethod
-    def get_user_bookings(user_id):
-        return Booking.query.filter_by(user_id=user_id).all()
+    # @staticmethod
+    # def get_user_bookings(user_id):
+    #     return Booking.query.filter_by(user_id=user_id).all()
 
     @staticmethod
     def cancel_booking(booking_id):
