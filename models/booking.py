@@ -37,6 +37,7 @@ class Booking(db.Model):
             'user_id': self.user_id,
             'status': self.status,
             'slot': self.slot.to_dict_for_booking() if self.slot else None,
-            'access_code': self.access_code_entry.access_code if self.access_code_entry else None
+            'access_code': self.access_code_entry.access_code if self.access_code_entry else None,
+            'book_date': self.transaction.booked_date.isoformat() if self.transaction else None
         }
 
