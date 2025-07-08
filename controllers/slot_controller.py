@@ -5,6 +5,8 @@ from db.extensions import db
 from sqlalchemy.sql import text 
 from datetime import datetime
 from models.availableGame import AvailableGame
+from pytz import timezone
+
 
 slot_blueprint = Blueprint('slots', __name__)
 
@@ -70,21 +72,24 @@ def get_slots_on_game_id(vendorId, gameId, date):
 @slot_blueprint.route('/getSlotList/vendor/<int:vendor_id>/game/<int:game_id>', methods=['GET'])
 def get_next_six_slot_for_game(vendor_id, game_id):
     """
-    Fetches the next six available slots for a given vendor and game based on the current time.
+    Fetches the next six available slots for a given vendor and game based on the current IST time.
     """
     try:
         current_app.logger.info("Fetching available slots for vendor_id=%s, game_id=%s", vendor_id, game_id)
 
-        # Get current time and today's date
-        current_time = datetime.now().time()
-        today_date = datetime.now().date()
+        # Set current time in IST (Asia/Kolkata)
+        ist = timezone("Asia/Kolkata")
+        now_ist = datetime.now(ist)
 
-        current_app.logger.info(f"current Time={current_time}, Date={today_date}")
+        current_time = now_ist.time()
+        today_date = now_ist.date()
 
-        # Fetch the next 6 slots from the Slot table based on the game_id and current time
+        current_app.logger.info(f"IST Time={current_time}, Date={today_date}")
+
+        # Fetch the next 6 future slots for this game
         next_slots = db.session.query(Slot.id, Slot.start_time, Slot.end_time).filter(
             Slot.gaming_type_id == game_id,
-            Slot.start_time > current_time  # Get only future slots
+            Slot.start_time > current_time
         ).order_by(Slot.start_time).limit(6).all()
 
         if not next_slots:
@@ -92,7 +97,7 @@ def get_next_six_slot_for_game(vendor_id, game_id):
 
         slot_ids = [slot.id for slot in next_slots]
 
-        # Fetch slot availability from the dynamic VENDOR_{vendor_id}_SLOT table
+        # Build and execute the dynamic vendor slot availability query
         slot_query = text(f"""
             SELECT slot_id, is_available
             FROM VENDOR_{vendor_id}_SLOT
@@ -101,19 +106,20 @@ def get_next_six_slot_for_game(vendor_id, game_id):
             ORDER BY slot_id;
         """)
 
-        slot_results = db.session.execute(slot_query, {"today_date": today_date, "slot_ids": tuple(slot_ids)}).fetchall()
+        slot_results = db.session.execute(
+            slot_query,
+            {"today_date": today_date, "slot_ids": tuple(slot_ids)}
+        ).fetchall()
 
-        # Map slot availability
         availability_map = {row.slot_id: row.is_available for row in slot_results}
 
-        # Construct response
         slots = []
         for slot in next_slots:
             slots.append({
                 "slot_id": slot.id,
                 "start_time": slot.start_time.strftime("%H:%M:%S"),
                 "end_time": slot.end_time.strftime("%H:%M:%S"),
-                "is_available": availability_map.get(slot.id, False)  # Default to False if not found
+                "is_available": availability_map.get(slot.id, False)
             })
 
         return jsonify(slots), 200
