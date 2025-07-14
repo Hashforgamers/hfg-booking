@@ -5,6 +5,7 @@ from models.slot import Slot
 from models.booking import Booking
 from models.booking import Booking
 import logging
+import random
 from datetime import datetime, timedelta
 from rq import Queue
 from rq_scheduler import Scheduler
@@ -273,7 +274,7 @@ def redeem_voucher():
     user_hash_coin.hash_coins -= required_coins
 
     # Generate unique voucher code
-    import random, string
+    import string
     code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
 
     voucher = Voucher(
@@ -726,6 +727,7 @@ def get_vendor_bookings(vendor_id):
 def new_booking(vendor_id):
     """
     Creates a new booking for the given vendor, checking for existing users or creating a new one.
+    Handles waive-off and extra controller fare.
     """
     try:
         current_app.logger.info("New Booking Triggered")
@@ -736,57 +738,48 @@ def new_booking(vendor_id):
         email = data.get("email")
         phone = data.get("phone")
         booked_date = data.get("bookedDate")
-        slot_ids = data.get("slotId")  # List of slot IDs
+        slot_ids = data.get("slotId")
         payment_type = data.get("paymentType")
         console_id = data.get("consoleId")
         is_rapid_booking = data.get("isRapidBooking")
-        booking_type = data.get("bookingType")
-        # Extract user_id safely from the data
-        user_id = data.get("userId") if data.get("userId") is not None else None
+        booking_type = data.get("bookingType") or "direct"
+        user_id = data.get("userId")
+        waive_off_total = float(data.get("waiveOffAmount", 0.0))
+        extra_controller_fare = float(data.get("extraControllerFare", 0.0))
 
         dashboard_status = None
-
-        if booking_type is None:
-            booking_type = "direct"
 
         if not all([name, phone, booked_date, slot_ids, payment_type]):
             return jsonify({"message": "Missing required fields"}), 400
 
-        # Check if user already exists
-        if user_id is not None:
-            user = db.session.query(User).filter(User.id == user_id).first()
-        else:
-            user = db.session.query(User).join(ContactInfo).filter(ContactInfo.email == email).first()
+        user = (
+            db.session.query(User).filter(User.id == user_id).first()
+            if user_id
+            else db.session.query(User).join(ContactInfo).filter(ContactInfo.email == email).first()
+        )
 
         if not user:
-            # Create a new user
             user = User(
                 fid=generate_fid(),
                 avatar_path="Not defined",
                 name=name,
-                game_username=name.lower().replace(" ", "_"),
+                game_username = name.lower().replace(" ", "_") + str(random.randint(1000, 9999)),
                 parent_type="user"
             )
-
             contact_info = ContactInfo(
                 phone=phone,
                 email=email,
                 parent_id=user.id,
                 parent_type="user"
             )
-
             user.contact_info = contact_info
-
             db.session.add(user)
             db.session.flush()
 
-        # Fetch the available game details
         available_game = db.session.query(AvailableGame).filter_by(vendor_id=vendor_id).first()
-
         if not available_game:
             return jsonify({"message": "Game not found for this vendor"}), 404
 
-        # Check slot availability for all requested slots
         placeholders = ", ".join([f":slot_id_{i}" for i in range(len(slot_ids))])
         slot_params = {f"slot_id_{i}": slot_id for i, slot_id in enumerate(slot_ids)}
 
@@ -800,27 +793,21 @@ def new_booking(vendor_id):
             {"booked_date": booked_date, **slot_params}
         ).fetchall()
 
-        # Ensure all requested slots exist and are available
         if len(slot_entries) != len(slot_ids):
             return jsonify({"message": "One or more slots not found or unavailable"}), 400
 
         for slot in slot_entries:
-            if slot[1] <= 0 or not slot[2]:  # available_slot <= 0 or is_available = False
+            if slot[1] <= 0 or not slot[2]:
                 return jsonify({"message": f"Slot {slot[0]} is fully booked"}), 400
 
-        # Begin transaction
         bookings = []
-        
-         # 1. Generate new access code
         code = generate_access_code()
         access_code_entry = AccessBookingCode(access_code=code)
         db.session.add(access_code_entry)
-        db.session.flush()  # ensure access_code_entry.id is populated
+        db.session.flush()
 
         for slot_id in slot_ids:
             slot_obj = db.session.query(Slot).filter_by(id=slot_id).first()
-            available_game = db.session.query(AvailableGame).filter_by(id=slot_obj.gaming_type_id).first()
-        
             booking = Booking(
                 slot_id=slot_id,
                 game_id=available_game.id,
@@ -829,10 +816,9 @@ def new_booking(vendor_id):
                 access_code_id=access_code_entry.id
             )
             db.session.add(booking)
-            db.session.flush()  # Get the booking ID
+            db.session.flush()
             bookings.append(booking)
 
-        # Decrease available slot count for all booked slots
         db.session.execute(
             text(f"""
                 UPDATE VENDOR_{vendor_id}_SLOT
@@ -844,21 +830,28 @@ def new_booking(vendor_id):
             {"booked_date": booked_date, **slot_params}
         )
 
-        db.session.commit()  # Commit all bookings before creating transactions
+        db.session.commit()
 
-        # Create transactions for each booking
+        # Create transaction entries
         transactions = []
+        waive_off_per_slot = waive_off_total / len(bookings) if bookings else 0.0
+
         for booking in bookings:
+            original_amount = available_game.single_slot_price
+            discounted_amount = waive_off_per_slot
+            final_amount = max(original_amount - discounted_amount, 0.0)
+
             transaction = Transaction(
                 booking_id=booking.id,
                 vendor_id=vendor_id,
                 user_id=user.id,
                 booked_date=datetime.strptime(booked_date, "%Y-%m-%d").date(),
+                booking_date=datetime.utcnow().date(),
                 booking_time=datetime.utcnow().time(),
                 user_name=user.name,
-                original_amount=available_game.single_slot_price,
-                discounted_amount = 0,
-                amount=available_game.single_slot_price,
+                original_amount=original_amount,
+                discounted_amount=discounted_amount,
+                amount=final_amount,
                 mode_of_payment=payment_type,
                 booking_type=booking_type,
                 settlement_status="NA" if payment_type != "paid" else "completed"
@@ -866,29 +859,40 @@ def new_booking(vendor_id):
             db.session.add(transaction)
             transactions.append(transaction)
 
+        if extra_controller_fare > 0:
+            controller_transaction = Transaction(
+                booking_id=bookings[0].id,
+                vendor_id=vendor_id,
+                user_id=user.id,
+                booked_date=datetime.strptime(booked_date, "%Y-%m-%d").date(),
+                booking_date=datetime.utcnow().date(),
+                booking_time=datetime.utcnow().time(),
+                user_name=user.name,
+                original_amount=extra_controller_fare,
+                discounted_amount=0,
+                amount=extra_controller_fare,
+                mode_of_payment=payment_type,
+                booking_type="extra_controller",
+                settlement_status="NA" if payment_type != "paid" else "completed"
+            )
+            db.session.add(controller_transaction)
+            transactions.append(controller_transaction)
+
         if is_rapid_booking:
             dashboard_status = "current"
+            console_table = f"VENDOR_{vendor_id}_CONSOLE_AVAILABILITY"
+            db.session.execute(
+                text(f"""
+                    UPDATE {console_table}
+                    SET is_available = FALSE
+                    WHERE console_id = :console_id AND game_id = :game_id
+                """),
+                {"console_id": console_id, "game_id": available_game.id}
+            )
 
-            # ✅ Define the dynamic console availability table name
-            console_table_name = f"VENDOR_{vendor_id}_CONSOLE_AVAILABILITY"
-
-            # ✅ Update the status to false (occupied)
-            sql_update_status = text(f"""
-                UPDATE {console_table_name}
-                SET is_available = FALSE
-                WHERE console_id = :console_id AND game_id = :game_id
-            """)
-
-            db.session.execute(sql_update_status, {
-                "console_id": console_id,
-                "game_id": available_game.id
-            })
-        
         db.session.commit()
 
         socketio = current_app.extensions['socketio']
-
-        # Emit event for each booked slot
         for booking in bookings:
             socketio.emit('slot_booked', {
                 'slot_id': booking.slot_id,
@@ -898,24 +902,18 @@ def new_booking(vendor_id):
 
         for trans in transactions:
             console_id_val = console_id if console_id is not None else -1
-            BookingService.insert_into_vendor_dashboard_table(trans.id, console_id_val, dashboard_status),
+            BookingService.insert_into_vendor_dashboard_table(trans.id, console_id_val, dashboard_status)
             BookingService.insert_into_vendor_promo_table(trans.id, console_id_val)
 
-        # Extract slot times for the email
         booking_details = []
         for booking in bookings:
             slot_obj = db.session.query(Slot).filter_by(id=booking.slot_id).first()
-            if slot_obj:
-                slot_time = f"{str(slot_obj.start_time)} - {str(slot_obj.end_time)}"  # Format as start_time - end_time
-            else:
-                slot_time = 'N/A'  # In case slot_obj is None (just as a fallback)
-            
+            slot_time = f"{str(slot_obj.start_time)} - {str(slot_obj.end_time)}" if slot_obj else "N/A"
             booking_details.append({
                 "booking_id": booking.id,
                 "slot_time": slot_time
             })
 
-        # Send confirmation email
         cafe_name = db.session.query(Vendor).filter_by(id=vendor_id).first().cafe_name
         booking_mail(
             gamer_name=name,
