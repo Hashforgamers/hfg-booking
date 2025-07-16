@@ -940,12 +940,12 @@ def new_booking(vendor_id):
 @booking_blueprint.route('/extraBooking', methods=['POST'])
 def extra_booking():
     """
-    Records extra booking (time extended) played by the user in a gaming cafe.
+    Records extra booking (time extended) played by the user in a gaming cafe, with waive-off functionality.
     """
     try:
         data = request.json
 
-        required_fields = ["consoleNumber", "consoleType", "date", "slotId", "userId", "username", "amount", "gameId", "modeOfPayment","vendorId"]
+        required_fields = ["consoleNumber", "consoleType", "date", "slotId", "userId", "username", "amount", "gameId", "modeOfPayment", "vendorId"]
         if not all(data.get(field) is not None for field in required_fields):
             return jsonify({"message": "Missing required fields"}), 400
 
@@ -956,10 +956,11 @@ def extra_booking():
         slot_id = data["slotId"]
         user_id = data["userId"]
         username = data["username"]
-        amount = data["amount"]
+        amount = float(data["amount"])
         game_id = data["gameId"]
         mode_of_payment = data["modeOfPayment"]
-        vendor_id = data["vendorId"] 
+        vendor_id = data["vendorId"]
+        waive_off_amount = float(data.get("waiveOffAmount", 0.0))  # Optional waive-off amount
 
         # Optional: verify user and slot exist
         user = db.session.query(User).filter_by(id=user_id).first()
@@ -978,6 +979,11 @@ def extra_booking():
         db.session.add(extra_booking)
         db.session.flush()
 
+        # Calculate final amount after waive-off
+        original_amount = amount
+        discounted_amount = waive_off_amount
+        final_amount = max(original_amount - discounted_amount, 0.0)
+
         # Create a transaction for extra booking
         transaction = Transaction(
             booking_id=extra_booking.id,
@@ -986,9 +992,9 @@ def extra_booking():
             booked_date=booked_date,
             booking_time=datetime.utcnow().time(),
             user_name=username,
-            original_amount=amount,
-            discounted_amount=0,
-            amount=amount,
+            original_amount=original_amount,
+            discounted_amount=discounted_amount,
+            amount=final_amount,
             mode_of_payment=mode_of_payment,
             booking_type="extra",
             settlement_status="completed" if mode_of_payment == "paid" else "NA"
@@ -1007,9 +1013,8 @@ def extra_booking():
             slot_time_str = "N/A"
         else:
             slot_time_str = f"{slot.start_time.strftime('%-I:%M %p')} to {slot.end_time.strftime('%-I:%M %p')}"
-            # Use '%#I' on Windows instead of '%-I' for removing leading zeros
-            
-        # ✅ Send the extra booking email
+
+        # Send the extra booking email
         extra_booking_time_mail(
             username=username,
             user_email=gamer_email,
@@ -1017,7 +1022,7 @@ def extra_booking():
             slot_time=slot_time_str,
             console_type=console_type,
             console_number=console_number,
-            amount=amount,
+            amount=final_amount,  # Use final_amount after waive-off
             mode_of_payment=mode_of_payment
         )
 
