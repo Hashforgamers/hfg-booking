@@ -52,7 +52,7 @@ def create_booking():
         socketio = current_app.extensions['socketio']
         scheduler = current_app.extensions['scheduler']
         available_game = db.session.query(AvailableGame).filter(AvailableGame.id == game_id).first()
-        booking_ids = []
+        booking_mappings = []  # Changed to collect dicts with slot_id and booking_id
 
         for slot_id in slot_ids:
             slot_entry = db.session.execute(text(f"""
@@ -66,7 +66,11 @@ def create_booking():
 
             booking = BookingService.create_booking(slot_id, game_id, user_id, socketio, book_date)
             db.session.flush()
-            booking_ids.append(booking.id)
+
+            booking_mappings.append({
+                "slot_id": slot_id,
+                "booking_id": booking.id
+            })
 
             scheduler.enqueue_in(
                 timedelta(seconds=360),
@@ -78,10 +82,13 @@ def create_booking():
 
         db.session.commit()
 
-        if not booking_ids:
+        if not booking_mappings:
             return jsonify({"message": "No slots available for booking"}), 400
 
-        return jsonify({"message": "Slots frozen", "booking_ids": booking_ids}), 200
+        return jsonify({
+            "message": "Slots frozen",
+            "bookings": booking_mappings
+        }), 200
 
     except Exception as e:
         db.session.rollback()
@@ -91,33 +98,48 @@ def create_booking():
 def release_slot():
     try:
         data = request.json
-        slot_id = data.get("slot_id")
-        booking_id = data.get("booking_id")
-        book_date = data.get("book_date")
+        bookings = data.get("bookings")  # Expect a list of {slot_id, booking_id, book_date}
 
-        if not slot_id or not booking_id or not book_date:
-            return jsonify({"message": "slot_id, booking_id, and book_date are required"}), 400
+        if not bookings or not isinstance(bookings, list):
+            return jsonify({"message": "A list of bookings is required under the 'bookings' key."}), 400
 
-        # Optionally validate the date format
-        try:
-            datetime.strptime(book_date, '%Y-%m-%d')
-        except ValueError:
-            return jsonify({"message": "book_date must be in YYYY-MM-DD format"}), 400
+        errors = []
+        success_count = 0
 
-        scheduler = current_app.extensions['scheduler']
-        socketio = current_app.extensions.get('socketio')  # If needed for notification
+        for index, booking in enumerate(bookings):
+            slot_id = booking.get("slot_id")
+            booking_id = booking.get("booking_id")
+            book_date = booking.get("book_date")
 
-        # Call release_slot synchronously here (or enqueue if you want async)
-        BookingService.release_slot(slot_id, booking_id, book_date)
+            if not slot_id or not booking_id or not book_date:
+                errors.append({"index": index, "error": "slot_id, booking_id, and book_date are required"})
+                continue
 
-        # Commit any DB changes inside release_slot or here depending on implementation
+            # Validate date format
+            try:
+                datetime.strptime(book_date, '%Y-%m-%d')
+            except ValueError:
+                errors.append({"index": index, "error": "book_date must be in YYYY-MM-DD format"})
+                continue
+
+            try:
+                BookingService.release_slot(slot_id, booking_id, book_date)
+                success_count += 1
+            except Exception as e:
+                errors.append({"index": index, "error": f"Failed to release slot: {str(e)}"})
+
         db.session.commit()
 
-        return jsonify({"message": "Slot released successfully"}), 200
+        response = {"message": f"Processed {success_count} bookings."}
+        if errors:
+            response["errors"] = errors
+            return jsonify(response), 207  # 207 Multi-Status for partial success
+        else:
+            return jsonify(response), 200
 
     except Exception as e:
         db.session.rollback()
-        return jsonify({"message": "Failed to release slot", "error": str(e)}), 500
+        return jsonify({"message": "Failed to release slot(s)", "error": str(e)}), 500
 
 @booking_blueprint.route('/bookings/confirm', methods=['POST'])
 def confirm_booking():
