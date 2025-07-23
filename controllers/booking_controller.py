@@ -87,6 +87,38 @@ def create_booking():
         db.session.rollback()
         return jsonify({"message": "Failed to freeze slot(s)", "error": str(e)}), 500
 
+@booking_blueprint.route('/release_slot', methods=['POST'])
+def release_slot():
+    try:
+        data = request.json
+        slot_id = data.get("slot_id")
+        booking_id = data.get("booking_id")
+        book_date = data.get("book_date")
+
+        if not slot_id or not booking_id or not book_date:
+            return jsonify({"message": "slot_id, booking_id, and book_date are required"}), 400
+
+        # Optionally validate the date format
+        try:
+            datetime.strptime(book_date, '%Y-%m-%d')
+        except ValueError:
+            return jsonify({"message": "book_date must be in YYYY-MM-DD format"}), 400
+
+        scheduler = current_app.extensions['scheduler']
+        socketio = current_app.extensions.get('socketio')  # If needed for notification
+
+        # Call release_slot synchronously here (or enqueue if you want async)
+        BookingService.release_slot(slot_id, booking_id, book_date)
+
+        # Commit any DB changes inside release_slot or here depending on implementation
+        db.session.commit()
+
+        return jsonify({"message": "Slot released successfully"}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"message": "Failed to release slot", "error": str(e)}), 500
+
 @booking_blueprint.route('/bookings/confirm', methods=['POST'])
 def confirm_booking():
     try:
