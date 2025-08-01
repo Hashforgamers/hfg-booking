@@ -39,7 +39,7 @@ from utils.common import generate_fid, generate_access_code
 
 booking_blueprint = Blueprint('bookings', __name__)
 
-@booking_blueprint.route('/api/create_order', methods=['POST'])
+@booking_blueprint.route('/create_order', methods=['POST'])
 def create_order():
     data = request.get_json()
 
