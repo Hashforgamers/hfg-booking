@@ -15,6 +15,8 @@ class Vendor(db.Model):
     # Add relationship to transactions
     transactions = relationship('Transaction', back_populates='vendor', cascade="all, delete-orphan")
 
+    extra_service_categories = relationship('ExtraServiceCategory', back_populates='vendor', cascade='all, delete-orphan')
+
     def to_dict_for_booking(self):
         return {
             "cafe_name":self.cafe_name
