@@ -37,6 +37,7 @@ from models.hashWalletTransaction import HashWalletTransaction
 import time
 import json
 import base64
+import requests
 
 from utils.common import generate_fid, generate_access_code
 
