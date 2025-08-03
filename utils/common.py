@@ -7,7 +7,6 @@ RAZORPAY_KEY_ID = None
 RAZORPAY_KEY_SECRET = None
 
 def get_razorpay_keys():
-    from flask import current_app
     return (current_app.config.get("RAZORPAY_KEY_ID"),
             current_app.config.get("RAZORPAY_KEY_SECRET"))
 
