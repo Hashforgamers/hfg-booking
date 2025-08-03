@@ -50,7 +50,8 @@ def create_order():
     currency = data.get('currency', 'INR')
     receipt = data.get('receipt', f'order_rcpt_{int(time.time())}')
 
-    RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET = get_razorpay_keys()
+    RAZORPAY_KEY_ID = current_app.config.get("RAZORPAY_KEY_ID")
+    RAZORPAY_KEY_SECRET = current_app.config.get("RAZORPAY_KEY_SECRET")
 
     headers = {
         "Content-Type": "application/json",
@@ -195,7 +196,8 @@ def confirm_booking():
             return jsonify({'message': 'booking_id and book_date are required'}), 400
         book_date = datetime.strptime(book_date_str, '%Y-%m-%d').date()
 
-        RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET = get_razorpay_keys()
+        RAZORPAY_KEY_ID = current_app.config.get("RAZORPAY_KEY_ID")
+        RAZORPAY_KEY_SECRET = current_app.config.get("RAZORPAY_KEY_SECRET")
 
         # Initialize Razorpay client (load your keys securely)
         razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))

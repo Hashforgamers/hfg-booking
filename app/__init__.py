@@ -68,8 +68,5 @@ def create_app():
 
     # Add scheduler to app.extensions
     app.extensions['scheduler'] = scheduler
-
-    common.RAZORPAY_KEY_ID = app.config.get("RAZORPAY_KEY_ID")
-    common.RAZORPAY_KEY_SECRET = app.config.get("RAZORPAY_KEY_SECRET")
     
     return app, socketio  # Return both app and socketio as a tuple
