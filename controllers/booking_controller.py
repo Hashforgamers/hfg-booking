@@ -42,8 +42,6 @@ from utils.common import generate_fid, generate_access_code, get_razorpay_keys
 
 booking_blueprint = Blueprint('bookings', __name__)
 
-RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET = get_razorpay_keys()
-
 @booking_blueprint.route('/create_order', methods=['POST'])
 def create_order():
     data = request.get_json()
@@ -51,6 +49,8 @@ def create_order():
     amount = data.get('amount')  # in paisa
     currency = data.get('currency', 'INR')
     receipt = data.get('receipt', f'order_rcpt_{int(time.time())}')
+
+    RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET = get_razorpay_keys()
 
     headers = {
         "Content-Type": "application/json",
@@ -194,6 +194,8 @@ def confirm_booking():
         if not booking_ids or not book_date_str:
             return jsonify({'message': 'booking_id and book_date are required'}), 400
         book_date = datetime.strptime(book_date_str, '%Y-%m-%d').date()
+
+        RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET = get_razorpay_keys()
 
         # Initialize Razorpay client (load your keys securely)
         razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
@@ -402,6 +404,7 @@ def confirm_booking():
         db.session.rollback()
         current_app.logger.exception("Error confirming booking")
         return jsonify({'error': str(e)}), 500
+
 # @booking_blueprint.route('/bookings/confirm', methods=['POST'])
 # def confirm_booking():
 #     try:
