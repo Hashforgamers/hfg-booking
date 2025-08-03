@@ -20,6 +20,7 @@ from controllers.game_controller import game_blueprint
 from .config import Config
 from events.socketio_events import register_socketio_events  # Import the socket event registration function
 from rq.registry import FinishedJobRegistry
+import utils.common as common
 
 def create_app():
     app = Flask(__name__)
@@ -67,5 +68,8 @@ def create_app():
 
     # Add scheduler to app.extensions
     app.extensions['scheduler'] = scheduler
+
+    common.RAZORPAY_KEY_ID = app.config.get("RAZORPAY_KEY_ID")
+    common.RAZORPAY_KEY_SECRET = app.config.get("RAZORPAY_KEY_SECRET")
     
     return app, socketio  # Return both app and socketio as a tuple

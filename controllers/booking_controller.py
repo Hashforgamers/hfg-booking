@@ -26,9 +26,6 @@ from models.extraServiceMenu import ExtraServiceMenu
 
 from sqlalchemy.sql import text
 from sqlalchemy.orm import joinedload
-
-from utils.common import RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET
-
 from sqlalchemy import and_
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy import func, distinct
@@ -41,9 +38,11 @@ import json
 import base64
 import requests
 
-from utils.common import generate_fid, generate_access_code
+from utils.common import generate_fid, generate_access_code, get_razorpay_keys
 
 booking_blueprint = Blueprint('bookings', __name__)
+
+RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET = get_razorpay_keys()
 
 @booking_blueprint.route('/create_order', methods=['POST'])
 def create_order():
