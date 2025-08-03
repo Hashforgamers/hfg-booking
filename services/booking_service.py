@@ -13,6 +13,9 @@ from models.user import User
 from models.paymentTransactionMapping import PaymentTransactionMapping
 from models.hashWallet import HashWallet
 from models.hashWalletTransaction import HashWalletTransaction
+from models.userPass import UserPass
+from models.cafePass import CafePass
+from models.extraServiceMenu import ExtraServiceMenu
 
 
 class BookingService:
@@ -313,3 +316,24 @@ class BookingService:
             reference_id=booking_id
         )
         db.session.add(wallet_txn)
+
+    @staticmethod
+    def get_user_pass(user_id, vendor_id, book_date):
+        """Return the best valid pass or None."""
+        return UserPass.query.join(CafePass).filter(
+            UserPass.user_id == user_id,
+            UserPass.is_active == True,
+            UserPass.valid_to >= book_date,
+            CafePass.is_active == True,
+            or_(
+                CafePass.vendor_id == vendor_id,
+                CafePass.vendor_id.is_(None)
+            )
+        ).order_by(
+            CafePass.vendor_id.is_(None).desc()
+        ).first()
+
+    @staticmethod
+    def get_menu_price(menu_id):
+        menu_obj = ExtraServiceMenu.query.filter_by(id=menu_id, is_active=True).first()
+        return menu_obj.price if menu_obj else 0
