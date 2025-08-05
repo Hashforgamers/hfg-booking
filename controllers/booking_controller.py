@@ -257,6 +257,8 @@ def confirm_booking():
 
         razorpay_payment_verified = False
 
+        current_app.logger.warning(f"razorpay_client {razorpay_client}")
+
         # Verify Razorpay payment if mode is payment_gateway
         if payment_mode == "payment_gateway":
             if not payment_id:
