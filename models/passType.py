@@ -1,5 +1,5 @@
 from sqlalchemy import Column, Integer, String, Boolean
-from app.extension.extensions import db
+from db.extensions import db
 
 class PassType(db.Model):
     __tablename__ = 'pass_types'
