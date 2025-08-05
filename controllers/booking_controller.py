@@ -37,6 +37,9 @@ import time
 import json
 import base64
 import requests
+import hmac
+import hashlib
+
 
 from utils.common import generate_fid, generate_access_code, get_razorpay_keys
 
@@ -72,6 +75,53 @@ def create_order():
 
     # For production, just forward the error status and message from Razorpay without exposing internal details
     return jsonify({"error": "Order creation failed"}), response.status_code
+
+@booking_blueprint.route('/capture_payment', methods=['POST'])
+def capture_payment():
+    data = request.get_json()
+    payment_id = data.get('razorpay_payment_id')
+    order_id = data.get('razorpay_order_id')
+    signature = data.get('razorpay_signature')
+
+    if not payment_id or not order_id or not signature:
+        return jsonify({"message": "Missing payment details"}), 400
+
+    RAZORPAY_KEY_ID = current_app.config.get("RAZORPAY_KEY_ID")
+    RAZORPAY_KEY_SECRET = current_app.config.get("RAZORPAY_KEY_SECRET")
+
+    # Validate signature
+    msg = f"{order_id}|{payment_id}"
+    generated_signature = hmac.new(
+        RAZORPAY_KEY_SECRET.encode(),
+        msg.encode(),
+        hashlib.sha256
+    ).hexdigest()
+
+    if generated_signature != signature:
+        return jsonify({"message": "Invalid payment signature"}), 400
+
+    # Initialize Razorpay client
+    razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+
+    try:
+        # Fetch payment to check status
+        payment = razorpay_client.payment.fetch(payment_id)
+
+        if payment['status'] == 'authorized':
+            # Capture payment manually if not auto-captured during order creation
+            amount = payment['amount']  # amount in paisa
+            razorpay_client.payment.capture(payment_id, amount)
+            return jsonify({"message": "Payment captured successfully"}), 200
+
+        elif payment["status"] == "captured":
+            return jsonify({"message": "Payment already captured"}), 200
+
+        else:
+            return jsonify({"message": f"Payment status {payment['status']} - cannot capture."}), 400
+    except razorpay.errors.RazorpayError as e:
+        current_app.logger.error(f"Razorpay error during capture: {str(e)}")
+        return jsonify({"message": "Error capturing payment", "error": str(e)}), 500
+
 
 @booking_blueprint.route('/bookings', methods=['POST'])
 def create_booking():

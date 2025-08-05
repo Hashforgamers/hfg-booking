@@ -1,6 +1,7 @@
 from sqlalchemy import Column, Integer, String, Float, ForeignKey, Boolean
 from sqlalchemy.orm import relationship
 from db.extensions import db
+from models.passType import PassType 
 
 class CafePass(db.Model):
     __tablename__ = 'cafe_passes'
