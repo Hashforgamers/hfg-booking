@@ -243,6 +243,8 @@ def confirm_booking():
         payment_mode = data.get('payment_mode', "payment_gateway")  # 'wallet' or 'payment_gateway'
         extra_services_data = data.get('extra_services', {})  # dict: booking_id (str) -> list of extras or {"service": [...]}
 
+        current_app.logger.warning(f"data {data}")
+
         if not booking_ids or not book_date_str:
             return jsonify({'message': 'booking_id and book_date are required'}), 400
         book_date = datetime.strptime(book_date_str, '%Y-%m-%d').date()
@@ -250,7 +252,7 @@ def confirm_booking():
         RAZORPAY_KEY_ID = current_app.config.get("RAZORPAY_KEY_ID")
         RAZORPAY_KEY_SECRET = current_app.config.get("RAZORPAY_KEY_SECRET")
 
-        current_app.logger.warning(f"Razorpay {RAZORPAY_KEY_ID}")
+        current_app.logger.warning(f"Razorpay {RAZORPAY_KEY_ID} ,  payment type {payment_mode}")
 
         # Initialize Razorpay client (load your keys securely)
         razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
@@ -261,16 +263,21 @@ def confirm_booking():
 
         # Verify Razorpay payment if mode is payment_gateway
         if payment_mode == "payment_gateway":
+            current_app.logger.warning(f"Inside payent")
             if not payment_id:
+                current_app.logger.warning(f"Inside payent -1 ")
                 return jsonify({"message": "payment_id required for payment_gateway mode"}), 400
             try:
                 payment = razorpay_client.payment.fetch(payment_id)
                 current_app.logger.warning(f"Razorpay status {payment}")
                 if payment['status'] == 'captured':
+                    current_app.logger.warning(f"Inside payent -2 ")
                     razorpay_payment_verified = True
                 else:
+                    current_app.logger.warning(f"Inside payent -3 ")
                     return jsonify({"message": "Payment not successful or not captured"}), 400
             except razorpay.errors.RazorpayError as e:
+                current_app.logger.warning(f"Inside payent -4 ")
                 current_app.logger.error(f"Razorpay verification failed: {str(e)}")
                 return jsonify({"message": "Payment verification failed", "error": str(e)}), 400
 
