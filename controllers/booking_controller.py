@@ -39,6 +39,7 @@ import base64
 import requests
 import hmac
 import hashlib
+import razorpay
 
 
 from utils.common import generate_fid, generate_access_code, get_razorpay_keys
@@ -249,6 +250,8 @@ def confirm_booking():
         RAZORPAY_KEY_ID = current_app.config.get("RAZORPAY_KEY_ID")
         RAZORPAY_KEY_SECRET = current_app.config.get("RAZORPAY_KEY_SECRET")
 
+        current_app.logger.warning(f"Razorpay {RAZORPAY_KEY_ID}")
+
         # Initialize Razorpay client (load your keys securely)
         razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
 
@@ -260,6 +263,7 @@ def confirm_booking():
                 return jsonify({"message": "payment_id required for payment_gateway mode"}), 400
             try:
                 payment = razorpay_client.payment.fetch(payment_id)
+                current_app.logger.warning(f"Razorpay status {payment}")
                 if payment['status'] == 'captured':
                     razorpay_payment_verified = True
                 else:
