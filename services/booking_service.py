@@ -16,6 +16,8 @@ from models.hashWalletTransaction import HashWalletTransaction
 from models.userPass import UserPass
 from models.cafePass import CafePass
 from models.extraServiceMenu import ExtraServiceMenu
+from sqlalchemy import or_
+
 
 
 class BookingService:
