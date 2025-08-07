@@ -229,6 +229,61 @@ def release_slot():
         db.session.rollback()
         return jsonify({"message": "Failed to release slot(s)", "error": str(e)}), 500
 
+@booking_blueprint.route('/generate_payment_link', methods=['POST'])
+def generate_payment_link():
+    """
+    Creates a Razorpay Payment Link and returns the URL.
+    Expects JSON: { "amount": 500, "customer_email": "user@example.com", "customer_contact": "9876543210" }
+    Amount is expected in rupees.
+    """
+    data = request.get_json()
+    amount_rupees = data.get('amount')
+    customer_email = data.get('customer_email')
+    customer_contact = data.get('customer_contact')
+
+    if not (amount_rupees and customer_email and customer_contact):
+        return jsonify({"message": "Missing required fields!"}), 400
+
+    try:
+        amount_paise = int(float(amount_rupees) * 100)
+    except Exception:
+        return jsonify({"message": "Invalid amount format."}), 400
+
+    RAZORPAY_KEY_ID = current_app.config.get('RAZORPAY_KEY_ID')
+    RAZORPAY_KEY_SECRET = current_app.config.get('RAZORPAY_KEY_SECRET')
+    if not (RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET):
+        return jsonify({'message': 'Server config error.'}), 500
+
+    client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+
+    payment_link_data = {
+        "amount": amount_paise,
+        "currency": "INR",
+        "accept_partial": False,
+        "description": "Payment for your order",
+        "customer": {
+            "name": "Customer Name",  # Optional, add if you have it
+            "contact": customer_contact,
+            "email": customer_email
+        },
+        "notify": {
+            "sms": True,
+            "email": True
+        },
+        "reminder_enable": True,
+        "callback_method": "get"  # Or "post" if you handle a callback
+    }
+
+    try:
+        payment_link = client.payment_link.create(payment_link_data)
+        return jsonify({
+            'payment_link': payment_link['short_url'],
+            'id': payment_link['id'],
+            'status': payment_link['status']
+        })
+    except Exception as e:
+        return jsonify({'message': 'Error creating payment link', 'error': str(e)}), 500
+
 
 @booking_blueprint.route('/bookings/confirm', methods=['POST'])
 def confirm_booking():
