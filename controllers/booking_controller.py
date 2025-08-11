@@ -469,12 +469,12 @@ def confirm_booking():
             user_hash_coin.hash_coins += 1000
 
             # Update slot availability
-            db.session.execute(f"""
+            db.session.execute(text(f"""
                 UPDATE VENDOR_{vendor.id}_SLOT
                 SET available_slot = available_slot - 1,
                     is_available = CASE WHEN available_slot - 1 = 0 THEN FALSE ELSE is_available END
                 WHERE slot_id = :slot_id AND date = :book_date
-            """, {"slot_id": booking.slot_id, "book_date": book_date})
+            """), {"slot_id": booking.slot_id, "book_date": book_date})
 
             # Vendor analytics
             BookingService.insert_into_vendor_dashboard_table(transaction.id, -1)
