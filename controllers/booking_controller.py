@@ -398,6 +398,7 @@ def confirm_booking():
                 pass_type_name        = None
 
             # Payment handling
+            razorpay_payment_verified = True
             if payment_mode == "wallet":
                 BookingService.debit_wallet(user.id, booking.id, amount_payable)
                 razorpay_payment_verified = True
