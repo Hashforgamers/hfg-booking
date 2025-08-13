@@ -15,3 +15,5 @@ rq-scheduler
 rq-dashboard
 redis-cli
 pytz
+requests
+razorpay

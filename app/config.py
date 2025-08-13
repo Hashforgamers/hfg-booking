@@ -16,3 +16,6 @@ class Config:
     MAIL_USERNAME = os.getenv("MAIL_USERNAME")  # Your SMTP username
     MAIL_PASSWORD = os.getenv("MAIL_PASSWORD")  # Your SMTP password
     MAIL_DEFAULT_SENDER = os.getenv("MAIL_DEFAULT_SENDER", "no-reply@hashforgamers.co.in")
+    # Environment variables or config
+    RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "your_key_id")
+    RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "your_key_secret")

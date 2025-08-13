@@ -5,6 +5,7 @@ from models.slot import Slot
 from models.booking import Booking
 from models.booking import Booking
 import logging
+import random
 from datetime import datetime, timedelta
 from rq import Queue
 from rq_scheduler import Scheduler
@@ -19,10 +20,12 @@ from models.voucherRedemptionLog import VoucherRedemptionLog
 from models.paymentTransactionMapping import PaymentTransactionMapping
 from models.userHashCoin import UserHashCoin
 from models.accessBookingCode import AccessBookingCode
+from models.bookingExtraService  import BookingExtraService
+from models.extraServiceCategory import ExtraServiceCategory
+from models.extraServiceMenu import ExtraServiceMenu
 
 from sqlalchemy.sql import text
 from sqlalchemy.orm import joinedload
-
 from sqlalchemy import and_
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy import func, distinct
@@ -30,10 +33,96 @@ from services.mail_service import booking_mail, reject_booking_mail, extra_booki
 
 from models.hashWallet import HashWallet
 from models.hashWalletTransaction import HashWalletTransaction
+import time
+import json
+import base64
+import requests
+import hmac
+import hashlib
+import razorpay
 
-from utils.common import generate_fid, generate_access_code
+
+from utils.common import generate_fid, generate_access_code, get_razorpay_keys
 
 booking_blueprint = Blueprint('bookings', __name__)
+
+@booking_blueprint.route('/create_order', methods=['POST'])
+def create_order():
+    data = request.get_json()
+
+    amount = data.get('amount')  # in paisa
+    currency = data.get('currency', 'INR')
+    receipt = data.get('receipt', f'order_rcpt_{int(time.time())}')
+
+    RAZORPAY_KEY_ID = current_app.config.get("RAZORPAY_KEY_ID")
+    RAZORPAY_KEY_SECRET = current_app.config.get("RAZORPAY_KEY_SECRET")
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": "Basic " + base64.b64encode(f"{RAZORPAY_KEY_ID}:{RAZORPAY_KEY_SECRET}".encode()).decode()
+    }
+
+    payload = {
+        "amount": amount,
+        "currency": currency,
+        "receipt": receipt,
+        "payment_capture": 1
+    }
+
+    response = requests.post("https://api.razorpay.com/v1/orders", headers=headers, json=payload)
+
+    if response.ok:
+        return jsonify(response.json()), 200
+
+    # For production, just forward the error status and message from Razorpay without exposing internal details
+    return jsonify({"error": "Order creation failed"}), response.status_code
+
+@booking_blueprint.route('/capture_payment', methods=['POST'])
+def capture_payment():
+    data = request.get_json()
+    payment_id = data.get('razorpay_payment_id')
+    order_id = data.get('razorpay_order_id')
+    signature = data.get('razorpay_signature')
+
+    if not payment_id or not order_id or not signature:
+        return jsonify({"message": "Missing payment details"}), 400
+
+    RAZORPAY_KEY_ID = current_app.config.get("RAZORPAY_KEY_ID")
+    RAZORPAY_KEY_SECRET = current_app.config.get("RAZORPAY_KEY_SECRET")
+
+    # Validate signature
+    msg = f"{order_id}|{payment_id}"
+    generated_signature = hmac.new(
+        RAZORPAY_KEY_SECRET.encode(),
+        msg.encode(),
+        hashlib.sha256
+    ).hexdigest()
+
+    if generated_signature != signature:
+        return jsonify({"message": "Invalid payment signature"}), 400
+
+    # Initialize Razorpay client
+    razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+
+    try:
+        # Fetch payment to check status
+        payment = razorpay_client.payment.fetch(payment_id)
+
+        if payment['status'] == 'authorized':
+            # Capture payment manually if not auto-captured during order creation
+            amount = payment['amount']  # amount in paisa
+            razorpay_client.payment.capture(payment_id, amount)
+            return jsonify({"message": "Payment captured successfully"}), 200
+
+        elif payment["status"] == "captured":
+            return jsonify({"message": "Payment already captured"}), 200
+
+        else:
+            return jsonify({"message": f"Payment status {payment['status']} - cannot capture."}), 400
+    except razorpay.errors.RazorpayError as e:
+        current_app.logger.error(f"Razorpay error during capture: {str(e)}")
+        return jsonify({"message": "Error capturing payment", "error": str(e)}), 500
+
 
 @booking_blueprint.route('/bookings', methods=['POST'])
 def create_booking():
@@ -51,7 +140,7 @@ def create_booking():
         socketio = current_app.extensions['socketio']
         scheduler = current_app.extensions['scheduler']
         available_game = db.session.query(AvailableGame).filter(AvailableGame.id == game_id).first()
-        booking_ids = []
+        booking_mappings = []  # Changed to collect dicts with slot_id and booking_id
 
         for slot_id in slot_ids:
             slot_entry = db.session.execute(text(f"""
@@ -65,7 +154,11 @@ def create_booking():
 
             booking = BookingService.create_booking(slot_id, game_id, user_id, socketio, book_date)
             db.session.flush()
-            booking_ids.append(booking.id)
+
+            booking_mappings.append({
+                "slot_id": slot_id,
+                "booking_id": booking.id
+            })
 
             scheduler.enqueue_in(
                 timedelta(seconds=360),
@@ -77,103 +170,287 @@ def create_booking():
 
         db.session.commit()
 
-        if not booking_ids:
+        if not booking_mappings:
             return jsonify({"message": "No slots available for booking"}), 400
 
-        return jsonify({"message": "Slots frozen", "booking_ids": booking_ids}), 200
+        return jsonify({
+            "message": "Slots frozen",
+            "bookings": booking_mappings
+        }), 200
 
     except Exception as e:
         db.session.rollback()
         return jsonify({"message": "Failed to freeze slot(s)", "error": str(e)}), 500
 
+@booking_blueprint.route('/release_slot', methods=['POST'])
+def release_slot():
+    try:
+        data = request.json
+        bookings = data.get("bookings")  # Expect a list of {slot_id, booking_id, book_date}
+
+        if not bookings or not isinstance(bookings, list):
+            return jsonify({"message": "A list of bookings is required under the 'bookings' key."}), 400
+
+        errors = []
+        success_count = 0
+
+        for index, booking in enumerate(bookings):
+            slot_id = booking.get("slot_id")
+            booking_id = booking.get("booking_id")
+            book_date = booking.get("book_date")
+
+            if not slot_id or not booking_id or not book_date:
+                errors.append({"index": index, "error": "slot_id, booking_id, and book_date are required"})
+                continue
+
+            # Validate date format
+            try:
+                datetime.strptime(book_date, '%Y-%m-%d')
+            except ValueError:
+                errors.append({"index": index, "error": "book_date must be in YYYY-MM-DD format"})
+                continue
+
+            try:
+                BookingService.release_slot(slot_id, booking_id, book_date)
+                success_count += 1
+            except Exception as e:
+                errors.append({"index": index, "error": f"Failed to release slot: {str(e)}"})
+
+        db.session.commit()
+
+        response = {"message": f"Processed {success_count} bookings."}
+        if errors:
+            response["errors"] = errors
+            return jsonify(response), 207  # 207 Multi-Status for partial success
+        else:
+            return jsonify(response), 200
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"message": "Failed to release slot(s)", "error": str(e)}), 500
+
+@booking_blueprint.route('/generate_payment_link', methods=['POST'])
+def generate_payment_link():
+    """
+    Creates a Razorpay Payment Link and returns the URL.
+    Expects JSON: { "amount": 500, "customer_email": "user@example.com", "customer_contact": "9876543210" }
+    Amount is expected in rupees.
+    """
+    data = request.get_json()
+    amount_rupees = data.get('amount')
+    customer_email = data.get('customer_email')
+    customer_contact = data.get('customer_contact')
+
+    if not (amount_rupees and customer_email and customer_contact):
+        return jsonify({"message": "Missing required fields!"}), 400
+
+    try:
+        amount_paise = int(float(amount_rupees) * 100)
+    except Exception:
+        return jsonify({"message": "Invalid amount format."}), 400
+
+    RAZORPAY_KEY_ID = current_app.config.get('RAZORPAY_KEY_ID')
+    RAZORPAY_KEY_SECRET = current_app.config.get('RAZORPAY_KEY_SECRET')
+    if not (RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET):
+        return jsonify({'message': 'Server config error.'}), 500
+
+    client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+
+    payment_link_data = {
+        "amount": amount_paise,
+        "currency": "INR",
+        "accept_partial": False,
+        "description": "Payment for your order",
+        "customer": {
+            "name": "Customer Name",  # Optional, add if you have it
+            "contact": customer_contact,
+            "email": customer_email
+        },
+        "notify": {
+            "sms": True,
+            "email": True
+        },
+        "reminder_enable": True,
+        "callback_method": "get"  # Or "post" if you handle a callback
+    }
+
+    try:
+        payment_link = client.payment_link.create(payment_link_data)
+        return jsonify({
+            'payment_link': payment_link['short_url'],
+            'id': payment_link['id'],
+            'status': payment_link['status']
+        })
+    except Exception as e:
+        return jsonify({'message': 'Error creating payment link', 'error': str(e)}), 500
+
 @booking_blueprint.route('/bookings/confirm', methods=['POST'])
 def confirm_booking():
     try:
         data = request.get_json(force=True)
-        booking_ids = data.get('booking_id')  # Expects a list
-        payment_id = data.get('payment_id')   # Optional
-        book_date = data.get('book_date')
-        voucher_code = data.get("voucher_code")
-        mode = data.get("payment_mode", "payment_gateway")  # Default to payment_gateway
 
-        if not booking_ids:
-            return jsonify({'message': 'No booking IDs provided'}), 400
+        booking_ids         = data.get('booking_id')  # list[int]
+        payment_id          = data.get('payment_id')  # Razorpay payment id
+        book_date_str       = data.get('book_date')
+        voucher_code        = data.get('voucher_code')
+        payment_mode        = data.get('payment_mode', "payment_gateway")  # 'wallet' or 'payment_gateway'
+        use_pass            = bool(data.get('use_pass', False))
+        extra_services_list = data.get('extra_services', [])  # flat array [{category_id, item_id, quantity}]
 
-        confirmed_ids = []
+        current_app.logger.info(f"Confirm payload: {data}")
 
-        # Generate access code for the booking session
+        if not booking_ids or not book_date_str:
+            return jsonify({'message': 'booking_id and book_date are required'}), 400
+
+        # Parse date
+        try:
+            if 'T' in book_date_str:
+                book_date = datetime.fromisoformat(book_date_str).date()
+            else:
+                book_date = datetime.strptime(book_date_str, '%Y-%m-%d').date()
+        except ValueError:
+            return jsonify({"message": "Invalid book_date format"}), 400
+
+        # Setup Razorpay client if needed
+        RAZORPAY_KEY_ID = current_app.config.get("RAZORPAY_KEY_ID")
+        RAZORPAY_KEY_SECRET = current_app.config.get("RAZORPAY_KEY_SECRET")
+        razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+        razorpay_payment_verified = False
+
+        # Payment gateway verification
+        if payment_mode == "payment_gateway":
+            if not payment_id:
+                return jsonify({"message": "payment_id required for payment_gateway mode"}), 400
+            try:
+                payment = razorpay_client.payment.fetch(payment_id)
+                current_app.logger.info(f"Razorpay payment fetched: {payment}")
+                if payment['status'] == 'captured':
+                    razorpay_payment_verified = True
+                else:
+                    return jsonify({"message": "Payment not successful or not captured"}), 400
+            except razorpay.errors.RazorpayError as e:
+                current_app.logger.error(f"Razorpay verification failed: {str(e)}")
+                return jsonify({"message": "Payment verification failed", "error": str(e)}), 400
+
+        # Create access code shared by this batch
         code = generate_access_code()
         access_code_entry = AccessBookingCode(access_code=code)
         db.session.add(access_code_entry)
-        db.session.flush()  # Get access_code_entry.id
+        db.session.flush()
+
+        confirmed_ids  = []
+        pass_used_id   = None
+        pass_type_name = None
+        user_id        = None
 
         for booking_id in booking_ids:
-            booking = db.session.query(Booking).filter_by(id=booking_id).first()
+            booking = Booking.query.filter_by(id=booking_id).first()
             if not booking or booking.status == 'confirmed':
                 continue
+            if user_id is None:
+                user_id = booking.user_id
 
-            booking.status = 'confirmed'
-            booking.updated_at = datetime.utcnow()
-            booking.access_code_id = access_code_entry.id
-
-            available_game = db.session.query(AvailableGame).filter_by(id=booking.game_id).first()
-            vendor = db.session.query(Vendor).filter_by(id=available_game.vendor_id).first() if available_game else None
-            slot_obj = db.session.query(Slot).filter_by(id=booking.slot_id).first()
-            user = db.session.query(User).filter_by(id=booking.user_id).first()
+            available_game = AvailableGame.query.filter_by(id=booking.game_id).first()
+            vendor         = Vendor.query.filter_by(id=available_game.vendor_id).first() if available_game else None
+            slot_obj       = Slot.query.filter_by(id=booking.slot_id).first()
+            user           = User.query.filter_by(id=booking.user_id).first()
 
             if not all([available_game, vendor, slot_obj, user]):
+                current_app.logger.warning(f"Booking {booking_id} missing related data")
                 continue
 
-            # Handle voucher if provided
-            voucher = None
+            # Pass logic (only if use_pass = True)
+            active_pass = None
+            if use_pass:
+                active_pass = BookingService.get_user_pass(user.id, vendor.id, book_date)
+                if active_pass:
+                    pass_used_id   = active_pass.id
+                    pass_type_name = active_pass.cafe_pass.pass_type.name if active_pass.cafe_pass.pass_type else None
+
+            # Calculate slot + extras
+            slot_price   = available_game.single_slot_price
+            extras_total = 0
+            for extra in extra_services_list:
+                menu_obj = ExtraServiceMenu.query.filter_by(id=extra.get('item_id'), is_active=True).first()
+                if not menu_obj:
+                    continue
+                extras_total += menu_obj.price * extra.get('quantity', 1)
+
+            # Voucher discount
+            voucher             = None
+            discount_percentage = 0
             if voucher_code:
-                voucher = db.session.query(Voucher).filter_by(code=voucher_code, user_id=user.id, is_active=True).first()
-                if not voucher:
+                voucher = Voucher.query.filter_by(code=voucher_code, user_id=user.id, is_active=True).first()
+                if voucher:
+                    discount_percentage = voucher.discount_percentage
+                else:
                     return jsonify({'message': 'Invalid or expired voucher'}), 400
 
-            # Credit reward coins
-            user_hash_coin = db.session.query(UserHashCoin).filter_by(user_id=user.id).first()
-            if not user_hash_coin:
-                user_hash_coin = UserHashCoin(user_id=user.id, hash_coins=0)
-                db.session.add(user_hash_coin)
-            user_hash_coin.hash_coins += 1000
-
-            # Pricing & discount
-            slot_price = available_game.single_slot_price
-            discount_percentage = voucher.discount_percentage if voucher else 0
-            discount_amount = int(slot_price * discount_percentage / 100)
-            amount = slot_price - discount_amount
-
-            # Payment via wallet or gateway
-            if mode == "wallet":
-                try:
-                    BookingService.debit_wallet(user.id, booking.id, amount)
-                    payment_mode_used = "wallet"
-                except ValueError as e:
-                    return jsonify({"message": str(e)}), 400
+            # Amount calculation
+            if active_pass:
+                discount_amount = slot_price
+                amount_payable  = extras_total
             else:
+                total_before_discount = slot_price + extras_total
+                discount_amount       = int(total_before_discount * discount_percentage / 100)
+                amount_payable        = total_before_discount - discount_amount
+                pass_used_id          = None
+                pass_type_name        = None
+
+            razorpay_payment_verified = True # Bypass for now ; TODO: update it in future
+
+            # Payment processing
+            if payment_mode == "wallet":
+                BookingService.debit_wallet(user.id, booking.id, amount_payable)
+                payment_mode_used         = "wallet"
+                razorpay_payment_verified = True
+            else:
+                if amount_payable == 0:
+                    razorpay_payment_verified = True
+                elif not razorpay_payment_verified:
+                    return jsonify({"message": "Payment not verified"}), 400
                 payment_mode_used = "payment_gateway"
 
-            # Create transaction
+            # Confirm booking
+            booking.status         = 'confirmed'
+            booking.updated_at     = datetime.utcnow()
+            booking.access_code_id = access_code_entry.id
+
+            # Create transaction (pass_id removed)
             transaction = Transaction(
-                booking_id=booking.id,
-                vendor_id=vendor.id,
-                user_id=user.id,
-                user_name=user.name,
-                original_amount=slot_price,
-                discounted_amount=discount_amount,
-                amount=amount,
-                mode_of_payment=payment_mode_used,
-                booking_date=datetime.utcnow().date(),
-                booked_date=book_date,
-                booking_time=datetime.utcnow().time()
+                booking_id       = booking.id,
+                vendor_id        = vendor.id,
+                user_id          = user.id,
+                user_name        = user.name,
+                original_amount  = slot_price + extras_total,
+                discounted_amount= discount_amount,
+                amount           = amount_payable,
+                mode_of_payment  = payment_mode_used,
+                booking_date     = datetime.utcnow().date(),
+                booked_date      = book_date,
+                booking_time     = datetime.utcnow().time(),
+                reference_id     = payment_id if payment_mode_used == "payment_gateway" else None
             )
             db.session.add(transaction)
             db.session.flush()
 
-            # Save payment mapping if available
-            if payment_id:
+            if payment_id and payment_mode_used == "payment_gateway":
                 BookingService.save_payment_transaction_mapping(booking.id, transaction.id, payment_id)
+
+            # Save extra services
+            BookingExtraService.query.filter_by(booking_id=booking.id).delete()
+            for extra in extra_services_list:
+                menu_obj = ExtraServiceMenu.query.filter_by(id=extra.get('item_id'), is_active=True).first()
+                if not menu_obj:
+                    continue
+                booking_extra = BookingExtraService(
+                    booking_id=booking.id,
+                    category_id=extra.get('category_id'),
+                    menu_id=menu_obj.id,
+                    quantity=extra.get('quantity', 1),
+                    price=menu_obj.price
+                )
+                db.session.add(booking_extra)
 
             # Mark voucher as used
             if voucher:
@@ -184,22 +461,26 @@ def confirm_booking():
                     booking_id=booking.id
                 ))
 
-            # Update vendor slot table
+            # Reward coins
+            user_hash_coin = UserHashCoin.query.filter_by(user_id=user.id).first()
+            if not user_hash_coin:
+                user_hash_coin = UserHashCoin(user_id=user.id, hash_coins=0)
+                db.session.add(user_hash_coin)
+            user_hash_coin.hash_coins += 1000
+
+            # Update slot availability
             db.session.execute(text(f"""
                 UPDATE VENDOR_{vendor.id}_SLOT
                 SET available_slot = available_slot - 1,
                     is_available = CASE WHEN available_slot - 1 = 0 THEN FALSE ELSE is_available END
                 WHERE slot_id = :slot_id AND date = :book_date
-            """), {
-                "slot_id": booking.slot_id,
-                "book_date": book_date
-            })
+            """), {"slot_id": booking.slot_id, "book_date": book_date})
 
-            # Insert into vendor dashboard and promo table
+            # Vendor analytics
             BookingService.insert_into_vendor_dashboard_table(transaction.id, -1)
             BookingService.insert_into_vendor_promo_table(transaction.id, -1)
 
-            # Send email confirmation
+            # Send confirmation email
             booking_mail(
                 gamer_name=user.name,
                 gamer_phone=user.contact_info.phone,
@@ -211,48 +492,192 @@ def confirm_booking():
                     "booking_id": booking.id,
                     "slot_time": f"{slot_obj.start_time} - {slot_obj.end_time}"
                 }],
-                price_paid=amount
+                price_paid=amount_payable
             )
 
             confirmed_ids.append(booking.id)
 
         db.session.commit()
-        return jsonify({'message': 'Bookings confirmed successfully', 'confirmed_ids': confirmed_ids}), 200
+        return jsonify({
+            'message': 'Bookings confirmed successfully',
+            'confirmed_ids': confirmed_ids,
+            'pass_used_id': pass_used_id,
+            'pass_type': pass_type_name,
+            'amount_paid': amount_payable
+        }), 200
 
     except Exception as e:
         db.session.rollback()
         current_app.logger.exception("Error confirming booking")
-
-        # Unfreeze slots
-        try:
-            booking_ids = data.get('booking_id')
-            book_date = data.get('book_date')
-
-            for booking_id in booking_ids or []:
-                booking = db.session.query(Booking).filter_by(id=booking_id).first()
-                if not booking or booking.status == 'confirmed':
-                    continue
-
-                booking.status = 'cancelled'
-                booking.updated_at = datetime.utcnow()
-
-                available_game = db.session.query(AvailableGame).filter_by(id=booking.game_id).first()
-                if available_game:
-                    vendor_id = available_game.vendor_id
-                    db.session.execute(text(f"""
-                        UPDATE VENDOR_{vendor_id}_SLOT
-                        SET available_slot = available_slot + 1,
-                            is_available = TRUE
-                        WHERE slot_id = :slot_id AND date = :book_date
-                    """), {
-                        "slot_id": booking.slot_id,
-                        "book_date": book_date
-                    })
-            db.session.commit()
-        except Exception as cleanup_error:
-            current_app.logger.error(f"Error during slot unfreezing cleanup: {str(cleanup_error)}")
-
         return jsonify({'error': str(e)}), 500
+
+# @booking_blueprint.route('/bookings/confirm', methods=['POST'])
+# def confirm_booking():
+#     try:
+#         data = request.get_json(force=True)
+#         booking_ids = data.get('booking_id')  # Expects a list
+#         payment_id = data.get('payment_id')   # Optional
+#         book_date = data.get('book_date')
+#         voucher_code = data.get("voucher_code")
+#         mode = data.get("payment_mode", "payment_gateway")  # Default to payment_gateway
+
+#         if not booking_ids:
+#             return jsonify({'message': 'No booking IDs provided'}), 400
+
+#         confirmed_ids = []
+
+#         # Generate access code for the booking session
+#         code = generate_access_code()
+#         access_code_entry = AccessBookingCode(access_code=code)
+#         db.session.add(access_code_entry)
+#         db.session.flush()  # Get access_code_entry.id
+
+#         for booking_id in booking_ids:
+#             booking = db.session.query(Booking).filter_by(id=booking_id).first()
+#             if not booking or booking.status == 'confirmed':
+#                 continue
+
+#             booking.status = 'confirmed'
+#             booking.updated_at = datetime.utcnow()
+#             booking.access_code_id = access_code_entry.id
+
+#             available_game = db.session.query(AvailableGame).filter_by(id=booking.game_id).first()
+#             vendor = db.session.query(Vendor).filter_by(id=available_game.vendor_id).first() if available_game else None
+#             slot_obj = db.session.query(Slot).filter_by(id=booking.slot_id).first()
+#             user = db.session.query(User).filter_by(id=booking.user_id).first()
+
+#             if not all([available_game, vendor, slot_obj, user]):
+#                 continue
+
+#             # Handle voucher if provided
+#             voucher = None
+#             if voucher_code:
+#                 voucher = db.session.query(Voucher).filter_by(code=voucher_code, user_id=user.id, is_active=True).first()
+#                 if not voucher:
+#                     return jsonify({'message': 'Invalid or expired voucher'}), 400
+
+#             # Credit reward coins
+#             user_hash_coin = db.session.query(UserHashCoin).filter_by(user_id=user.id).first()
+#             if not user_hash_coin:
+#                 user_hash_coin = UserHashCoin(user_id=user.id, hash_coins=0)
+#                 db.session.add(user_hash_coin)
+#             user_hash_coin.hash_coins += 1000
+
+#             # Pricing & discount
+#             slot_price = available_game.single_slot_price
+#             discount_percentage = voucher.discount_percentage if voucher else 0
+#             discount_amount = int(slot_price * discount_percentage / 100)
+#             amount = slot_price - discount_amount
+
+#             # Payment via wallet or gateway
+#             if mode == "wallet":
+#                 try:
+#                     BookingService.debit_wallet(user.id, booking.id, amount)
+#                     payment_mode_used = "wallet"
+#                 except ValueError as e:
+#                     return jsonify({"message": str(e)}), 400
+#             else:
+#                 payment_mode_used = "payment_gateway"
+
+#             # Create transaction
+#             transaction = Transaction(
+#                 booking_id=booking.id,
+#                 vendor_id=vendor.id,
+#                 user_id=user.id,
+#                 user_name=user.name,
+#                 original_amount=slot_price,
+#                 discounted_amount=discount_amount,
+#                 amount=amount,
+#                 mode_of_payment=payment_mode_used,
+#                 booking_date=datetime.utcnow().date(),
+#                 booked_date=book_date,
+#                 booking_time=datetime.utcnow().time()
+#             )
+#             db.session.add(transaction)
+#             db.session.flush()
+
+#             # Save payment mapping if available
+#             if payment_id:
+#                 BookingService.save_payment_transaction_mapping(booking.id, transaction.id, payment_id)
+
+#             # Mark voucher as used
+#             if voucher:
+#                 voucher.is_active = False
+#                 db.session.add(VoucherRedemptionLog(
+#                     user_id=user.id,
+#                     voucher_id=voucher.id,
+#                     booking_id=booking.id
+#                 ))
+
+#             # Update vendor slot table
+#             db.session.execute(text(f"""
+#                 UPDATE VENDOR_{vendor.id}_SLOT
+#                 SET available_slot = available_slot - 1,
+#                     is_available = CASE WHEN available_slot - 1 = 0 THEN FALSE ELSE is_available END
+#                 WHERE slot_id = :slot_id AND date = :book_date
+#             """), {
+#                 "slot_id": booking.slot_id,
+#                 "book_date": book_date
+#             })
+
+#             # Insert into vendor dashboard and promo table
+#             BookingService.insert_into_vendor_dashboard_table(transaction.id, -1)
+#             BookingService.insert_into_vendor_promo_table(transaction.id, -1)
+
+#             # Send email confirmation
+#             booking_mail(
+#                 gamer_name=user.name,
+#                 gamer_phone=user.contact_info.phone,
+#                 gamer_email=user.contact_info.email,
+#                 cafe_name=vendor.cafe_name,
+#                 booking_date=datetime.utcnow().strftime("%Y-%m-%d"),
+#                 booked_for_date=str(book_date),
+#                 booking_details=[{
+#                     "booking_id": booking.id,
+#                     "slot_time": f"{slot_obj.start_time} - {slot_obj.end_time}"
+#                 }],
+#                 price_paid=amount
+#             )
+
+#             confirmed_ids.append(booking.id)
+
+#         db.session.commit()
+#         return jsonify({'message': 'Bookings confirmed successfully', 'confirmed_ids': confirmed_ids}), 200
+
+#     except Exception as e:
+#         db.session.rollback()
+#         current_app.logger.exception("Error confirming booking")
+
+#         # Unfreeze slots
+#         try:
+#             booking_ids = data.get('booking_id')
+#             book_date = data.get('book_date')
+
+#             for booking_id in booking_ids or []:
+#                 booking = db.session.query(Booking).filter_by(id=booking_id).first()
+#                 if not booking or booking.status == 'confirmed':
+#                     continue
+
+#                 booking.status = 'cancelled'
+#                 booking.updated_at = datetime.utcnow()
+
+#                 available_game = db.session.query(AvailableGame).filter_by(id=booking.game_id).first()
+#                 if available_game:
+#                     vendor_id = available_game.vendor_id
+#                     db.session.execute(text(f"""
+#                         UPDATE VENDOR_{vendor_id}_SLOT
+#                         SET available_slot = available_slot + 1,
+#                             is_available = TRUE
+#                         WHERE slot_id = :slot_id AND date = :book_date
+#                     """), {
+#                         "slot_id": booking.slot_id,
+#                         "book_date": book_date
+#                     })
+#             db.session.commit()
+#         except Exception as cleanup_error:
+#             current_app.logger.error(f"Error during slot unfreezing cleanup: {str(cleanup_error)}")
+
+#         return jsonify({'error': str(e)}), 500
 
 @booking_blueprint.route('/redeem-voucher', methods=['POST'])
 def redeem_voucher():
@@ -273,7 +698,7 @@ def redeem_voucher():
     user_hash_coin.hash_coins -= required_coins
 
     # Generate unique voucher code
-    import random, string
+    import string
     code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
 
     voucher = Voucher(
@@ -726,6 +1151,7 @@ def get_vendor_bookings(vendor_id):
 def new_booking(vendor_id):
     """
     Creates a new booking for the given vendor, checking for existing users or creating a new one.
+    Handles waive-off and extra controller fare.
     """
     try:
         current_app.logger.info("New Booking Triggered")
@@ -736,57 +1162,48 @@ def new_booking(vendor_id):
         email = data.get("email")
         phone = data.get("phone")
         booked_date = data.get("bookedDate")
-        slot_ids = data.get("slotId")  # List of slot IDs
+        slot_ids = data.get("slotId")
         payment_type = data.get("paymentType")
         console_id = data.get("consoleId")
         is_rapid_booking = data.get("isRapidBooking")
-        booking_type = data.get("bookingType")
-        # Extract user_id safely from the data
-        user_id = data.get("userId") if data.get("userId") is not None else None
+        booking_type = data.get("bookingType") or "direct"
+        user_id = data.get("userId")
+        waive_off_total = float(data.get("waiveOffAmount", 0.0))
+        extra_controller_fare = float(data.get("extraControllerFare", 0.0))
 
         dashboard_status = None
-
-        if booking_type is None:
-            booking_type = "direct"
 
         if not all([name, phone, booked_date, slot_ids, payment_type]):
             return jsonify({"message": "Missing required fields"}), 400
 
-        # Check if user already exists
-        if user_id is not None:
-            user = db.session.query(User).filter(User.id == user_id).first()
-        else:
-            user = db.session.query(User).join(ContactInfo).filter(ContactInfo.email == email).first()
+        user = (
+            db.session.query(User).filter(User.id == user_id).first()
+            if user_id
+            else db.session.query(User).join(ContactInfo).filter(ContactInfo.email == email).first()
+        )
 
         if not user:
-            # Create a new user
             user = User(
                 fid=generate_fid(),
                 avatar_path="Not defined",
                 name=name,
-                game_username=name.lower().replace(" ", "_"),
+                game_username = name.lower().replace(" ", "_") + str(random.randint(1000, 9999)),
                 parent_type="user"
             )
-
             contact_info = ContactInfo(
                 phone=phone,
                 email=email,
                 parent_id=user.id,
                 parent_type="user"
             )
-
             user.contact_info = contact_info
-
             db.session.add(user)
             db.session.flush()
 
-        # Fetch the available game details
         available_game = db.session.query(AvailableGame).filter_by(vendor_id=vendor_id).first()
-
         if not available_game:
             return jsonify({"message": "Game not found for this vendor"}), 404
 
-        # Check slot availability for all requested slots
         placeholders = ", ".join([f":slot_id_{i}" for i in range(len(slot_ids))])
         slot_params = {f"slot_id_{i}": slot_id for i, slot_id in enumerate(slot_ids)}
 
@@ -800,27 +1217,21 @@ def new_booking(vendor_id):
             {"booked_date": booked_date, **slot_params}
         ).fetchall()
 
-        # Ensure all requested slots exist and are available
         if len(slot_entries) != len(slot_ids):
             return jsonify({"message": "One or more slots not found or unavailable"}), 400
 
         for slot in slot_entries:
-            if slot[1] <= 0 or not slot[2]:  # available_slot <= 0 or is_available = False
+            if slot[1] <= 0 or not slot[2]:
                 return jsonify({"message": f"Slot {slot[0]} is fully booked"}), 400
 
-        # Begin transaction
         bookings = []
-        
-         # 1. Generate new access code
         code = generate_access_code()
         access_code_entry = AccessBookingCode(access_code=code)
         db.session.add(access_code_entry)
-        db.session.flush()  # ensure access_code_entry.id is populated
+        db.session.flush()
 
         for slot_id in slot_ids:
             slot_obj = db.session.query(Slot).filter_by(id=slot_id).first()
-            available_game = db.session.query(AvailableGame).filter_by(id=slot_obj.gaming_type_id).first()
-        
             booking = Booking(
                 slot_id=slot_id,
                 game_id=available_game.id,
@@ -829,10 +1240,9 @@ def new_booking(vendor_id):
                 access_code_id=access_code_entry.id
             )
             db.session.add(booking)
-            db.session.flush()  # Get the booking ID
+            db.session.flush()
             bookings.append(booking)
 
-        # Decrease available slot count for all booked slots
         db.session.execute(
             text(f"""
                 UPDATE VENDOR_{vendor_id}_SLOT
@@ -844,21 +1254,28 @@ def new_booking(vendor_id):
             {"booked_date": booked_date, **slot_params}
         )
 
-        db.session.commit()  # Commit all bookings before creating transactions
+        db.session.commit()
 
-        # Create transactions for each booking
+        # Create transaction entries
         transactions = []
+        waive_off_per_slot = waive_off_total / len(bookings) if bookings else 0.0
+
         for booking in bookings:
+            original_amount = available_game.single_slot_price
+            discounted_amount = waive_off_per_slot
+            final_amount = max(original_amount - discounted_amount, 0.0)
+
             transaction = Transaction(
                 booking_id=booking.id,
                 vendor_id=vendor_id,
                 user_id=user.id,
                 booked_date=datetime.strptime(booked_date, "%Y-%m-%d").date(),
+                booking_date=datetime.utcnow().date(),
                 booking_time=datetime.utcnow().time(),
                 user_name=user.name,
-                original_amount=available_game.single_slot_price,
-                discounted_amount = 0,
-                amount=available_game.single_slot_price,
+                original_amount=original_amount,
+                discounted_amount=discounted_amount,
+                amount=final_amount,
                 mode_of_payment=payment_type,
                 booking_type=booking_type,
                 settlement_status="NA" if payment_type != "paid" else "completed"
@@ -866,29 +1283,40 @@ def new_booking(vendor_id):
             db.session.add(transaction)
             transactions.append(transaction)
 
+        if extra_controller_fare > 0:
+            controller_transaction = Transaction(
+                booking_id=bookings[0].id,
+                vendor_id=vendor_id,
+                user_id=user.id,
+                booked_date=datetime.strptime(booked_date, "%Y-%m-%d").date(),
+                booking_date=datetime.utcnow().date(),
+                booking_time=datetime.utcnow().time(),
+                user_name=user.name,
+                original_amount=extra_controller_fare,
+                discounted_amount=0,
+                amount=extra_controller_fare,
+                mode_of_payment=payment_type,
+                booking_type="extra_controller",
+                settlement_status="NA" if payment_type != "paid" else "completed"
+            )
+            db.session.add(controller_transaction)
+            transactions.append(controller_transaction)
+
         if is_rapid_booking:
             dashboard_status = "current"
+            console_table = f"VENDOR_{vendor_id}_CONSOLE_AVAILABILITY"
+            db.session.execute(
+                text(f"""
+                    UPDATE {console_table}
+                    SET is_available = FALSE
+                    WHERE console_id = :console_id AND game_id = :game_id
+                """),
+                {"console_id": console_id, "game_id": available_game.id}
+            )
 
-            # ✅ Define the dynamic console availability table name
-            console_table_name = f"VENDOR_{vendor_id}_CONSOLE_AVAILABILITY"
-
-            # ✅ Update the status to false (occupied)
-            sql_update_status = text(f"""
-                UPDATE {console_table_name}
-                SET is_available = FALSE
-                WHERE console_id = :console_id AND game_id = :game_id
-            """)
-
-            db.session.execute(sql_update_status, {
-                "console_id": console_id,
-                "game_id": available_game.id
-            })
-        
         db.session.commit()
 
         socketio = current_app.extensions['socketio']
-
-        # Emit event for each booked slot
         for booking in bookings:
             socketio.emit('slot_booked', {
                 'slot_id': booking.slot_id,
@@ -898,24 +1326,18 @@ def new_booking(vendor_id):
 
         for trans in transactions:
             console_id_val = console_id if console_id is not None else -1
-            BookingService.insert_into_vendor_dashboard_table(trans.id, console_id_val, dashboard_status),
+            BookingService.insert_into_vendor_dashboard_table(trans.id, console_id_val, dashboard_status)
             BookingService.insert_into_vendor_promo_table(trans.id, console_id_val)
 
-        # Extract slot times for the email
         booking_details = []
         for booking in bookings:
             slot_obj = db.session.query(Slot).filter_by(id=booking.slot_id).first()
-            if slot_obj:
-                slot_time = f"{str(slot_obj.start_time)} - {str(slot_obj.end_time)}"  # Format as start_time - end_time
-            else:
-                slot_time = 'N/A'  # In case slot_obj is None (just as a fallback)
-            
+            slot_time = f"{str(slot_obj.start_time)} - {str(slot_obj.end_time)}" if slot_obj else "N/A"
             booking_details.append({
                 "booking_id": booking.id,
                 "slot_time": slot_time
             })
 
-        # Send confirmation email
         cafe_name = db.session.query(Vendor).filter_by(id=vendor_id).first().cafe_name
         booking_mail(
             gamer_name=name,
@@ -942,12 +1364,12 @@ def new_booking(vendor_id):
 @booking_blueprint.route('/extraBooking', methods=['POST'])
 def extra_booking():
     """
-    Records extra booking (time extended) played by the user in a gaming cafe.
+    Records extra booking (time extended) played by the user in a gaming cafe, with waive-off functionality.
     """
     try:
         data = request.json
 
-        required_fields = ["consoleNumber", "consoleType", "date", "slotId", "userId", "username", "amount", "gameId", "modeOfPayment","vendorId"]
+        required_fields = ["consoleNumber", "consoleType", "date", "slotId", "userId", "username", "amount", "gameId", "modeOfPayment", "vendorId"]
         if not all(data.get(field) is not None for field in required_fields):
             return jsonify({"message": "Missing required fields"}), 400
 
@@ -958,10 +1380,11 @@ def extra_booking():
         slot_id = data["slotId"]
         user_id = data["userId"]
         username = data["username"]
-        amount = data["amount"]
+        amount = float(data["amount"])
         game_id = data["gameId"]
         mode_of_payment = data["modeOfPayment"]
-        vendor_id = data["vendorId"] 
+        vendor_id = data["vendorId"]
+        waive_off_amount = float(data.get("waiveOffAmount", 0.0))  # Optional waive-off amount
 
         # Optional: verify user and slot exist
         user = db.session.query(User).filter_by(id=user_id).first()
@@ -980,6 +1403,11 @@ def extra_booking():
         db.session.add(extra_booking)
         db.session.flush()
 
+        # Calculate final amount after waive-off
+        original_amount = amount
+        discounted_amount = waive_off_amount
+        final_amount = max(original_amount - discounted_amount, 0.0)
+
         # Create a transaction for extra booking
         transaction = Transaction(
             booking_id=extra_booking.id,
@@ -988,9 +1416,9 @@ def extra_booking():
             booked_date=booked_date,
             booking_time=datetime.utcnow().time(),
             user_name=username,
-            original_amount=amount,
-            discounted_amount=0,
-            amount=amount,
+            original_amount=original_amount,
+            discounted_amount=discounted_amount,
+            amount=final_amount,
             mode_of_payment=mode_of_payment,
             booking_type="extra",
             settlement_status="completed" if mode_of_payment == "paid" else "NA"
@@ -1009,9 +1437,8 @@ def extra_booking():
             slot_time_str = "N/A"
         else:
             slot_time_str = f"{slot.start_time.strftime('%-I:%M %p')} to {slot.end_time.strftime('%-I:%M %p')}"
-            # Use '%#I' on Windows instead of '%-I' for removing leading zeros
-            
-        # ✅ Send the extra booking email
+
+        # Send the extra booking email
         extra_booking_time_mail(
             username=username,
             user_email=gamer_email,
@@ -1019,7 +1446,7 @@ def extra_booking():
             slot_time=slot_time_str,
             console_type=console_type,
             console_number=console_number,
-            amount=amount,
+            amount=final_amount,  # Use final_amount after waive-off
             mode_of_payment=mode_of_payment
         )
 

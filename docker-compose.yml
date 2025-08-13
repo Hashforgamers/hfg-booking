@@ -17,6 +17,8 @@ services:
       - MAIL_USERNAME=support@hashforgamers.co.in
       - MAIL_PASSWORD=h3b:@yasDm
       - MAIL_DEFAULT_SENDER=support@hashforgamers.co.in
+      - RAZORPAY_KEY_ID=dummyValue
+      - RAZORPAY_KEY_SECRET=dummyvalue
     volumes:
       - .:/app
     command: >

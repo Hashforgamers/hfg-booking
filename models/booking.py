@@ -25,6 +25,8 @@ class Booking(db.Model):
     # Add relationship to transactions
     transaction = relationship('Transaction', back_populates='booking', uselist=False)
 
+    booking_extra_services = relationship('BookingExtraService', back_populates='booking', cascade='all, delete-orphan')
+
     access_code_id = Column(Integer, ForeignKey('access_booking_codes.id'), nullable=True)
     access_code_entry = db.relationship('AccessBookingCode', back_populates='bookings')
 
