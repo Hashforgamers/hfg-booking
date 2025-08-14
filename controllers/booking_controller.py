@@ -441,11 +441,12 @@ def confirm_booking():
             BookingExtraService.query.filter_by(booking_id=booking.id).delete()
             for extra in extra_services_list:
                 menu_obj = ExtraServiceMenu.query.filter_by(id=extra.get('item_id'), is_active=True).first()
+                category_obj = ExtraServiceCategory.query.filter_by(id=extra.get('category_id'), is_active=True).first()
                 if not menu_obj:
                     continue
                 booking_extra = BookingExtraService(
                     booking_id=booking.id,
-                    category_id=extra.get('category_id'),
+                    category_id=category_obj.id,
                     menu_id=menu_obj.id,
                     quantity=extra.get('quantity', 1),
                     price=menu_obj.price
@@ -510,174 +511,6 @@ def confirm_booking():
         db.session.rollback()
         current_app.logger.exception("Error confirming booking")
         return jsonify({'error': str(e)}), 500
-
-# @booking_blueprint.route('/bookings/confirm', methods=['POST'])
-# def confirm_booking():
-#     try:
-#         data = request.get_json(force=True)
-#         booking_ids = data.get('booking_id')  # Expects a list
-#         payment_id = data.get('payment_id')   # Optional
-#         book_date = data.get('book_date')
-#         voucher_code = data.get("voucher_code")
-#         mode = data.get("payment_mode", "payment_gateway")  # Default to payment_gateway
-
-#         if not booking_ids:
-#             return jsonify({'message': 'No booking IDs provided'}), 400
-
-#         confirmed_ids = []
-
-#         # Generate access code for the booking session
-#         code = generate_access_code()
-#         access_code_entry = AccessBookingCode(access_code=code)
-#         db.session.add(access_code_entry)
-#         db.session.flush()  # Get access_code_entry.id
-
-#         for booking_id in booking_ids:
-#             booking = db.session.query(Booking).filter_by(id=booking_id).first()
-#             if not booking or booking.status == 'confirmed':
-#                 continue
-
-#             booking.status = 'confirmed'
-#             booking.updated_at = datetime.utcnow()
-#             booking.access_code_id = access_code_entry.id
-
-#             available_game = db.session.query(AvailableGame).filter_by(id=booking.game_id).first()
-#             vendor = db.session.query(Vendor).filter_by(id=available_game.vendor_id).first() if available_game else None
-#             slot_obj = db.session.query(Slot).filter_by(id=booking.slot_id).first()
-#             user = db.session.query(User).filter_by(id=booking.user_id).first()
-
-#             if not all([available_game, vendor, slot_obj, user]):
-#                 continue
-
-#             # Handle voucher if provided
-#             voucher = None
-#             if voucher_code:
-#                 voucher = db.session.query(Voucher).filter_by(code=voucher_code, user_id=user.id, is_active=True).first()
-#                 if not voucher:
-#                     return jsonify({'message': 'Invalid or expired voucher'}), 400
-
-#             # Credit reward coins
-#             user_hash_coin = db.session.query(UserHashCoin).filter_by(user_id=user.id).first()
-#             if not user_hash_coin:
-#                 user_hash_coin = UserHashCoin(user_id=user.id, hash_coins=0)
-#                 db.session.add(user_hash_coin)
-#             user_hash_coin.hash_coins += 1000
-
-#             # Pricing & discount
-#             slot_price = available_game.single_slot_price
-#             discount_percentage = voucher.discount_percentage if voucher else 0
-#             discount_amount = int(slot_price * discount_percentage / 100)
-#             amount = slot_price - discount_amount
-
-#             # Payment via wallet or gateway
-#             if mode == "wallet":
-#                 try:
-#                     BookingService.debit_wallet(user.id, booking.id, amount)
-#                     payment_mode_used = "wallet"
-#                 except ValueError as e:
-#                     return jsonify({"message": str(e)}), 400
-#             else:
-#                 payment_mode_used = "payment_gateway"
-
-#             # Create transaction
-#             transaction = Transaction(
-#                 booking_id=booking.id,
-#                 vendor_id=vendor.id,
-#                 user_id=user.id,
-#                 user_name=user.name,
-#                 original_amount=slot_price,
-#                 discounted_amount=discount_amount,
-#                 amount=amount,
-#                 mode_of_payment=payment_mode_used,
-#                 booking_date=datetime.utcnow().date(),
-#                 booked_date=book_date,
-#                 booking_time=datetime.utcnow().time()
-#             )
-#             db.session.add(transaction)
-#             db.session.flush()
-
-#             # Save payment mapping if available
-#             if payment_id:
-#                 BookingService.save_payment_transaction_mapping(booking.id, transaction.id, payment_id)
-
-#             # Mark voucher as used
-#             if voucher:
-#                 voucher.is_active = False
-#                 db.session.add(VoucherRedemptionLog(
-#                     user_id=user.id,
-#                     voucher_id=voucher.id,
-#                     booking_id=booking.id
-#                 ))
-
-#             # Update vendor slot table
-#             db.session.execute(text(f"""
-#                 UPDATE VENDOR_{vendor.id}_SLOT
-#                 SET available_slot = available_slot - 1,
-#                     is_available = CASE WHEN available_slot - 1 = 0 THEN FALSE ELSE is_available END
-#                 WHERE slot_id = :slot_id AND date = :book_date
-#             """), {
-#                 "slot_id": booking.slot_id,
-#                 "book_date": book_date
-#             })
-
-#             # Insert into vendor dashboard and promo table
-#             BookingService.insert_into_vendor_dashboard_table(transaction.id, -1)
-#             BookingService.insert_into_vendor_promo_table(transaction.id, -1)
-
-#             # Send email confirmation
-#             booking_mail(
-#                 gamer_name=user.name,
-#                 gamer_phone=user.contact_info.phone,
-#                 gamer_email=user.contact_info.email,
-#                 cafe_name=vendor.cafe_name,
-#                 booking_date=datetime.utcnow().strftime("%Y-%m-%d"),
-#                 booked_for_date=str(book_date),
-#                 booking_details=[{
-#                     "booking_id": booking.id,
-#                     "slot_time": f"{slot_obj.start_time} - {slot_obj.end_time}"
-#                 }],
-#                 price_paid=amount
-#             )
-
-#             confirmed_ids.append(booking.id)
-
-#         db.session.commit()
-#         return jsonify({'message': 'Bookings confirmed successfully', 'confirmed_ids': confirmed_ids}), 200
-
-#     except Exception as e:
-#         db.session.rollback()
-#         current_app.logger.exception("Error confirming booking")
-
-#         # Unfreeze slots
-#         try:
-#             booking_ids = data.get('booking_id')
-#             book_date = data.get('book_date')
-
-#             for booking_id in booking_ids or []:
-#                 booking = db.session.query(Booking).filter_by(id=booking_id).first()
-#                 if not booking or booking.status == 'confirmed':
-#                     continue
-
-#                 booking.status = 'cancelled'
-#                 booking.updated_at = datetime.utcnow()
-
-#                 available_game = db.session.query(AvailableGame).filter_by(id=booking.game_id).first()
-#                 if available_game:
-#                     vendor_id = available_game.vendor_id
-#                     db.session.execute(text(f"""
-#                         UPDATE VENDOR_{vendor_id}_SLOT
-#                         SET available_slot = available_slot + 1,
-#                             is_available = TRUE
-#                         WHERE slot_id = :slot_id AND date = :book_date
-#                     """), {
-#                         "slot_id": booking.slot_id,
-#                         "book_date": book_date
-#                     })
-#             db.session.commit()
-#         except Exception as cleanup_error:
-#             current_app.logger.error(f"Error during slot unfreezing cleanup: {str(cleanup_error)}")
-
-#         return jsonify({'error': str(e)}), 500
 
 @booking_blueprint.route('/redeem-voucher', methods=['POST'])
 def redeem_voucher():
