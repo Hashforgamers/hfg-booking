@@ -437,19 +437,24 @@ def confirm_booking():
             if payment_id and payment_mode_used == "payment_gateway":
                 BookingService.save_payment_transaction_mapping(booking.id, transaction.id, payment_id)
 
-            # Save extra services
+            # Clear previous extra services for the booking
             BookingExtraService.query.filter_by(booking_id=booking.id).delete()
+
             for extra in extra_services_list:
                 menu_obj = ExtraServiceMenu.query.filter_by(id=extra.get('item_id'), is_active=True).first()
-                category_obj = ExtraServiceCategory.query.filter_by(id=extra.get('category_id'), is_active=True).first()
                 if not menu_obj:
                     continue
+
+                quantity = extra.get('quantity', 1)
+                unit_price = menu_obj.price
+                total_price = unit_price * quantity
+
                 booking_extra = BookingExtraService(
                     booking_id=booking.id,
-                    category_id=category_obj.id,
-                    menu_id=menu_obj.id,
-                    quantity=extra.get('quantity', 1),
-                    price=menu_obj.price
+                    menu_item_id=menu_obj.id,
+                    quantity=quantity,
+                    unit_price=unit_price,
+                    total_price=total_price
                 )
                 db.session.add(booking_extra)
 
