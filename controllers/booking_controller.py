@@ -1,4 +1,4 @@
-from flask import Blueprint, request, jsonify, current_app
+from flask import Blueprint, request, jsonify, current_app, g
 from services.booking_service import BookingService
 from db.extensions import db
 from models.slot import Slot
