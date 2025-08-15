@@ -17,3 +17,6 @@ redis-cli
 pytz
 requests
 razorpay
+firebase-admin
+pyjwt
+cryptography

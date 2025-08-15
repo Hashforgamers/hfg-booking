@@ -40,7 +40,7 @@ import requests
 import hmac
 import hashlib
 import razorpay
-
+from services.security import auth_required_self
 
 from utils.common import generate_fid, generate_access_code, get_razorpay_keys
 
