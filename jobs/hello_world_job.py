@@ -1,12 +1,12 @@
-
 """
 Hello World Job Script for Render One-Off Job
-This is the actual job that Render will execute.
+Runs in a loop every 30 seconds for 30 days.
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import sys
+import time
 
 # Configure logging
 logging.basicConfig(
@@ -14,12 +14,11 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-def main():
+def run_job():
     """
-    Main function that executes the Hello World job
+    Executes one iteration of the Hello World job
     """
     try:
-        # Print Hello World message
         print("=" * 50)
         print("🎮 HFG BOOKING SERVICE - HELLO WORLD JOB")
         print("=" * 50)
@@ -49,7 +48,24 @@ def main():
         logging.error(error_msg)
         return False
 
+
+def main():
+    # Define duration
+    duration_days = 30
+    end_time = datetime.now() + timedelta(days=duration_days)
+    
+    logging.info(f"Starting loop for {duration_days} days.")
+    
+    while datetime.now() < end_time:
+        success = run_job()
+        if not success:
+            logging.error("Job iteration failed. Continuing to next iteration...")
+        
+        # Sleep 30 seconds before next run
+        time.sleep(30)
+    
+    logging.info("Loop finished after 30 days.")
+
+
 if __name__ == "__main__":
-    success = main()
-    # Exit with appropriate code
-    sys.exit(0 if success else 1)
+    main()
