@@ -14,4 +14,4 @@ class BookingExtraService(db.Model):
     total_price = Column(Float, nullable=False)
 
     booking = relationship('Booking', back_populates='booking_extra_services')
-    menu_item = relationship('ExtraServiceMenu')
+    extra_service_menu = relationship('ExtraServiceMenu', back_populates='booking_extra_services')
