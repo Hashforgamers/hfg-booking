@@ -2,12 +2,13 @@ import logging
 import time
 from datetime import datetime, timedelta
 from sqlalchemy import and_
-from db.extensions import db
-from models.transaction import Transaction
-from models.booking import Booking
-from models.availableGame import AvailableGame
-from models.slot import Slot
-from models.vendor import Vendor
+
+from app.db.extensions import db
+from app.models.transaction import Transaction
+from app.models.booking import Booking
+from app.models.availableGame import AvailableGame
+from app.models.slot import Slot
+from app.models.vendor import Vendor
 
 # Logging setup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
