@@ -2,7 +2,6 @@ import logging
 import time
 from datetime import datetime, timedelta
 from sqlalchemy import and_
-from app import create_app
 from db.extensions import db
 from models.transaction import Transaction
 from models.booking import Booking
@@ -75,20 +74,19 @@ def release_unverified_slots():
 
 def main_loop():
     """Run every 30 seconds for 30 days."""
-    app, _ = create_app()
+    duration_days = 30
+    end_time = datetime.utcnow() + timedelta(days=duration_days)
 
-    with app.app_context():
-        duration_days = 30
-        end_time = datetime.utcnow() + timedelta(days=duration_days)
+    logging.info(f"🚀 Starting slot release job loop for {duration_days} days...")
 
-        logging.info(f"🚀 Starting slot release job loop for {duration_days} days...")
+    while datetime.utcnow() < end_time:
+        success = release_unverified_slots()
+        if not success:
+            logging.error("Job iteration failed. Continuing to next iteration...")
 
-        while datetime.utcnow() < end_time:
-            release_unverified_slots()
-            time.sleep(30)
+        time.sleep(30)
 
-        logging.info(f"🏁 Slot release job finished after {duration_days} days.")
-
+    logging.info(f"🏁 Slot release job finished after {duration_days} days.")
 
 if __name__ == "__main__":
     main_loop()
