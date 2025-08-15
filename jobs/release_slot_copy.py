@@ -10,7 +10,7 @@ import requests
 # Config via env
 # -----------------------------------------------------------------------------
 API_BASE = os.getenv("SERVICE_BASE_URL", "https://hfg-booking.onrender.com/api")
-RELEASE_ENDPOINT = f"{API_BASE}/release_slot"
+RELEASE_ENDPOINT = f"{API_BASE}/release_slot_job"
 
 AUTH_HEADER = os.getenv("RELEASE_JOB_AUTH")  # e.g., "Bearer <token>" or "Key abc123"
 INTERVAL_SEC = int(os.getenv("RELEASE_TRIGGER_INTERVAL_SEC", "30"))  # seconds between calls
