@@ -6,6 +6,7 @@ from models.booking import Booking
 from models.booking import Booking
 import logging
 import random
+import os
 from datetime import datetime, timedelta
 from rq import Queue
 from rq_scheduler import Scheduler
@@ -123,13 +124,13 @@ def capture_payment():
         current_app.logger.error(f"Razorpay error during capture: {str(e)}")
         return jsonify({"message": "Error capturing payment", "error": str(e)}), 500
 
-
 @booking_blueprint.route('/bookings', methods=['POST'])
+@auth_required_self(decrypt_user=True) 
 def create_booking():
+    user_id = g.auth_user_id 
     current_app.logger.info(f"Current App in Blueprint {current_app}")
     data = request.json
     slot_ids = data.get("slot_id")  # Now expects a list
-    user_id = data.get("user_id")
     game_id = data.get("game_id")
     book_date = data.get("book_date")
 
@@ -562,7 +563,9 @@ def redeem_voucher():
     }), 200
 
 @booking_blueprint.route('/users/<int:user_id>/bookings', methods=['GET'])
-def get_user_bookings(user_id):
+@auth_required_self(decrypt_user=True) 
+def get_user_bookings():
+    user_id = g.auth_user_id 
     bookings = BookingService.get_user_bookings(user_id)
     return jsonify([booking.to_dict() for booking in bookings])
 
@@ -1436,3 +1439,44 @@ def get_console_status(vendor_id, console_id):
     except Exception as e:
         current_app.logger.error(f"Error retrieving console status: {str(e)}")
         return jsonify({"error": "Internal Server Error"}), 500
+    
+@booking_blueprint.route('/jobs/render/create', methods=['POST'])
+def create_render_one_off_job():
+    """
+    Create a one-off job in Render dashboard
+    """
+    try:
+        api_key = os.getenv('RENDER_API_KEY' , 'rnd_bJpw79wtDkiZSy2DqD2AybGPjj5T')
+        service_id = os.getenv('SERVICE_ID', 'srv-culflkl6l47c73dntal0')
+        
+        url = f"https://api.render.com/v1/services/{service_id}/jobs"
+        headers = {
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': 'application/json'
+        }
+        
+        data = {
+        'startCommand': "python /app/jobs/hello_world_job.py"
+    }
+        
+        response = requests.post(url, headers=headers, json=data)
+        
+        if response.status_code == 201:
+            job_data = response.json()
+            return jsonify({
+                "message": "One-off job created successfully",
+                "job_id": job_data.get('id'),
+                "service_id": job_data.get('serviceId'),
+                "start_command": job_data.get('startCommand')
+            }), 201
+        else:
+            return jsonify({
+                "error": "Failed to create one-off job",
+                "details": response.text
+            }), response.status_code
+            
+    except Exception as e:
+        return jsonify({
+            "error": "Failed to create one-off job",
+            "details": str(e)
+        }), 500

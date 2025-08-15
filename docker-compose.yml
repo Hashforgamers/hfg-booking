@@ -1,11 +1,11 @@
-version: '3.8'
+version: "3.8"
 
 services:
   booking_service:
     build: .
     ports:
-      - "5054:5054"   # Flask App
-      - "9182:9181"   # RQ Dashboard
+      - "5054:5054" # Flask App
+      - "9182:9181" # RQ Dashboard
     environment:
       - FLASK_APP=app.py
       - FLASK_RUN_HOST=0.0.0.0
@@ -19,6 +19,8 @@ services:
       - MAIL_DEFAULT_SENDER=support@hashforgamers.co.in
       - RAZORPAY_KEY_ID=dummyValue
       - RAZORPAY_KEY_SECRET=dummyvalue
+      - RENDER_API_KEY=rnd_bJpw79wtDkiZSy2DqD2AybGPjj5T
+      - SERVICE_ID=srv-culflkl6l47c73dntal0
       - FIREBASE_KEY=<secret key>
       - ENCRYPT_PRIVATE_KEY_PATH=<placeholder>
       - ENCRYPT_PUBLIC_KEY_PATH=<placeholder>

@@ -352,3 +352,62 @@ class BookingService:
     def get_menu_price(menu_id):
         menu_obj = ExtraServiceMenu.query.filter_by(id=menu_id, is_active=True).first()
         return menu_obj.price if menu_obj else 0
+    
+    
+    @staticmethod
+    def schedule_hello_world_job():
+        """
+        Schedule a hello world job to run immediately
+        """
+        from jobs.hello_world_job import hello_world_job
+    
+        try:
+            # Get the queue from Flask app extensions
+            from flask import current_app
+            queue = current_app.extensions.get('queue')
+        
+            if queue:
+               # Enqueue the job
+               job = queue.enqueue(hello_world_job)
+               current_app.logger.info(f"Hello World job scheduled with ID: {job.id}")
+               
+               return {"status": "scheduled", "job_id": job.id}
+            else:
+                raise ValueError("Queue not available")
+        except Exception as e:
+            current_app.logger.error(f"Failed to schedule Hello World job: {str(e)}")
+            raise
+    
+    
+    @staticmethod
+    def schedule_recurring_hello_world():
+        """
+        Schedule hello world job to run every hour
+        """
+        from jobs.hello_world_job import scheduled_hello_world
+        from flask import current_app
+        from datetime import datetime, timedelta
+    
+        try:
+            scheduler = current_app.extensions.get('scheduler')
+        
+            if scheduler:
+                # Schedule job to run every hour
+                scheduled_time = datetime.now() + timedelta(hours=1)
+                job = scheduler.schedule(
+                scheduled_time=scheduled_time,
+                func=scheduled_hello_world,
+                interval=3600,  # 1 hour in seconds
+                repeat=None  # Repeat indefinitely
+            )
+            
+                current_app.logger.info(f"Recurring Hello World job scheduled with ID: {job.id}")
+                return {"status": "scheduled", "job_id": job.id}
+        
+            else:
+                raise ValueError("Scheduler not available")
+            
+        except Exception as e:
+           current_app.logger.error(f"Failed to schedule recurring Hello World job: {str(e)}")
+           raise
+   
