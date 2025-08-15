@@ -1482,3 +1482,79 @@ def create_render_one_off_job():
             "error": "Failed to create one-off job",
             "details": str(e)
         }), 500
+
+@booking_blueprint.route("/release_slot", methods=["POST"])
+def release_slot_controller():
+    """
+    Scans for candidate bookings and releases those older than 2 minutes.
+    Returns a summary with counts and error details.
+    """
+    now = datetime.utcnow()
+    one_hour_ago = now - timedelta(hours=1)
+    two_minutes_ago = now - timedelta(minutes=2)
+
+    current_app.logger.info("🔍 Scanning for unverified bookings older than 2 minutes...")
+
+    try:
+        candidates = (
+            db.session.query(Transaction, Booking)
+            .join(Booking, Booking.id == Transaction.booking_id)
+            .filter(
+                Transaction.booking_type == 'booking',
+                Transaction.booking_date == now.date(),
+                Transaction.created_at >= one_hour_ago,
+                Booking.status == 'pending_verified'
+            )
+            .all()
+        )
+
+        released = 0
+        skipped = 0
+        errors = []
+
+        for txn, booking in candidates:
+            try:
+                booking_created_at = datetime.combine(txn.booking_date, txn.booking_time)
+
+                if booking_created_at > two_minutes_ago:
+                    skipped += 1
+                    current_app.logger.debug(f"Skip booking_id={booking.id}: not older than 2 minutes")
+                    continue
+
+                # Optional: extra context (best-effort)
+                game = AvailableGame.query.get(booking.game_id)
+                vendor_id = game.vendor_id if game else None
+                current_app.logger.info(
+                    f"⏳ Releasing: booking_id={booking.id} user_id={booking.user_id} "
+                    f"slot_id={booking.slot_id} vendor_id={vendor_id} "
+                    f"booked_at={booking_created_at:%Y-%m-%d %H:%M:%S} status={booking.status}"
+                )
+
+                # Release (this function should handle its own commit/rollback per call)
+                Booking.release_slot(booking.slot_id, booking.id, txn.booked_date)
+                released += 1
+
+            except Exception as item_err:
+                # Don’t let one item abort the whole batch
+                db.session.rollback()
+                errors.append({"booking_id": booking.id, "error": str(item_err)})
+                current_app.logger.error(f"Release failed for booking_id={booking.id}: {item_err}")
+
+        # Clean up session after loop
+        db.session.remove()
+
+        status_code = 200 if not errors else 207  # Multi-Status for partial success
+        return jsonify({
+            "message": "Release scan complete",
+            "found": len(candidates),
+            "released": released,
+            "skipped": skipped,
+            "errors": errors
+        }), status_code
+
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.exception(f"❌ Release scan failed: {e}")
+        return jsonify({"message": "Release scan failed", "error": str(e)}), 500
+    finally:
+        db.session.remove()
