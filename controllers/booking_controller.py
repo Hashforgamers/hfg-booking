@@ -41,7 +41,7 @@ import requests
 import hmac
 import hashlib
 import razorpay
-
+from services.security import auth_required_self
 
 from utils.common import generate_fid, generate_access_code, get_razorpay_keys
 
@@ -320,7 +320,7 @@ def confirm_booking():
         RAZORPAY_KEY_ID = current_app.config.get("RAZORPAY_KEY_ID")
         RAZORPAY_KEY_SECRET = current_app.config.get("RAZORPAY_KEY_SECRET")
         razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
-        razorpay_payment_verified = False
+        razorpay_payment_verified = True
 
         # Verify Razorpay payment if using gateway
         if payment_mode == "payment_gateway":
@@ -452,15 +452,17 @@ def confirm_booking():
                 menu_obj = ExtraServiceMenu.query.filter_by(id=extra.get('item_id'), is_active=True).first()
                 if not menu_obj:
                     continue
-                quantity    = extra.get('quantity', 1)
-                unit_price  = menu_obj.price
+
+                quantity = extra.get('quantity', 1)
+                unit_price = menu_obj.price
                 total_price = unit_price * quantity
+
                 booking_extra = BookingExtraService(
-                    booking_id   = booking.id,
-                    category_id  = extra.get('category_id'),
-                    menu_id      = menu_obj.id,
-                    quantity     = quantity,
-                    price        = unit_price
+                    booking_id=booking.id,
+                    menu_item_id=menu_obj.id,
+                    quantity=quantity,
+                    unit_price=unit_price,
+                    total_price=total_price
                 )
                 db.session.add(booking_extra)
 
