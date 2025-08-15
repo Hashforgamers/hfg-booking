@@ -1,4 +1,4 @@
-from flask import Blueprint, request, jsonify, current_app
+from flask import Blueprint, request, jsonify, current_app, g
 from services.booking_service import BookingService
 from db.extensions import db
 from models.slot import Slot
@@ -124,13 +124,13 @@ def capture_payment():
         current_app.logger.error(f"Razorpay error during capture: {str(e)}")
         return jsonify({"message": "Error capturing payment", "error": str(e)}), 500
 
-
 @booking_blueprint.route('/bookings', methods=['POST'])
+@auth_required_self(decrypt_user=True) 
 def create_booking():
+    user_id = g.auth_user_id 
     current_app.logger.info(f"Current App in Blueprint {current_app}")
     data = request.json
     slot_ids = data.get("slot_id")  # Now expects a list
-    user_id = data.get("user_id")
     game_id = data.get("game_id")
     book_date = data.get("book_date")
 
@@ -526,9 +526,10 @@ def confirm_booking():
         return jsonify({'error': str(e)}), 500
 
 @booking_blueprint.route('/redeem-voucher', methods=['POST'])
+@auth_required_self(decrypt_user=True) 
 def redeem_voucher():
+    user_id = g.auth_user_id 
     data = request.json
-    user_id = data.get('user_id')
     discount = data.get('discount_percentage')  # expected: 10, 20, 30
 
     if discount not in [10, 20, 30]:
@@ -563,7 +564,9 @@ def redeem_voucher():
     }), 200
 
 @booking_blueprint.route('/users/<int:user_id>/bookings', methods=['GET'])
-def get_user_bookings(user_id):
+@auth_required_self(decrypt_user=True) 
+def get_user_bookings():
+    user_id = g.auth_user_id 
     bookings = BookingService.get_user_bookings(user_id)
     return jsonify([booking.to_dict() for booking in bookings])
 
@@ -1454,7 +1457,7 @@ def create_render_one_off_job():
         }
         
         data = {
-        'startCommand': "python /app/jobs/hello_world_job.py"
+        'startCommand': "python /app/jobs/release_slot.py"
     }
         
         response = requests.post(url, headers=headers, json=data)
