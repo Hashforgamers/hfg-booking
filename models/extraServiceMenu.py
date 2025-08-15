@@ -13,3 +13,6 @@ class ExtraServiceMenu(db.Model):
     is_active = Column(Boolean, default=True)
 
     category = relationship('ExtraServiceCategory', back_populates='menus')
+    booking_extra_services = relationship('BookingExtraService', back_populates='extra_service_menu')
+    images = relationship('ExtraServiceMenuImage', back_populates='menu_item')
+
