@@ -40,6 +40,23 @@ class Booking(db.Model):
             'status': self.status,
             'slot': self.slot.to_dict_for_booking() if self.slot else None,
             'access_code': self.access_code_entry.access_code if self.access_code_entry else None,
-            'book_date': self.transaction.booked_date.isoformat() if self.transaction else None
+            'book_date': self.transaction.booked_date.isoformat() if self.transaction else None,
+            'extra_services': [
+            {
+                'id': bes.extra_service_menu.id,
+                'name': bes.extra_service_menu.name,
+                'price': bes.extra_service_menu.price,
+                'quantity': bes.quantity,
+                'total_price': bes.total_price,
+                'images': [
+                    {
+                        'id': img.id,
+                        'image_url': img.image_url,
+                        'public_id': img.public_id,
+                        'alt_text': img.alt_text,
+                        'is_primary': img.is_primary
+                    } for img in bes.extra_service_menu.images if img.is_active
+                ]
+            } for bes in self.booking_extra_services]
         }
 

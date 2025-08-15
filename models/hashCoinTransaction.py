@@ -1,3 +1,5 @@
+from sqlalchemy import Column, Integer, ForeignKey, String , DateTime
+from db.extensions import db
 # models/hash_coin_transaction.py
 class HashCoinTransaction(db.Model):
     __tablename__ = 'hash_coin_transactions'
