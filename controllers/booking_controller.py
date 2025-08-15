@@ -124,13 +124,13 @@ def capture_payment():
         current_app.logger.error(f"Razorpay error during capture: {str(e)}")
         return jsonify({"message": "Error capturing payment", "error": str(e)}), 500
 
-
 @booking_blueprint.route('/bookings', methods=['POST'])
+@auth_required_self(decrypt_user=True) 
 def create_booking():
+    user_id = g.auth_user_id 
     current_app.logger.info(f"Current App in Blueprint {current_app}")
     data = request.json
     slot_ids = data.get("slot_id")  # Now expects a list
-    user_id = data.get("user_id")
     game_id = data.get("game_id")
     book_date = data.get("book_date")
 
@@ -563,7 +563,9 @@ def redeem_voucher():
     }), 200
 
 @booking_blueprint.route('/users/<int:user_id>/bookings', methods=['GET'])
-def get_user_bookings(user_id):
+@auth_required_self(decrypt_user=True) 
+def get_user_bookings():
+    user_id = g.auth_user_id 
     bookings = BookingService.get_user_bookings(user_id)
     return jsonify([booking.to_dict() for booking in bookings])
 
