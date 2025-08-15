@@ -19,6 +19,9 @@ services:
       - MAIL_DEFAULT_SENDER=support@hashforgamers.co.in
       - RAZORPAY_KEY_ID=dummyValue
       - RAZORPAY_KEY_SECRET=dummyvalue
+      - FIREBASE_KEY=<secret key>
+      - ENCRYPT_PRIVATE_KEY_PATH=<placeholder>
+      - ENCRYPT_PUBLIC_KEY_PATH=<placeholder>
     volumes:
       - .:/app
     command: >

@@ -1,6 +1,6 @@
 # app/config.py
-
 import os
+from services.config_load import load_key_from_file
 
 class Config:
     SECRET_KEY = os.getenv('SECRET_KEY', 'dev')
@@ -19,3 +19,8 @@ class Config:
     # Environment variables or config
     RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "your_key_id")
     RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "your_key_secret")
+
+    # Read paths from environment variables
+    ENCRYPT_PRIVATE_KEY = load_key_from_file(os.getenv("ENCRYPT_PRIVATE_KEY_PATH"))
+    ENCRYPT_PUBLIC_KEY = load_key_from_file(os.getenv("ENCRYPT_PUBLIC_KEY_PATH"))
+    JWT_SECRET_KEY= 'dev'
