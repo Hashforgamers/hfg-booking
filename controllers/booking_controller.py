@@ -564,7 +564,7 @@ def redeem_voucher():
         "hash_coins_remaining": user_hash_coin.hash_coins
     }), 200
 
-@booking_blueprint.route('/users/<int:user_id>/bookings', methods=['GET'])
+@booking_blueprint.route('/users/bookings', methods=['GET'])
 @auth_required_self(decrypt_user=True) 
 def get_user_bookings():
     user_id = g.auth_user_id 
