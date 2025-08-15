@@ -526,9 +526,10 @@ def confirm_booking():
         return jsonify({'error': str(e)}), 500
 
 @booking_blueprint.route('/redeem-voucher', methods=['POST'])
+@auth_required_self(decrypt_user=True) 
 def redeem_voucher():
+    user_id = g.auth_user_id 
     data = request.json
-    user_id = data.get('user_id')
     discount = data.get('discount_percentage')  # expected: 10, 20, 30
 
     if discount not in [10, 20, 30]:
