@@ -1483,7 +1483,7 @@ def create_render_one_off_job():
             "details": str(e)
         }), 500
 
-@booking_blueprint.route("/release_slot", methods=["POST"])
+@booking_blueprint.route("/release_slot_job", methods=["POST"])
 def release_slot_controller():
     """
     Scans for candidate bookings and releases those older than 2 minutes.
