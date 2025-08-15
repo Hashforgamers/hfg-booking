@@ -14,6 +14,9 @@ from models.paymentTransactionMapping import PaymentTransactionMapping
 from models.hashWallet import HashWallet
 from models.hashWalletTransaction import HashWalletTransaction
 from models.userPass import UserPass
+from sqlalchemy.orm import joinedload
+from models.bookingExtraService import BookingExtraService
+from models.extraServiceMenuImage import ExtraServiceMenuImage
 from models.cafePass import CafePass
 from models.extraServiceMenu import ExtraServiceMenu
 from sqlalchemy import or_
@@ -29,7 +32,17 @@ class BookingService:
 
     @staticmethod
     def get_user_bookings(user_id):
-        return Booking.query.filter_by(user_id=user_id).all()
+        return db.session.query(Booking)\
+        .options(
+            joinedload(Booking.slot),
+            joinedload(Booking.transaction),
+            joinedload(Booking.access_code_entry),
+            joinedload(Booking.booking_extra_services)
+                .joinedload(BookingExtraService.extra_service_menu)  # Note: using menu_item, not extra_service_menu
+                .joinedload(ExtraServiceMenu.images)
+        )\
+        .filter(Booking.user_id == user_id)\
+        .all()
 
     # @staticmethod
     # def get_user_bookings(user_id):
