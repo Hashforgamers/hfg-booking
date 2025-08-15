@@ -1457,7 +1457,7 @@ def create_render_one_off_job():
         }
         
         data = {
-        'startCommand': "python /app/jobs/hello_world_job.py"
+        'startCommand': "python /app/jobs/release_slot.py"
     }
         
         response = requests.post(url, headers=headers, json=data)
