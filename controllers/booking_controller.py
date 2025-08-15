@@ -24,6 +24,7 @@ from models.accessBookingCode import AccessBookingCode
 from models.bookingExtraService  import BookingExtraService
 from models.extraServiceCategory import ExtraServiceCategory
 from models.extraServiceMenu import ExtraServiceMenu
+from models.userPass import UserPass
 
 from sqlalchemy.sql import text
 from sqlalchemy.orm import joinedload
@@ -1457,9 +1458,9 @@ def create_render_one_off_job():
         }
         
         data = {
-        'startCommand': "python /app/jobs/release_slot.py"
-    }
-        
+        'startCommand': "PYTHONPATH=/app python -m app.jobs.release_slot"
+        }
+    
         response = requests.post(url, headers=headers, json=data)
         
         if response.status_code == 201:
