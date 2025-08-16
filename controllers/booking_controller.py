@@ -1609,7 +1609,7 @@ def release_slot_controller():
                     "🔧 Calling Booking.release_slot(slot_id=%s, booking_id=%s, booked_date=%s)",
                     booking.slot_id, booking.id, booked_date
                 )
-                Booking.release_slot(booking.slot_id, booking.id, booked_date)
+                BookingService.release_slot(booking.slot_id, booking.id, booked_date)
 
                 released += 1
                 current_app.logger.info("✅ Released booking_id=%s", booking.id)
