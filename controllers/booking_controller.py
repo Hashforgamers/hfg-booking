@@ -7,7 +7,6 @@ from models.booking import Booking
 import logging
 import random
 import os
-from datetime import datetime, timedelta
 from rq import Queue
 from rq_scheduler import Scheduler
 from models.transaction import Transaction
@@ -25,6 +24,12 @@ from models.bookingExtraService  import BookingExtraService
 from models.extraServiceCategory import ExtraServiceCategory
 from models.extraServiceMenu import ExtraServiceMenu
 from models.userPass import UserPass
+from datetime import datetime, timedelta, timezone
+import pytz
+from flask import current_app, jsonify
+from sqlalchemy.orm import joinedload
+
+IST = pytz.timezone("Asia/Kolkata")
 
 from sqlalchemy.sql import text
 from sqlalchemy.orm import joinedload
@@ -1483,27 +1488,41 @@ def create_render_one_off_job():
             "details": str(e)
         }), 500
 
+def now_utc():
+    return datetime.now(timezone.utc)
+
+def to_utc(dt):
+    # dt may be timezone-aware (IST) per your model default; convert to UTC
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        # Treat naive as IST, then convert to UTC (defensive)
+        return IST.localize(dt).astimezone(timezone.utc)
+    return dt.astimezone(timezone.utc)
+
 @booking_blueprint.route("/release_slot_job", methods=["POST"])
 def release_slot_controller():
     """
-    Scans for candidate bookings and releases those older than 2 minutes.
-    Returns a summary with counts and error details.
+    Releases bookings stuck in 'pending_verified' that are older than 2 minutes.
+    Uses Booking.created_at (IST-aware) and converts to UTC for comparison.
     """
-    now = datetime.utcnow()
-    one_hour_ago = now - timedelta(hours=1)
-    two_minutes_ago = now - timedelta(minutes=2)
+    now = now_utc()
+    two_minutes_ago_utc = now - timedelta(minutes=2)
 
-    current_app.logger.info("🔍 Scanning for unverified bookings older than 2 minutes...")
+    current_app.logger.info("🔍 Scanning for pending_verified bookings older than 2 minutes (based on Booking.created_at)...")
 
     try:
+        # Optional eager loading to avoid N+1 for logging context
         candidates = (
-            db.session.query(Transaction, Booking)
-            .join(Booking, Booking.id == Transaction.booking_id)
+            db.session.query(Booking)
+            .options(
+                joinedload(Booking.slot),
+                joinedload(Booking.game)
+            )
             .filter(
-                Transaction.booking_type == 'booking',
-                Transaction.booking_date == now.date(),
-                Transaction.created_at >= one_hour_ago,
-                Booking.status == 'pending_verified'
+                Booking.status == 'pending_verified',
+                # Only consider recent window to keep scans lean (adjust as needed)
+                Booking.created_at <= now.astimezone(IST)  # safe guard; created_at is IST-aware per model
             )
             .all()
         )
@@ -1512,30 +1531,47 @@ def release_slot_controller():
         skipped = 0
         errors = []
 
-        for txn, booking in candidates:
+        for booking in candidates:
             try:
-                booking_created_at = datetime.combine(txn.booking_date, txn.booking_time)
+                # created_at is timezone-aware (IST) per model; convert to UTC
+                created_utc = to_utc(booking.created_at)
 
-                if booking_created_at > two_minutes_ago:
+                if created_utc is None:
                     skipped += 1
-                    current_app.logger.debug(f"Skip booking_id={booking.id}: not older than 2 minutes")
+                    current_app.logger.warning(f"Skip booking_id={booking.id}: created_at is None")
                     continue
 
-                # Optional: extra context (best-effort)
-                game = AvailableGame.query.get(booking.game_id)
-                vendor_id = game.vendor_id if game else None
+                if created_utc > two_minutes_ago_utc:
+                    skipped += 1
+                    current_app.logger.debug(
+                        f"Skip booking_id={booking.id}: not older than 2 minutes "
+                        f"(created_at_utc={created_utc.isoformat()}, threshold_utc={two_minutes_ago_utc.isoformat()})"
+                    )
+                    continue
+
+                # Optional: context for logs
+                vendor_id = None
+                if booking.game:
+                    try:
+                        vendor_id = booking.game.vendor_id  # assuming AvailableGame has vendor_id
+                    except Exception:
+                        pass
+
                 current_app.logger.info(
-                    f"⏳ Releasing: booking_id={booking.id} user_id={booking.user_id} "
-                    f"slot_id={booking.slot_id} vendor_id={vendor_id} "
-                    f"booked_at={booking_created_at:%Y-%m-%d %H:%M:%S} status={booking.status}"
+                    "⏳ Releasing: booking_id=%s user_id=%s slot_id=%s vendor_id=%s "
+                    "created_at_utc=%s status=%s",
+                    booking.id, booking.user_id, booking.slot_id, vendor_id,
+                    created_utc.strftime("%Y-%m-%d %H:%M:%S%z"), booking.status
                 )
 
-                # Release (this function should handle its own commit/rollback per call)
-                Booking.release_slot(booking.slot_id, booking.id, txn.booked_date)
+                # Perform release
+                # Adjust signature if your method differs (we pass booked_date only if needed)
+                # If your Booking.release_slot just needs slot_id and booking_id, call accordingly.
+                Booking.release_slot(booking.slot_id, booking.id, getattr(booking, "booked_date", None))
+
                 released += 1
 
             except Exception as item_err:
-                # Don’t let one item abort the whole batch
                 db.session.rollback()
                 errors.append({"booking_id": booking.id, "error": str(item_err)})
                 current_app.logger.error(f"Release failed for booking_id={booking.id}: {item_err}")
@@ -1543,7 +1579,7 @@ def release_slot_controller():
         # Clean up session after loop
         db.session.remove()
 
-        status_code = 200 if not errors else 207  # Multi-Status for partial success
+        status_code = 200 if not errors else 207
         return jsonify({
             "message": "Release scan complete",
             "found": len(candidates),
