@@ -1594,17 +1594,17 @@ def release_slot_controller():
                     )
                     continue
 
-                # Context (best-effort)
+                # Format as YYYY-MM-DD (UTC)
+                date_for_release_str = created_utc.strftime("%Y-%m-%d")
                 vendor_id = getattr(booking.game, "vendor_id", None) if booking.game else None
                 current_app.logger.info(
-                    "⏳ Releasing booking_id=%s user_id=%s slot_id=%s vendor_id=%s created_utc=%s (older than 2min)",
-                    booking.id, booking.user_id, booking.slot_id, vendor_id,
-                    created_utc.strftime("%Y-%m-%d %H:%M:%S%z")
+                    "⏳ Releasing id=%s user_id=%s slot_id=%s vendor_id=%s date_for_release=%s (UTC)",
+                    booking.id, booking.user_id, booking.slot_id, vendor_id, date_for_release_str
                 )
 
                 # Perform release
                 # If your release signature differs, adjust here.
-                booked_date = getattr(booking, "booked_date", None)  # may not exist; log it for clarity
+                booked_date = getattr(booking, "booked_date", date_for_release_str)  # may not exist; log it for clarity
                 current_app.logger.debug(
                     "🔧 Calling Booking.release_slot(slot_id=%s, booking_id=%s, booked_date=%s)",
                     booking.slot_id, booking.id, booked_date
