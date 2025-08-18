@@ -5,6 +5,7 @@ import functools
 from flask import request, jsonify, g, current_app
 import jwt
 
+import time
 
 def encode_user(user_id: str, public_key_pem: str) -> str:
     """
@@ -57,7 +58,7 @@ def auth_required(match_route_user=True, decrypt_user=False):
     """
     - match_route_user: if True, ensure token user_id matches the user_id in the route.
     - decrypt_user: if True, apply decrypt_user_id() to the user_id claim before comparing.
-    Attaches g.token_claims and g.auth_user_id for downstream usage.
+    Attaches g.token_claims, g.auth_user_id, and g.token_expired for downstream usage.
     """
     def decorator(fn):
         @functools.wraps(fn)
@@ -74,17 +75,26 @@ def auth_required(match_route_user=True, decrypt_user=False):
                 secret = current_app.config["JWT_SECRET_KEY"]
                 current_app.logger.debug(f"Using JWT secret: {secret[:6]}... (hidden)")
 
+                # Decode without enforcing expiration
                 claims = jwt.decode(
                     token,
                     secret,
                     algorithms=["HS256"],
-                    options={"require": ["exp", "iat", "uuid"]},
+                    options={
+                        "require": ["exp", "iat", "uuid"],
+                        "verify_exp": False
+                    },
                 )
                 current_app.logger.debug(f"Decoded JWT claims: {claims}")
 
-            except jwt.ExpiredSignatureError:
-                current_app.logger.warning("Token expired")
-                return jsonify({"message": "Token expired"}), 401
+                # Handle expiration manually
+                exp = claims.get("exp")
+                if exp and int(time.time()) > exp:
+                    current_app.logger.warning("Token is expired, but proceeding anyway.")
+                    g.token_expired = True
+                else:
+                    g.token_expired = False
+
             except jwt.InvalidTokenError as e:
                 current_app.logger.warning(f"Invalid token: {e}")
                 return jsonify({"message": "Invalid token"}), 401
@@ -119,7 +129,9 @@ def auth_required(match_route_user=True, decrypt_user=False):
 
             g.token_claims = claims
             g.auth_user_id = token_user_id_int
-            current_app.logger.debug(f"Stored g.token_claims and g.auth_user_id: {g.auth_user_id}")
+            current_app.logger.debug(
+                f"Stored g.token_claims, g.auth_user_id={g.auth_user_id}, token_expired={g.token_expired}"
+            )
 
             if match_route_user:
                 route_user_id = kwargs.get("user_id")
@@ -128,7 +140,9 @@ def auth_required(match_route_user=True, decrypt_user=False):
                     current_app.logger.warning("Route user_id missing")
                     return jsonify({"message": "Route user_id missing"}), 400
                 if int(route_user_id) != token_user_id_int:
-                    current_app.logger.warning(f"User mismatch: route={route_user_id}, token={token_user_id_int}")
+                    current_app.logger.warning(
+                        f"User mismatch: route={route_user_id}, token={token_user_id_int}"
+                    )
                     return jsonify({"message": "Forbidden: user mismatch"}), 403
 
             current_app.logger.debug("Authorization successful, proceeding to view function.")
