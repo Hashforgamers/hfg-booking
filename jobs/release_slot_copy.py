@@ -14,7 +14,6 @@ RELEASE_ENDPOINT = f"{API_BASE}/release_slot_job"
 
 AUTH_HEADER = os.getenv("RELEASE_JOB_AUTH")  # e.g., "Bearer <token>" or "Key abc123"
 INTERVAL_SEC = int(os.getenv("RELEASE_TRIGGER_INTERVAL_SEC", "30"))  # seconds between calls
-RUN_LOOPS = int(os.getenv("RELEASE_TRIGGER_LOOPS", "2880"))  # 2880 loops ≈ 24h @30s; adjust as needed
 TIMEOUT_SEC = int(os.getenv("RELEASE_TRIGGER_TIMEOUT_SEC", "20"))  # HTTP timeout
 
 RETRIES = int(os.getenv("RELEASE_TRIGGER_RETRIES", "3"))
@@ -65,7 +64,6 @@ def trigger_once():
         body_text = (resp.text or "")[:800]
 
         if 200 <= resp.status_code < 300:
-            # Try to parse JSON to surface counts cleanly
             try:
                 body = resp.json()
                 found = body.get("found")
@@ -87,15 +85,16 @@ def trigger_once():
 def main():
     log.info(
         "Starting release-slot trigger job with config: "
-        f"endpoint={RELEASE_ENDPOINT}, interval={INTERVAL_SEC}s, loops={RUN_LOOPS}, "
+        f"endpoint={RELEASE_ENDPOINT}, interval={INTERVAL_SEC}s, "
         f"retries={RETRIES}, backoff={BACKOFF}"
     )
-    for i in range(1, RUN_LOOPS + 1):
-        log.info(f"Loop {i}/{RUN_LOOPS}")
+
+    loop_counter = 0
+    while True:
+        loop_counter += 1
+        log.info(f"Loop {loop_counter} (infinite)")
         trigger_once()
-        if i < RUN_LOOPS:
-            time.sleep(INTERVAL_SEC)
-    log.info("Release-slot trigger job finished.")
+        time.sleep(INTERVAL_SEC)
 
 
 if __name__ == "__main__":
