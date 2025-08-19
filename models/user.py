@@ -19,7 +19,8 @@ class User(db.Model):
     # Relationship to ContactInfo
     contact_info = relationship(
         'ContactInfo',
+        primaryjoin="and_(foreign(ContactInfo.parent_id) == User.id, ContactInfo.parent_type == 'user')",
         back_populates='user',
-        uselist=False,  # One-to-one relationship
+        uselist=False,
         cascade="all, delete-orphan"
     )
