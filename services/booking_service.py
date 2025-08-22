@@ -206,7 +206,7 @@ class BookingService:
         try:
             slot_meta = db.session.execute(
                 text("""
-                    SELECT start_time, end_time, console_id
+                    SELECT start_time, end_time, -1 AS console_id
                     FROM slots
                     WHERE id = :slot_id
                 """),
