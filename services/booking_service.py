@@ -140,8 +140,10 @@ class BookingService:
         cid = getattr(g, "cid", None) or str(uuid.uuid4())
         log = current_app.logger
 
-        log.info("create_booking.start cid=%s slot_id=%s game_id=%s user_id=%s book_date=%s is_pay_at_cafe=%s",
-                 cid, slot_id, game_id, user_id, book_date, is_pay_at_cafe)
+        log.info(
+            "create_booking.start cid=%s slot_id=%s game_id=%s user_id=%s book_date=%s is_pay_at_cafe=%s",
+            cid, slot_id, game_id, user_id, book_date, is_pay_at_cafe
+        )
 
         # STEP 1: Resolve vendor and game meta (BUGFIX: proper unpack)
         try:
@@ -163,11 +165,13 @@ class BookingService:
             log.warning("create_booking.no_vendor_for_slot cid=%s slot_id=%s", cid, slot_id)
             raise ValueError("Vendor not found for this slot.")
 
-        vendor_id, slot_price, game_name = ag_row[0], ag_row, ag_row
-        log.info("create_booking.meta_parsed cid=%s vendor_id=%s slot_price=%s game_name=%s",
-                 cid, vendor_id, slot_price, game_name)
+        vendor_id, slot_price, game_name = ag_row, ag_row, ag_row
+        log.info(
+            "create_booking.meta_parsed cid=%s vendor_id=%s slot_price=%s game_name=%s",
+            cid, vendor_id, slot_price, game_name
+        )
 
-        # STEP 2A: Lock and read vendor availability row (only columns present there)
+        # STEP 2A: Lock and read vendor availability row
         try:
             vendor_slot_row = db.session.execute(
                 text(f"""
@@ -180,29 +184,33 @@ class BookingService:
             ).fetchone()
             log.info("create_booking.vendor_slot_locked cid=%s has_row=%s", cid, bool(vendor_slot_row))
         except Exception as e:
-            log.exception("create_booking.vendor_slot_query_failed cid=%s vendor_id=%s slot_id=%s error=%s",
-                          cid, vendor_id, slot_id, e)
+            log.exception(
+                "create_booking.vendor_slot_query_failed cid=%s vendor_id=%s slot_id=%s error=%s",
+                cid, vendor_id, slot_id, e
+            )
             raise
 
         if not vendor_slot_row:
-            log.warning("create_booking.vendor_slot_missing cid=%s vendor_id=%s slot_id=%s book_date=%s",
-                        cid, vendor_id, slot_id, book_date)
+            log.warning(
+                "create_booking.vendor_slot_missing cid=%s vendor_id=%s slot_id=%s book_date=%s",
+                cid, vendor_id, slot_id, book_date
+            )
             raise ValueError("Slot row not found for this date.")
 
         available_slot, date_value = vendor_slot_row
         log.info("create_booking.vendor_slot_state cid=%s available_slot=%s date=%s",
-                 cid, available_slot, date_value)
+                cid, available_slot, date_value)
 
         if available_slot is None or available_slot <= 0:
             log.warning("create_booking.slot_full cid=%s vendor_id=%s slot_id=%s date=%s",
                         cid, vendor_id, slot_id, date_value)
             raise ValueError("Slot is fully booked for this date.")
 
-        # STEP 2B: Fetch time/console metadata from slots table
+        # STEP 2B: Fetch time metadata; force console_id to -1 (no schema change)
         try:
             slot_meta = db.session.execute(
                 text("""
-                    SELECT start_time, end_time, console_id
+                    SELECT start_time, end_time, -1 AS console_id
                     FROM slots
                     WHERE id = :slot_id
                 """),
@@ -217,9 +225,9 @@ class BookingService:
             log.warning("create_booking.slot_meta_missing cid=%s slot_id=%s", cid, slot_id)
             raise ValueError("Slot metadata missing.")
 
-        start_time, end_time, console_id = slot_meta
+        start_time, end_time, console_id = slot_meta  # console_id is -1 by design
         log.info("create_booking.slot_meta cid=%s start=%s end=%s console_id=%s",
-                 cid, start_time, end_time, console_id)
+                cid, start_time, end_time, console_id)
 
         # STEP 3: Atomic decrement on vendor slot row
         try:
@@ -234,10 +242,10 @@ class BookingService:
                 {"slot_id": slot_id, "book_date": book_date}
             ).fetchone()
             log.info("create_booking.vendor_slot_decrement cid=%s success=%s new_available_slot=%s",
-                     cid, bool(update_res), (update_res[0] if update_res else None))
+                    cid, bool(update_res), (update_res if update_res else None))
         except Exception as e:
             log.exception("create_booking.vendor_slot_decrement_failed cid=%s vendor_id=%s slot_id=%s error=%s",
-                          cid, vendor_id, slot_id, e)
+                        cid, vendor_id, slot_id, e)
             db.session.rollback()
             raise
 
@@ -247,7 +255,7 @@ class BookingService:
                         cid, vendor_id, slot_id, date_value)
             raise ValueError("Concurrent booking conflict. Please retry.")
 
-        # STEP 4: Create booking
+        # STEP 4: Create booking (unchanged)
         try:
             booking = Booking(
                 slot_id=slot_id,
@@ -263,18 +271,18 @@ class BookingService:
         except Exception as e:
             db.session.rollback()
             log.exception("create_booking.booking_persist_failed cid=%s vendor_id=%s slot_id=%s error=%s",
-                          cid, vendor_id, slot_id, e)
+                        cid, vendor_id, slot_id, e)
             raise
 
-        # STEP 5: Resolve username (non-fatal if fails)
+        # STEP 5: Resolve username (non-fatal)
         try:
             user_row = db.session.execute(
                 text("SELECT name FROM users WHERE id = :uid"),
                 {"uid": user_id}
             ).fetchone()
-            username = user_row[0] if user_row else None
+            username = user_row if user_row else None
             log.info("create_booking.user_loaded cid=%s user_id=%s has_username=%s",
-                     cid, user_id, bool(username))
+                    cid, user_id, bool(username))
         except Exception as e:
             username = None
             log.exception("create_booking.user_query_failed cid=%s user_id=%s error=%s", cid, user_id, e)
@@ -288,10 +296,15 @@ class BookingService:
             log.exception("create_booking.db_commit_failed cid=%s bid=%s error=%s", cid, bid, e)
             raise
 
-        # STEP 7: Emit canonical booking event (non-blocking)
+        # STEP 7: Emit booking event (non-blocking)
         try:
             machine_status = "pending_acceptance" if is_pay_at_cafe else "pending_verified"
             log.info("create_booking.emit_prepare cid=%s bid=%s status=%s", cid, bid, machine_status)
+
+            # Hide sentinel -1 from consumers; emit console fields only if assigned later
+            has_console = console_id is not None and console_id != -1
+            console_type = f"Console-{console_id}" if has_console else None
+            console_number = str(console_id) if has_console else None
 
             emit_booking_event(
                 socketio,
@@ -304,8 +317,8 @@ class BookingService:
                     "username": username,
                     "game_id": game_id,
                     "game": game_name,
-                    "consoleType": f"Console-{console_id}" if console_id is not None else None,
-                    "consoleNumber": str(console_id) if console_id is not None else None,
+                    "consoleType": console_type,
+                    "consoleNumber": console_number,
                     "date": date_value,
                     "slot_price": slot_price,
                     "time": [{"start_time": start_time, "end_time": end_time}],
@@ -322,6 +335,7 @@ class BookingService:
 
         log.info("create_booking.success cid=%s bid=%s", cid, bid)
         return booking
+
 
     @staticmethod
     def release_slot(slot_id, booking_id, book_date):
