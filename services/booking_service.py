@@ -118,11 +118,16 @@ class BookingService:
 
             socketio.emit('slot_pending', {'slot_id': slot_id, 'booking': booking.id, 'status': 'pending'})
 
-            # ✅ Emit WebSocket event
-            if BookingService.socketio:
-                BookingService.socketio.emit('booking_updated', {
-                    'booking_id': booking.id, 'status': 'pending_verified'
-                }, room=None)  # 'room=None' sends to all
+            if socketio:
+                socketio.emit(
+                    "booking_updated",
+                    {
+                        "booking_id": booking.id,
+                        "slot_id": slot_id,
+                        "status": "pending_verified"
+                    },
+                    room=f"vendor_{vendor_id}"
+                )
 
             return booking
 
