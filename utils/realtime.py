@@ -215,3 +215,29 @@ def emit_booking_event(
     except Exception as exc:
         logger.exception("emit_booking_event failed: event='%s' error=%s", event, exc)
         return None
+
+def build_booking_event_payload(*, vendor_id, booking_id, slot_id, user_id, username,
+                                game_id, game_name, date_value, slot_price,
+                                start_time, end_time, console_id,
+                                status: str, booking_status: str):
+    # status: 'pending_verified' | 'pending_acceptance' | 'confirmed' | ...
+    # booking_status: 'upcoming' | 'current' | 'past'
+    payload = {
+        "vendor_id": vendor_id,
+        "booking_id": booking_id,
+        "slot_id": slot_id,
+        "user_id": user_id,
+        "username": username,
+        "game_id": game_id,
+        "game": game_name,
+        "consoleType": f"Console-{console_id}" if console_id is not None else None,
+        "consoleNumber": str(console_id) if console_id is not None else None,
+        "date": date_value,                 # YYYY-MM-DD or date object (emitter converts)
+        "slot_price": float(slot_price) if slot_price is not None else None,
+        "time": [{"start_time": start_time, "end_time": end_time}],
+        "processed_time": [{"start_time": start_time, "end_time": end_time}],
+        "status": status,                   # machine status
+        "booking_status": booking_status,   # stage dimension per your UI contract
+    }
+    # Remove Nones to keep payload tight; emitter also filters
+    return {k: v for k, v in payload.items() if v is not None}
