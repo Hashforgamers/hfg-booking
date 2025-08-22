@@ -7,7 +7,6 @@ from models.booking import Booking
 import logging
 import random
 import os
-from datetime import datetime, timedelta
 from rq import Queue
 from rq_scheduler import Scheduler
 from models.transaction import Transaction
@@ -24,6 +23,13 @@ from models.accessBookingCode import AccessBookingCode
 from models.bookingExtraService  import BookingExtraService
 from models.extraServiceCategory import ExtraServiceCategory
 from models.extraServiceMenu import ExtraServiceMenu
+from models.userPass import UserPass
+from datetime import datetime, timedelta, timezone
+import pytz
+from flask import current_app, jsonify
+from sqlalchemy.orm import joinedload
+
+IST = pytz.timezone("Asia/Kolkata")
 
 from sqlalchemy.sql import text
 from sqlalchemy.orm import joinedload
@@ -482,14 +488,6 @@ def confirm_booking():
                 db.session.add(user_hash_coin)
             user_hash_coin.hash_coins += 1000
 
-            # Update slot availability (with SQLAlchemy text())
-            db.session.execute(text(f"""
-                UPDATE VENDOR_{vendor.id}_SLOT
-                SET available_slot = available_slot - 1,
-                    is_available = CASE WHEN available_slot - 1 = 0 THEN FALSE ELSE is_available END
-                WHERE slot_id = :slot_id AND date = :book_date
-            """), {"slot_id": booking.slot_id, "book_date": book_date})
-
             # Vendor analytics
             BookingService.insert_into_vendor_dashboard_table(transaction.id, -1)
             BookingService.insert_into_vendor_promo_table(transaction.id, -1)
@@ -563,7 +561,7 @@ def redeem_voucher():
         "hash_coins_remaining": user_hash_coin.hash_coins
     }), 200
 
-@booking_blueprint.route('/users/<int:user_id>/bookings', methods=['GET'])
+@booking_blueprint.route('/users/bookings', methods=['GET'])
 @auth_required_self(decrypt_user=True) 
 def get_user_bookings():
     user_id = g.auth_user_id 
@@ -1457,9 +1455,9 @@ def create_render_one_off_job():
         }
         
         data = {
-        'startCommand': "python /app/jobs/release_slot.py"
-    }
-        
+        'startCommand': "PYTHONPATH=/app python -m app.jobs.release_slot"
+        }
+    
         response = requests.post(url, headers=headers, json=data)
         
         if response.status_code == 201:
@@ -1481,3 +1479,158 @@ def create_render_one_off_job():
             "error": "Failed to create one-off job",
             "details": str(e)
         }), 500
+
+def now_utc():
+    return datetime.now(timezone.utc)
+
+def to_utc(dt):
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        # Defensive: treat naive as IST, then to UTC
+        return IST.localize(dt).astimezone(timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+@booking_blueprint.route("/release_slot_job", methods=["POST"])
+def release_slot_controller():
+    """
+    Releases bookings stuck in 'pending_verified' that are older than 2 minutes.
+    Uses Booking.created_at (IST-aware) and converts to UTC for comparison.
+    """
+    now = now_utc()
+    two_minutes_ago_utc = now - timedelta(minutes=2)
+    now_ist = now.astimezone(IST)
+    two_minutes_ago_ist = two_minutes_ago_utc.astimezone(IST)
+
+    # Optional: constrain to a recent window to keep scans lean
+    # Set to None to disable.
+    recent_window_hours = 6
+    lower_bound_utc = now - timedelta(hours=recent_window_hours) if recent_window_hours else None
+    lower_bound_ist = lower_bound_utc.astimezone(IST) if lower_bound_utc else None
+
+    current_app.logger.info(
+        "🔍 Start release scan | now_utc=%s | now_ist=%s | threshold_utc=%s | threshold_ist=%s | recent_window_hours=%s | lower_bound_utc=%s | lower_bound_ist=%s",
+        now.isoformat(), now_ist.isoformat(),
+        two_minutes_ago_utc.isoformat(), two_minutes_ago_ist.isoformat(),
+        recent_window_hours, (lower_bound_utc.isoformat() if lower_bound_utc else None),
+        (lower_bound_ist.isoformat() if lower_bound_ist else None),
+    )
+
+    try:
+        # Quick metrics before fetching
+        total_pending = db.session.query(func.count(Booking.id)).filter(Booking.status == 'pending_verified').scalar()
+        current_app.logger.info("📊 Metrics: total_pending_verified=%s", total_pending)
+
+        # Build base query
+        q = (
+            db.session.query(Booking)
+            .options(
+                joinedload(Booking.slot),
+                joinedload(Booking.game)
+            )
+            .filter(Booking.status == 'pending_verified')
+        )
+
+        # Upper bound (safety) — created_at should not be in the future relative to now_ist
+        q = q.filter(Booking.created_at <= now_ist)
+
+        # Lower bound for performance if enabled
+        if lower_bound_ist:
+            q = q.filter(Booking.created_at >= lower_bound_ist)
+
+        # Fetch candidates
+        candidates = q.all()
+
+        # Log candidate summary
+        if candidates:
+            min_created = min(b.created_at for b in candidates if b.created_at is not None)
+            max_created = max(b.created_at for b in candidates if b.created_at is not None)
+            current_app.logger.info(
+                "📦 Candidates fetched: count=%s | created_at_min_ist=%s | created_at_max_ist=%s",
+                len(candidates),
+                (min_created.astimezone(IST).isoformat() if min_created else None),
+                (max_created.astimezone(IST).isoformat() if max_created else None),
+            )
+        else:
+            current_app.logger.info("📦 Candidates fetched: count=0 (no pending_verified within time window)")
+
+        released = 0
+        skipped = 0
+        errors = []
+
+        for booking in candidates:
+            try:
+                created_ist = booking.created_at  # should be tz-aware IST by model default
+                created_utc = to_utc(created_ist)
+
+                current_app.logger.debug(
+                    "🔎 Candidate booking_id=%s user_id=%s status=%s created_ist=%s created_utc=%s",
+                    booking.id, booking.user_id, booking.status,
+                    (created_ist.isoformat() if created_ist else None),
+                    (created_utc.isoformat() if created_utc else None),
+                )
+
+                if created_utc is None:
+                    skipped += 1
+                    current_app.logger.warning(
+                        "⛔ Skip booking_id=%s: created_at is None or invalid", booking.id
+                    )
+                    continue
+
+                # Decision: older than 2 minutes?
+                if created_utc > two_minutes_ago_utc:
+                    skipped += 1
+                    current_app.logger.debug(
+                        "⏭️ Skip booking_id=%s: age too young (created_utc=%s > threshold_utc=%s)",
+                        booking.id, created_utc.isoformat(), two_minutes_ago_utc.isoformat()
+                    )
+                    continue
+
+                # Format as YYYY-MM-DD (UTC)
+                date_for_release_str = created_utc.strftime("%Y-%m-%d")
+                vendor_id = getattr(booking.game, "vendor_id", None) if booking.game else None
+                current_app.logger.info(
+                    "⏳ Releasing id=%s user_id=%s slot_id=%s vendor_id=%s date_for_release=%s (UTC)",
+                    booking.id, booking.user_id, booking.slot_id, vendor_id, date_for_release_str
+                )
+
+                # Perform release
+                # If your release signature differs, adjust here.
+                booked_date = getattr(booking, "booked_date", date_for_release_str)  # may not exist; log it for clarity
+                current_app.logger.debug(
+                    "🔧 Calling Booking.release_slot(slot_id=%s, booking_id=%s, booked_date=%s)",
+                    booking.slot_id, booking.id, booked_date
+                )
+                BookingService.release_slot(booking.slot_id, booking.id, booked_date)
+
+                released += 1
+                current_app.logger.info("✅ Released booking_id=%s", booking.id)
+
+            except Exception as item_err:
+                db.session.rollback()
+                errors.append({"booking_id": booking.id, "error": str(item_err)})
+                current_app.logger.exception("❌ Release failed for booking_id=%s: %s", booking.id, item_err)
+
+        # Clean up session after loop
+        db.session.remove()
+
+        current_app.logger.info(
+            "🧾 Release summary | found=%s | released=%s | skipped=%s | errors=%s",
+            len(candidates), released, skipped, len(errors)
+        )
+
+        status_code = 200 if not errors else 207
+        return jsonify({
+            "message": "Release scan complete",
+            "found": len(candidates),
+            "released": released,
+            "skipped": skipped,
+            "errors": errors
+        }), status_code
+
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.exception("❌ Release scan failed: %s", e)
+        return jsonify({"message": "Release scan failed", "error": str(e)}), 500
+    finally:
+        db.session.remove()
