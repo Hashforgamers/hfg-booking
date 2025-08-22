@@ -49,6 +49,8 @@ import hashlib
 import razorpay
 from services.security import auth_required_self
 
+import uuid
+
 from utils.common import generate_fid, generate_access_code, get_razorpay_keys
 
 booking_blueprint = Blueprint('bookings', __name__)
@@ -133,53 +135,110 @@ def capture_payment():
 @booking_blueprint.route('/bookings', methods=['POST'])
 @auth_required_self(decrypt_user=True) 
 def create_booking():
-    user_id = g.auth_user_id 
-    current_app.logger.info(f"Current App in Blueprint {current_app}")
-    data = request.json
-    slot_ids = data.get("slot_id")  # Now expects a list
+    # Correlation id for this request
+    g.cid = getattr(g, "cid", None) or str(uuid.uuid4())
+    cid = g.cid
+    log = current_app.logger
+
+    try:
+        user_id = g.auth_user_id
+    except Exception:
+        user_id = None
+
+    log.info("bookings.post.start cid=%s user_id=%s", cid, user_id)
+
+    data = request.json or {}
+    slot_ids = data.get("slot_id")  # list expected
     game_id = data.get("game_id")
     book_date = data.get("book_date")
 
+    log.info("bookings.post.payload cid=%s slot_ids_len=%s game_id=%s book_date=%s",
+             cid, (len(slot_ids) if isinstance(slot_ids, list) else None), game_id, book_date)
+
     if not slot_ids or not user_id or not game_id or not book_date:
+        log.warning("bookings.post.validation_failed cid=%s", cid)
         return jsonify({"message": "slot_id, game_id, user_id, and book_date are required"}), 400
 
     try:
-        socketio = current_app.extensions['socketio']
-        scheduler = current_app.extensions['scheduler']
+        socketio = current_app.extensions.get('socketio')
+        scheduler = current_app.extensions.get('scheduler')
+        log.info("bookings.post.extensions cid=%s has_socketio=%s has_scheduler=%s",
+                 cid, bool(socketio), bool(scheduler))
+
         available_game = db.session.query(AvailableGame).filter(AvailableGame.id == game_id).first()
-        booking_mappings = []  # Changed to collect dicts with slot_id and booking_id
+        if not available_game:
+            log.warning("bookings.post.available_game_missing cid=%s game_id=%s", cid, game_id)
+            return jsonify({"message": "Game not found"}), 404
+
+        vendor_id = available_game.vendor_id
+        log.info("bookings.post.vendor_resolved cid=%s vendor_id=%s", cid, vendor_id)
+
+        booking_mappings = []
+        processed = 0
+        skipped = 0
 
         for slot_id in slot_ids:
-            slot_entry = db.session.execute(text(f"""
-                SELECT available_slot, is_available
-                FROM VENDOR_{available_game.vendor_id}_SLOT
-                WHERE slot_id = :slot_id AND date = :book_date
-            """), {"slot_id": slot_id, "book_date": book_date}).fetchone()
+            processed += 1
+            try:
+                log.info("bookings.post.slot_check.start cid=%s slot_id=%s", cid, slot_id)
 
-            if slot_entry is None or slot_entry[0] <= 0 or not slot_entry[1]:
-                continue  # Skip if not available
+                slot_entry = db.session.execute(text(f"""
+                    SELECT available_slot, is_available
+                    FROM VENDOR_{vendor_id}_SLOT
+                    WHERE slot_id = :slot_id AND date = :book_date
+                """), {"slot_id": slot_id, "book_date": book_date}).fetchone()
 
-            booking = BookingService.create_booking(slot_id, game_id, user_id, socketio, book_date)
-            db.session.flush()
+                log.info("bookings.post.slot_check.result cid=%s slot_id=%s has_entry=%s entry=%s",
+                         cid, slot_id, bool(slot_entry), (tuple(slot_entry) if slot_entry else None))
 
-            booking_mappings.append({
-                "slot_id": slot_id,
-                "booking_id": booking.id
-            })
+                if slot_entry is None or slot_entry[0] <= 0 or not slot_entry:
+                    skipped += 1
+                    log.info("bookings.post.slot_skipped cid=%s slot_id=%s reason=%s",
+                             cid, slot_id,
+                             ("no_entry" if slot_entry is None else ("no_slots" if slot_entry <= 0 else "not_available")))
+                    continue
 
-            scheduler.enqueue_in(
-                timedelta(seconds=360),
-                BookingService.release_slot,
-                slot_id,
-                booking.id,
-                book_date
-            )
+                booking = BookingService.create_booking(slot_id, game_id, user_id, socketio, book_date)
+                db.session.flush()
 
-        db.session.commit()
+                log.info("bookings.post.slot_booked cid=%s slot_id=%s booking_id=%s",
+                         cid, slot_id, booking.id)
+
+                booking_mappings.append({
+                    "slot_id": slot_id,
+                    "booking_id": booking.id
+                })
+
+                if scheduler:
+                    scheduler.enqueue_in(
+                        timedelta(seconds=360),
+                        BookingService.release_slot,
+                        slot_id,
+                        booking.id,
+                        book_date
+                    )
+                    log.info("bookings.post.release_scheduled cid=%s slot_id=%s booking_id=%s delay_sec=%s",
+                             cid, slot_id, booking.id, 360)
+
+            except Exception as loop_err:
+                # Do not abort the entire batch; record and continue
+                log.exception("bookings.post.slot_error cid=%s slot_id=%s error=%s", cid, slot_id, loop_err)
+                continue
+
+        try:
+            db.session.commit()
+            log.info("bookings.post.db_committed cid=%s bookings_count=%s skipped=%s processed=%s",
+                     cid, len(booking_mappings), skipped, processed)
+        except Exception as commit_err:
+            db.session.rollback()
+            log.exception("bookings.post.db_commit_failed cid=%s error=%s", cid, commit_err)
+            return jsonify({"message": "Failed to freeze slot(s)", "error": "commit_failed"}), 500
 
         if not booking_mappings:
+            log.info("bookings.post.none_booked cid=%s", cid)
             return jsonify({"message": "No slots available for booking"}), 400
 
+        log.info("bookings.post.success cid=%s bookings=%s", cid, booking_mappings)
         return jsonify({
             "message": "Slots frozen",
             "bookings": booking_mappings
@@ -187,6 +246,7 @@ def create_booking():
 
     except Exception as e:
         db.session.rollback()
+        log.exception("bookings.post.failed cid=%s error=%s", cid, e)
         return jsonify({"message": "Failed to freeze slot(s)", "error": str(e)}), 500
 
 @booking_blueprint.route('/release_slot', methods=['POST'])
