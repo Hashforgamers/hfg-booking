@@ -552,6 +552,70 @@ def confirm_booking():
             BookingService.insert_into_vendor_dashboard_table(transaction.id, -1)
             BookingService.insert_into_vendor_promo_table(transaction.id, -1)
 
+            # -- After booking.status = 'confirmed' and transaction creation --
+            # Gather fields for event payload
+            # vendor_id already available via vendor.id
+            vendor_id = vendor.id
+            booking_id_val = booking.id
+            slot_id_val = booking.slot_id
+            user_id_val = user.id
+            username_val = user.name
+            game_id_val = booking.game_id
+            game_name_val = available_game.game_name         # from AvailableGame
+            date_value = book_date                           # already a date
+            slot_price_val = available_game.single_slot_price
+
+            # Pull slot metadata (you already have slot_obj)
+            start_time_val = slot_obj.start_time
+            end_time_val = slot_obj.end_time
+            console_id_val = getattr(slot_obj, "console_id", None)
+
+            # Decide booking_status for confirmed
+            # If your UI marks confirmed bookings still as 'upcoming' until start time, keep 'upcoming'.
+            # If you prefer to mark as 'current' at confirmation, change accordingly.
+            booking_status_dim = "upcoming"
+
+            # Build the exact same message shape used in create flow
+            event_payload = build_booking_event_payload(
+                vendor_id=vendor_id,
+                booking_id=booking_id_val,
+                slot_id=slot_id_val,
+                user_id=user_id_val,
+                username=username_val,
+                game_id=game_id_val,
+                game_name=game_name_val,
+                date_value=date_value,
+                slot_price=slot_price_val,
+                start_time=start_time_val,
+                end_time=end_time_val,
+                console_id=console_id_val,
+                status="confirmed",
+                booking_status=booking_status_dim
+            )
+
+            # Emit after DB state is consistent; you can emit pre-commit if you prefer,
+            # but post-commit avoids clients seeing uncommitted state.
+            try:
+                socketio = current_app.extensions.get('socketio')
+                # Same event name "booking", same payload keys
+                emit_booking_event(
+                    socketio,
+                    event="booking",
+                    data=event_payload,
+                    vendor_id=vendor_id
+                    # namespace=... if your clients use a custom namespace
+                )
+                current_app.logger.info(
+                    "confirm_booking.emit_done booking_id=%s vendor_id=%s room=%s",
+                    booking_id_val, vendor_id, f"vendor_{vendor_id}"
+                )
+            except Exception as e:
+                current_app.logger.exception(
+                    "confirm_booking.emit_failed booking_id=%s vendor_id=%s error=%s",
+                    booking_id_val, vendor_id, e
+                )
+
+
             # Send booking confirmation email
             booking_mail(
                 gamer_name      = user.name,
