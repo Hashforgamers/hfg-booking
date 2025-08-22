@@ -1,34 +1,37 @@
 # socketio_events.py
 
-from flask_socketio import SocketIO
-import json
+from flask import current_app
+from flask_socketio import SocketIO, join_room
 
-global socketio  
+socketio: SocketIO | None = None  # Global socket instance
+
 
 def register_socketio_events(socket: SocketIO):
     """
     Register WebSocket events with the given SocketIO instance.
-    This will allow all controllers to access these events.
+    Provides vendor-specific rooms for booking updates.
     """
-    # Declare the socketio as a global variable
-    socketio = socket  # Set the global socketio variable
+    global socketio
+    socketio = socket
 
-    @socketio.on('connect')
+    @socketio.on("connect")
     def handle_connect():
-        print("Client connected")
-        socketio.emit('message', {"data": "Connected to WebSocket server"})
+        current_app.logger.info("Client connected to WebSocket")
 
-    @socketio.on('slot_booked')
-    def handle_slot_booked(data):
-        try:
-            # Parse the JSON string into a dictionary
-            data = json.loads(data)
-            print(f"Slot {data['slot_id']} has been booked. Status: {data['status']}")
-            socketio.emit('slot_booked', {'slot_id': data['slot_id'], 'status': 'booked'})
-        except json.JSONDecodeError:
-            print(f"Failed to decode JSON: {data}")
-            
-    @socketio.on('booking_updated')
-    def handle_booking_updated(data):
-        print(f"Booking {data['booking_id']} updated. Status: {data['status']}")
-        socketio.emit('booking_updated', data)
+    @socketio.on("disconnect")
+    def handle_disconnect():
+        current_app.logger.info("Client disconnected from WebSocket")
+
+    @socketio.on("connect_vendor")
+    def handle_vendor_connect(data):
+        """
+        Vendor joins their own room based on vendor_id.
+        Example client emit:
+            socket.emit("connect_vendor", { vendor_id: 123 });
+        """
+        vendor_id = data.get("vendor_id")
+        if vendor_id:
+            join_room(f"vendor_{vendor_id}")
+            current_app.logger.info(f"Vendor {vendor_id} joined their room")
+        else:
+            current_app.logger.warning("connect_vendor called without vendor_id")
