@@ -1,6 +1,7 @@
 # utils/realtime.py
 from __future__ import annotations
 from datetime import datetime, date, time
+from decimal import Decimal
 from typing import Any, Dict, Optional, List, Union
 import logging
 import uuid
@@ -21,11 +22,9 @@ CANONICAL_KEYS = {
     "time", "processed_time",
 }
 
-# Optional: allow consumer to pass a formatter, else fallback to 12h
 def _fmt_time(t: TimeLike, fmt: str = "%I:%M %p") -> str:
     if isinstance(t, (datetime, time)):
         return t.strftime(fmt)
-    # If already a serialized string, trust producer (ensure it's safe upstream)
     return str(t)
 
 def _normalize_block(block: Optional[BlockLike], fmt: str = "%I:%M %p") -> Optional[str]:
@@ -59,8 +58,65 @@ def _as_date_str(d: Union[date, datetime, str, None]) -> Optional[str]:
 def _derive_status_label(machine_status: str) -> str:
     return "Pending" if machine_status in ("pending_verified", "pending_acceptance") else "Confirmed"
 
+def _as_mapping(obj: Any) -> Optional[Dict[str, Any]]:
+    # SQLAlchemy Row/RowMapping compatibility
+    try:
+        # Row has _mapping attr that is a read-only mapping
+        mp = getattr(obj, "_mapping", None)
+        if mp is not None:
+            return dict(mp)
+    except Exception:
+        pass
+    # RowProxy/legacy rows behave like sequences with keys(); try dict() directly
+    try:
+        if hasattr(obj, "keys"):
+            return dict(obj)
+    except Exception:
+        pass
+    return None
+
+def _to_jsonable(obj: Any) -> Any:
+    # Fast path for primitives
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+
+    # Datetime/date/time
+    if isinstance(obj, datetime):
+        return obj.isoformat() + ("Z" if obj.tzinfo is None else "")
+    if isinstance(obj, date):
+        return obj.isoformat()
+    if isinstance(obj, time):
+        return obj.strftime("%H:%M:%S")
+
+    # Decimal
+    if isinstance(obj, Decimal):
+        # Choose float; if precision matters, use str(obj)
+        return float(obj)
+
+    # SQLAlchemy Row/RowMapping or similar mappings
+    mp = _as_mapping(obj)
+    if mp is not None:
+        return {k: _to_jsonable(v) for k, v in mp.items()}
+
+    # dict
+    if isinstance(obj, dict):
+        return {str(k): _to_jsonable(v) for k, v in obj.items()}
+
+    # list/tuple/set
+    if isinstance(obj, (list, tuple, set)):
+        return [_to_jsonable(v) for v in obj]
+
+    # Objects with __dict__
+    if hasattr(obj, "__dict__"):
+        try:
+            return {k: _to_jsonable(v) for k, v in vars(obj).items() if not k.startswith("_")}
+        except Exception:
+            pass
+
+    # Fallback to string representation
+    return str(obj)
+
 def _canonical_payload(data: Dict[str, Any], time_fmt: str) -> Dict[str, Any]:
-    # Ingest legacy keys
     username = _coalesce(data.get("username"), data.get("user_name"))
     booking_id = _coalesce(data.get("bookingId"), data.get("booking_id"))
     slot_id = _coalesce(data.get("slotId"), data.get("slot_id"))
@@ -73,11 +129,9 @@ def _canonical_payload(data: Dict[str, Any], time_fmt: str) -> Dict[str, Any]:
     date_val = _as_date_str(data.get("date"))
     slot_price = data.get("slot_price")
 
-    # status fields
     machine_status = _coalesce(data.get("status"), "pending_verified")
     booking_status = _coalesce(data.get("booking_status"), data.get("book_status"))
 
-    # normalize times
     time_block = _normalize_block(data.get("time"), time_fmt)
     processed_block = _normalize_block(data.get("processed_time"), time_fmt)
 
@@ -99,7 +153,6 @@ def _canonical_payload(data: Dict[str, Any], time_fmt: str) -> Dict[str, Any]:
         "time": time_block,
         "processed_time": processed_block,
     }
-    # Filter out None and extraneous keys
     return {k: v for k, v in payload.items() if v is not None}
 
 def emit_booking_event(
@@ -113,17 +166,6 @@ def emit_booking_event(
     time_fmt: str = "%I:%M %p",
     event_id: Optional[str] = None
 ) -> Optional[str]:
-    """
-    Production-ready emitter for booking-related events.
-
-    - Ensures canonical payload
-    - Adds event metadata (event_id, emitted_at)
-    - Emits to vendor room by default if vendor_id provided
-    - Returns event_id for idempotency tracking upstream
-
-    This function is tolerant to Flask-SocketIO/python-socketio API differences by
-    using 'to=' (newer) or 'room=' (older) parameter names when emitting.
-    """
     if not socketio:
         logger.warning("emit_booking_event: SocketIO unavailable; event='%s'", event)
         return None
@@ -142,32 +184,31 @@ def emit_booking_event(
 
         target_room = room or (f"vendor_{vendor_id}" if vendor_id else None)
 
-        # Final allowlist filter + include metadata
+        # Allowlist + metadata
         filtered_payload = {k: v for k, v in full_payload.items() if k in CANONICAL_KEYS}
         filtered_payload["event_id"] = full_payload["event_id"]
         filtered_payload["emitted_at"] = full_payload["emitted_at"]
 
-        # Prepare emit kwargs in a version-compatible way:
-        # - Newer python-socketio prefers 'to='
-        # - Older Flask-SocketIO accepted 'room='
+        # FINAL: Make sure it's JSON-serializable
+        serializable_payload = _to_jsonable(filtered_payload)
+
         emit_kwargs = {"namespace": namespace} if namespace else {}
 
-        # Try 'to' first, fall back to 'room'
+        # Try 'to=' first, fallback to 'room=' on older versions
         try:
             if target_room:
-                socketio.emit(event, filtered_payload, to=target_room, **emit_kwargs)
+                socketio.emit(event, serializable_payload, to=target_room, **emit_kwargs)
             else:
-                socketio.emit(event, filtered_payload, **emit_kwargs)
+                socketio.emit(event, serializable_payload, **emit_kwargs)
         except TypeError:
-            # Older API path: use 'room='
             if target_room:
-                socketio.emit(event, filtered_payload, room=target_room, **emit_kwargs)
+                socketio.emit(event, serializable_payload, room=target_room, **emit_kwargs)
             else:
-                socketio.emit(event, filtered_payload, **emit_kwargs)
+                socketio.emit(event, serializable_payload, **emit_kwargs)
 
         logger.info(
             "emit_booking_event: event='%s' vendor=%s room=%s payload_keys=%s",
-            event, vendor_id, target_room, list(filtered_payload.keys())
+            event, vendor_id, target_room, list(serializable_payload.keys())
         )
         return eid
 
