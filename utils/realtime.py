@@ -109,7 +109,6 @@ def emit_booking_event(
     *,
     vendor_id: Optional[int] = None,
     room: Optional[str] = None,
-    broadcast: bool = False,
     namespace: Optional[str] = None,
     time_fmt: str = "%I:%M %p",
     event_id: Optional[str] = None
@@ -122,7 +121,8 @@ def emit_booking_event(
     - Emits to vendor room by default if vendor_id provided
     - Returns event_id for idempotency tracking upstream
 
-    Raises no exceptions (logs and returns None) to avoid breaking request lifecycle.
+    This function is tolerant to Flask-SocketIO/python-socketio API differences by
+    using 'to=' (newer) or 'room=' (older) parameter names when emitting.
     """
     if not socketio:
         logger.warning("emit_booking_event: SocketIO unavailable; event='%s'", event)
@@ -142,20 +142,28 @@ def emit_booking_event(
 
         target_room = room or (f"vendor_{vendor_id}" if vendor_id else None)
 
-        # Final allowlist filter
+        # Final allowlist filter + include metadata
         filtered_payload = {k: v for k, v in full_payload.items() if k in CANONICAL_KEYS}
-
-        # Include meta keys as well
         filtered_payload["event_id"] = full_payload["event_id"]
         filtered_payload["emitted_at"] = full_payload["emitted_at"]
 
-        socketio.emit(
-            event,
-            filtered_payload,
-            room=target_room,
-            namespace=namespace,
-            broadcast=broadcast
-        )
+        # Prepare emit kwargs in a version-compatible way:
+        # - Newer python-socketio prefers 'to='
+        # - Older Flask-SocketIO accepted 'room='
+        emit_kwargs = {"namespace": namespace} if namespace else {}
+
+        # Try 'to' first, fall back to 'room'
+        try:
+            if target_room:
+                socketio.emit(event, filtered_payload, to=target_room, **emit_kwargs)
+            else:
+                socketio.emit(event, filtered_payload, **emit_kwargs)
+        except TypeError:
+            # Older API path: use 'room='
+            if target_room:
+                socketio.emit(event, filtered_payload, room=target_room, **emit_kwargs)
+            else:
+                socketio.emit(event, filtered_payload, **emit_kwargs)
 
         logger.info(
             "emit_booking_event: event='%s' vendor=%s room=%s payload_keys=%s",
