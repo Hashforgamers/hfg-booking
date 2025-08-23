@@ -49,6 +49,8 @@ import hashlib
 import razorpay
 from services.security import auth_required_self
 
+from utils.realtime import build_booking_event_payload
+
 import uuid
 
 from utils.common import generate_fid, generate_access_code, get_razorpay_keys
@@ -552,7 +554,7 @@ def confirm_booking():
             BookingService.insert_into_vendor_dashboard_table(transaction.id, -1)
             BookingService.insert_into_vendor_promo_table(transaction.id, -1)
 
-            # -- After booking.status = 'confirmed' and transaction creation --
+            # - - After booking.status = 'confirmed' and transaction creation --
             # Gather fields for event payload
             # vendor_id already available via vendor.id
             vendor_id = vendor.id
