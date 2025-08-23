@@ -50,6 +50,7 @@ import razorpay
 from services.security import auth_required_self
 
 from utils.realtime import build_booking_event_payload
+from utils.realtime import emit_booking_event
 
 import uuid
 
