@@ -154,6 +154,7 @@ def create_booking():
     slot_ids = data.get("slot_id")  # list expected
     game_id = data.get("game_id")
     book_date = data.get("book_date")
+    is_pay_at_cafe = data.get("is_pay_at_cafe")
 
     log.info("bookings.post.payload cid=%s slot_ids_len=%s game_id=%s book_date=%s",
              cid, (len(slot_ids) if isinstance(slot_ids, list) else None), game_id, book_date)
