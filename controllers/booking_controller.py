@@ -154,6 +154,7 @@ def create_booking():
     slot_ids = data.get("slot_id")  # list expected
     game_id = data.get("game_id")
     book_date = data.get("book_date")
+    is_pay_at_cafe = data.get("is_pay_at_cafe", False)
 
     log.info("bookings.post.payload cid=%s slot_ids_len=%s game_id=%s book_date=%s",
              cid, (len(slot_ids) if isinstance(slot_ids, list) else None), game_id, book_date)
@@ -201,7 +202,7 @@ def create_booking():
                              ("no_entry" if slot_entry is None else ("no_slots" if slot_entry <= 0 else "not_available")))
                     continue
 
-                booking = BookingService.create_booking(slot_id, game_id, user_id, socketio, book_date)
+                booking = BookingService.create_booking(slot_id, game_id, user_id, socketio, book_date, is_pay_at_cafe)
                 db.session.flush()
 
                 log.info("bookings.post.slot_booked cid=%s slot_id=%s booking_id=%s",
