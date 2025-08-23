@@ -3,11 +3,8 @@ from models.availableGame import AvailableGame
 from flask_socketio import socketio
 from models.slot import Slot
 from models.booking import Booking
-from flask import current_app
 from db.extensions import db
 from datetime import datetime
-from sqlalchemy.sql import text
-from flask import current_app
 from models.transaction import Transaction
 from models.user import User
 from models.paymentTransactionMapping import PaymentTransactionMapping
@@ -20,7 +17,10 @@ from models.extraServiceMenuImage import ExtraServiceMenuImage
 from models.cafePass import CafePass
 from models.extraServiceMenu import ExtraServiceMenu
 from sqlalchemy import or_
-
+from utils.realtime import emit_booking_event
+from flask import current_app, g
+from sqlalchemy import text
+import uuid
 
 
 class BookingService:
@@ -70,65 +70,263 @@ class BookingService:
     def verifyPayment(payment_id):
         return payment_id == "1234"
 
-    @staticmethod
-    def create_booking(slot_id, game_id, user_id, socketio, book_date):
-        # ✅ Get vendor_id from available_games
-        available_game = db.session.execute(
-            text("SELECT vendor_id FROM available_games WHERE id = (SELECT gaming_type_id FROM slots WHERE id = :slot_id)"),
-            {"slot_id": slot_id}
-        ).fetchone()
+    # @staticmethod
+    # def create_booking_old(slot_id, game_id, user_id, socketio, book_date):
+    #     # ✅ Get vendor_id from available_games
+    #     available_game = db.session.execute(
+    #         text("SELECT vendor_id FROM available_games WHERE id = (SELECT gaming_type_id FROM slots WHERE id = :slot_id)"),
+    #         {"slot_id": slot_id}
+    #     ).fetchone()
 
-        if not available_game:
+    #     if not available_game:
+    #         raise ValueError("Vendor not found for this slot.")
+
+    #     vendor_id = available_game[0]
+
+    #     current_app.logger.info(f"Test1 {vendor_id} . {slot_id}, {book_date}")
+
+    #     # ✅ Check availability in the VENDOR_{vendor_id}_SLOT table
+    #     slot_entry = db.session.execute(
+    #         text(f"""
+    #             SELECT * FROM VENDOR_{vendor_id}_SLOT
+    #             WHERE slot_id = :slot_id AND date = :book_date
+    #         """),
+    #         {"slot_id": slot_id, "book_date": book_date}
+    #     ).fetchone()
+
+    #     current_app.logger.info(f"Test {slot_entry} .")
+
+    #     if not slot_entry or slot_entry[0] <= 0:
+    #         raise ValueError("Slot is fully booked for this date.")
+
+    #     try:
+    #         # ✅ Decrease `available_slot` by 1 in the table
+    #         update_query = text(f"""
+    #             UPDATE VENDOR_{vendor_id}_SLOT
+    #             SET available_slot = available_slot - 1,
+    #                 is_available = CASE WHEN available_slot - 1 = 0 THEN FALSE ELSE is_available END
+    #             WHERE slot_id = :slot_id
+    #             AND date = :book_date;
+    #         """)
+    #         db.session.execute(update_query, {"slot_id": slot_id, "book_date": book_date})
+    #         db.session.commit()
+
+    #         # ✅ Create booking
+    #         booking = Booking(slot_id=slot_id, game_id=game_id, user_id=user_id, status='pending_verified')
+    #         db.session.add(booking)
+    #         db.session.commit()
+
+    #         socketio.emit('slot_pending', {'slot_id': slot_id, 'booking': booking.id, 'status': 'pending'})
+
+    #         if socketio:
+    #             socketio.emit(
+    #                 "booking_updated",
+    #                 {
+    #                     "booking_id": booking.id,
+    #                     "slot_id": slot_id,
+    #                     "status": "pending_verified"
+    #                 },
+    #                 room=f"vendor_{vendor_id}"
+    #             )
+
+    #         return booking
+
+    #     except Exception as e:
+    #         db.session.rollback()
+    #         raise ValueError(f"Failed to create booking: {str(e)}")
+
+    @staticmethod
+    def create_booking(slot_id: int, game_id: int, user_id: int, socketio, book_date, is_pay_at_cafe: bool = False):
+        cid = getattr(g, "cid", None) or str(uuid.uuid4())
+        log = current_app.logger
+
+        log.info("create_booking.start cid=%s slot_id=%s game_id=%s user_id=%s book_date=%s is_pay_at_cafe=%s",
+                 cid, slot_id, game_id, user_id, book_date, is_pay_at_cafe)
+
+        # STEP 1: Resolve vendor and game meta (BUGFIX: proper unpack)
+        try:
+            ag_row = db.session.execute(
+                text("""
+                    SELECT ag.vendor_id, ag.single_slot_price, ag.game_name
+                    FROM available_games ag
+                    JOIN slots s ON s.gaming_type_id = ag.id
+                    WHERE s.id = :slot_id
+                """),
+                {"slot_id": slot_id}
+            ).fetchone()
+            log.info("create_booking.meta_loaded cid=%s has_ag_row=%s", cid, bool(ag_row))
+        except Exception as e:
+            log.exception("create_booking.meta_query_failed cid=%s slot_id=%s error=%s", cid, slot_id, e)
+            raise
+
+        if not ag_row:
+            log.warning("create_booking.no_vendor_for_slot cid=%s slot_id=%s", cid, slot_id)
             raise ValueError("Vendor not found for this slot.")
 
-        vendor_id = available_game[0]
+        # Properly unpack the tuple
+        vendor_id = ag_row[0]
+        slot_price = ag_row
+        game_name = ag_row
 
-        current_app.logger.info(f"Test1 {vendor_id} . {slot_id}, {book_date}")
+        log.info("create_booking.meta_parsed cid=%s vendor_id=%s slot_price=%s game_name=%s",
+                 cid, vendor_id, slot_price, game_name)
 
-        # ✅ Check availability in the VENDOR_{vendor_id}_SLOT table
-        slot_entry = db.session.execute(
-            text(f"""
-                SELECT * FROM VENDOR_{vendor_id}_SLOT
-                WHERE slot_id = :slot_id AND date = :book_date
-            """),
-            {"slot_id": slot_id, "book_date": book_date}
-        ).fetchone()
+        # STEP 2A: Lock and read vendor availability row (match schema)
+        try:
+            vendor_slot_row = db.session.execute(
+                text(f"""
+                    SELECT available_slot, date
+                    FROM VENDOR_{vendor_id}_SLOT
+                    WHERE slot_id = :slot_id AND date = :book_date
+                    FOR UPDATE
+                """),
+                {"slot_id": slot_id, "book_date": book_date}
+            ).fetchone()
+            log.info("create_booking.vendor_slot_locked cid=%s has_row=%s", cid, bool(vendor_slot_row))
+        except Exception as e:
+            log.exception("create_booking.vendor_slot_query_failed cid=%s vendor_id=%s slot_id=%s error=%s",
+                          cid, vendor_id, slot_id, e)
+            raise
 
-        current_app.logger.info(f"Test {slot_entry} .")
+        if not vendor_slot_row:
+            log.warning("create_booking.vendor_slot_missing cid=%s vendor_id=%s slot_id=%s book_date=%s",
+                        cid, vendor_id, slot_id, book_date)
+            raise ValueError("Slot row not found for this date.")
 
-        if not slot_entry or slot_entry[0] <= 0:
+        available_slot, date_value = vendor_slot_row
+        log.info("create_booking.vendor_slot_state cid=%s available_slot=%s date=%s",
+                 cid, available_slot, date_value)
+
+        if available_slot is None or available_slot <= 0:
+            log.warning("create_booking.slot_full cid=%s vendor_id=%s slot_id=%s date=%s",
+                        cid, vendor_id, slot_id, date_value)
             raise ValueError("Slot is fully booked for this date.")
 
+        # STEP 2B: Fetch time/console metadata from slots table
         try:
-            # ✅ Decrease `available_slot` by 1 in the table
-            update_query = text(f"""
-                UPDATE VENDOR_{vendor_id}_SLOT
-                SET available_slot = available_slot - 1,
-                    is_available = CASE WHEN available_slot - 1 = 0 THEN FALSE ELSE is_available END
-                WHERE slot_id = :slot_id
-                AND date = :book_date;
-            """)
-            db.session.execute(update_query, {"slot_id": slot_id, "book_date": book_date})
-            db.session.commit()
+            slot_meta = db.session.execute(
+                text("""
+                    SELECT start_time, end_time, -1 AS console_id
+                    FROM slots
+                    WHERE id = :slot_id
+                """),
+                {"slot_id": slot_id}
+            ).fetchone()
+            log.info("create_booking.slot_meta_loaded cid=%s has_meta=%s", cid, bool(slot_meta))
+        except Exception as e:
+            log.exception("create_booking.slot_meta_query_failed cid=%s slot_id=%s error=%s", cid, slot_id, e)
+            raise
 
-            # ✅ Create booking
-            booking = Booking(slot_id=slot_id, game_id=game_id, user_id=user_id, status='pending_verified')
+        if not slot_meta:
+            log.warning("create_booking.slot_meta_missing cid=%s slot_id=%s", cid, slot_id)
+            raise ValueError("Slot metadata missing.")
+
+        start_time, end_time, console_id = slot_meta
+        log.info("create_booking.slot_meta cid=%s start=%s end=%s console_id=%s",
+                 cid, start_time, end_time, console_id)
+
+        # STEP 3: Atomic decrement on vendor slot row
+        try:
+            update_res = db.session.execute(
+                text(f"""
+                    UPDATE VENDOR_{vendor_id}_SLOT
+                    SET available_slot = available_slot - 1,
+                        is_available = CASE WHEN available_slot - 1 = 0 THEN FALSE ELSE is_available END
+                    WHERE slot_id = :slot_id AND date = :book_date AND available_slot > 0
+                    RETURNING available_slot
+                """),
+                {"slot_id": slot_id, "book_date": book_date}
+            ).fetchone()
+            log.info("create_booking.vendor_slot_decrement cid=%s success=%s new_available_slot=%s",
+                     cid, bool(update_res), (update_res[0] if update_res else None))
+        except Exception as e:
+            log.exception("create_booking.vendor_slot_decrement_failed cid=%s vendor_id=%s slot_id=%s error=%s",
+                          cid, vendor_id, slot_id, e)
+            db.session.rollback()
+            raise
+
+        if not update_res:
+            db.session.rollback()
+            log.warning("create_booking.concurrent_conflict cid=%s vendor_id=%s slot_id=%s date=%s",
+                        cid, vendor_id, slot_id, date_value)
+            raise ValueError("Concurrent booking conflict. Please retry.")
+
+        # STEP 4: Create booking
+        try:
+            booking = Booking(
+                slot_id=slot_id,
+                game_id=game_id,
+                user_id=user_id,
+                status='pending_verified',
+                created_at=datetime.utcnow()
+            )
             db.session.add(booking)
-            db.session.commit()
-
-            socketio.emit('slot_pending', {'slot_id': slot_id, 'booking': booking.id, 'status': 'pending'})
-
-            # ✅ Emit WebSocket event
-            if BookingService.socketio:
-                BookingService.socketio.emit('booking_updated', {
-                    'booking_id': booking.id, 'status': 'pending_verified'
-                }, room=None)  # 'room=None' sends to all
-
-            return booking
-
+            db.session.flush()
+            bid = booking.id
+            log.info("create_booking.booking_created cid=%s bid=%s", cid, bid)
         except Exception as e:
             db.session.rollback()
-            raise ValueError(f"Failed to create booking: {str(e)}")
+            log.exception("create_booking.booking_persist_failed cid=%s vendor_id=%s slot_id=%s error=%s",
+                          cid, vendor_id, slot_id, e)
+            raise
+
+        # STEP 5: Resolve username (non-fatal)
+        try:
+            user_row = db.session.execute(
+                text("SELECT name FROM users WHERE id = :uid"),
+                {"uid": user_id}
+            ).fetchone()
+            username = user_row[0] if user_row else None
+            log.info("create_booking.user_loaded cid=%s user_id=%s has_username=%s",
+                     cid, user_id, bool(username))
+        except Exception as e:
+            username = None
+            log.exception("create_booking.user_query_failed cid=%s user_id=%s error=%s", cid, user_id, e)
+
+        # STEP 6: Commit DB
+        try:
+            db.session.commit()
+            log.info("create_booking.db_committed cid=%s bid=%s", cid, bid)
+        except Exception as e:
+            db.session.rollback()
+            log.exception("create_booking.db_commit_failed cid=%s bid=%s error=%s", cid, bid, e)
+            raise
+
+        # STEP 7: Emit event (non-fatal)
+        try:
+            machine_status = "pending_acceptance" if is_pay_at_cafe else "pending_verified"
+            log.info("create_booking.emit_prepare cid=%s bid=%s status=%s", cid, bid, machine_status)
+
+            emit_booking_event(
+                socketio,
+                event="booking",
+                data={
+                    "vendor_id": vendor_id,
+                    "booking_id": bid,
+                    "slot_id": slot_id,
+                    "user_id": user_id,
+                    "username": username,
+                    "game_id": game_id,
+                    "game": game_name,
+                    "consoleType": f"Console-{console_id}" if console_id is not None else None,
+                    "consoleNumber": str(console_id) if console_id is not None else None,
+                    "date": date_value,
+                    "slot_price": slot_price,
+                    "time": [{"start_time": start_time, "end_time": end_time}],
+                    "processed_time": [{"start_time": start_time, "end_time": end_time}],
+                    "status": machine_status,
+                    "booking_status": "upcoming",
+                    "cid": cid,
+                },
+                vendor_id=vendor_id
+            )
+            log.info("create_booking.emit_done cid=%s bid=%s", cid, bid)
+        except Exception as e:
+            log.exception("create_booking.emit_failed cid=%s bid=%s error=%s", cid, bid, e)
+
+        log.info("create_booking.success cid=%s bid=%s", cid, bid)
+        return booking
+
 
     @staticmethod
     def release_slot(slot_id, booking_id, book_date):
@@ -173,7 +371,7 @@ class BookingService:
 
                     # ✅ Emit WebSocket event to update slot status
                     socketio = current_app.extensions['socketio']
-                    socketio.emit('slot_released', {
+                    socketio.emit('booking', {
                         'slot_id': slot_id,
                         'slot_status': 'available',
                         'booking_id': booking_id,
