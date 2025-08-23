@@ -257,7 +257,7 @@ class BookingService:
                 slot_id=slot_id,
                 game_id=game_id,
                 user_id=user_id,
-                status=is_pay_at_cafe?'pending_acceptance':'pending_verified',
+                status="pending_acceptance" if is_pay_at_cafe else "pending_verified",
                 created_at=datetime.utcnow()
             )
             db.session.add(booking)
@@ -315,7 +315,7 @@ class BookingService:
                     "time": [{"start_time": start_time, "end_time": end_time}],
                     "processed_time": [{"start_time": start_time, "end_time": end_time}],
                     "status": machine_status,
-                    "booking_status": is_pay_at_cafe?"notification":"upcoming",
+                    "booking_status": "pending_acceptance" if is_pay_at_cafe else "pending_verified",
                     "cid": cid,
                 },
                 vendor_id=vendor_id
