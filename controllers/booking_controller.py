@@ -9,6 +9,7 @@ import random
 import os
 from rq import Queue
 from rq_scheduler import Scheduler
+from sqlalchemy import func
 from models.transaction import Transaction
 from models.availableGame import AvailableGame, available_game_console
 from models.vendor import Vendor
@@ -1772,13 +1773,14 @@ def get_pending_pay_at_cafe_bookings(vendor_id):
     try:
         current_app.logger.info(f"Fetching pending pay at cafe bookings for vendor {vendor_id}")
         
-        # Query pending acceptance bookings with all related data
+        
+        # Updated query with proper timezone handling
         pending_bookings = db.session.query(
             Booking.id.label('bookingId'),
             Booking.slot_id.label('slotId'),
             Booking.user_id.label('userId'),
             Booking.game_id,
-            Booking.created_at.label('emitted_at'),
+            Booking.created_at.label('emitted_at'),  # Direct access since it's not nullable
             User.name.label('username'),
             Slot.start_time,
             Slot.end_time,
@@ -1796,48 +1798,65 @@ def get_pending_pay_at_cafe_bookings(vendor_id):
         # Transform to match your socket data structure
         notifications = []
         for booking in pending_bookings:
-            # Format date
-            booking_date = booking.created_at.date().strftime('%Y-%m-%d') if booking.created_at else datetime.utcnow().strftime('%Y-%m-%d')
-            
-            # Format time slot
-            if booking.start_time and booking.end_time:
-                start_time = booking.start_time.strftime('%I:%M %p')
-                end_time = booking.end_time.strftime('%I:%M %p')
-                time_slot = f"{start_time} - {end_time}"
-            else:
-                time_slot = "N/A"
+            try:
+                # Handle timezone-aware datetime
+                if booking.emitted_at:
+                    # Convert to ISO format with timezone info
+                    emitted_at_iso = booking.emitted_at.isoformat()
+                    # Get date for booking
+                    booking_date = booking.emitted_at.date().strftime('%Y-%m-%d')
+                else:
+                    # Fallback to current time
+                    now = datetime.utcnow()
+                    emitted_at_iso = now.isoformat()
+                    booking_date = now.strftime('%Y-%m-%d')
+                
+                # Format time slot
+                if booking.start_time and booking.end_time:
+                    try:
+                        start_time = booking.start_time.strftime('%I:%M %p')
+                        end_time = booking.end_time.strftime('%I:%M %p')
+                        time_slot = f"{start_time} - {end_time}"
+                    except Exception:
+                        time_slot = "N/A"
+                else:
+                    time_slot = "N/A"
 
-            notification = {
-                "event_id": f"db-{booking.bookingId}",
-                "emitted_at": booking.emitted_at.isoformat() if booking.emitted_at else datetime.utcnow().isoformat(),
-                "bookingId": booking.bookingId,
-                "slotId": booking.slotId,
-                "vendorId": booking.vendorId,
-                "userId": booking.userId,
-                "username": booking.username,
-                "game": {
-                    "vendor_id": booking.vendorId,
-                    "single_slot_price": booking.single_slot_price,
-                    "game_name": booking.game_name
-                },
-                "game_id": booking.game_id,
-                "consoleType": "Console--1",
-                "consoleNumber": "-1",
-                "date": booking_date,
-                "slot_price": {
-                    "vendor_id": booking.vendorId,
-                    "single_slot_price": booking.single_slot_price,
-                    "game_name": booking.game_name
-                },
-                "status": "pending_acceptance",
-                "statusLabel": "Pending",
-                "booking_status": "pending_acceptance",
-                "time": time_slot,
-                "processed_time": time_slot
-            }
-            notifications.append(notification)
+                notification = {
+                    "event_id": f"db-{booking.bookingId}",
+                    "emitted_at": emitted_at_iso,
+                    "bookingId": booking.bookingId,
+                    "slotId": booking.slotId,
+                    "vendorId": booking.vendorId,
+                    "userId": booking.userId,
+                    "username": booking.username or "Unknown User",
+                    "game": {
+                        "vendor_id": booking.vendorId,
+                        "single_slot_price": booking.single_slot_price or 0,
+                        "game_name": booking.game_name or "Unknown Game"
+                    },
+                    "game_id": booking.game_id,
+                    "consoleType": "Console--1",
+                    "consoleNumber": "-1",
+                    "date": booking_date,
+                    "slot_price": {
+                        "vendor_id": booking.vendorId,
+                        "single_slot_price": booking.single_slot_price or 0,
+                        "game_name": booking.game_name or "Unknown Game"
+                    },
+                    "status": "pending_acceptance",
+                    "statusLabel": "Pending",
+                    "booking_status": "pending_acceptance",
+                    "time": time_slot,
+                    "processed_time": time_slot
+                }
+                notifications.append(notification)
+                
+            except Exception as item_error:
+                current_app.logger.error(f"Error processing booking {booking.bookingId}: {item_error}")
+                continue
 
-        current_app.logger.info(f"Found {len(notifications)} pending pay at cafe bookings for vendor {vendor_id}")
+        current_app.logger.info(f"Successfully processed {len(notifications)} pending bookings for vendor {vendor_id}")
         
         return jsonify({
             'success': True,
