@@ -1872,26 +1872,21 @@ def get_pending_pay_at_cafe_bookings(vendor_id):
         }), 500
 
 
-@booking_blueprint.route('/pay-at-cafe/respond', methods=['POST'])
-def respond_to_pay_at_cafe_booking():
-    """Accept or reject a pay-at-cafe booking"""
+@booking_blueprint.route('/pay-at-cafe/accept', methods=['POST'])
+def accept_pay_at_cafe_booking():
+    """Accept a pay-at-cafe booking and change status to confirmed"""
     try:
         data = request.get_json()
         booking_id = data.get('booking_id')
-        action = data.get('action')  # 'accept' or 'reject'
         vendor_id = data.get('vendor_id')
-        rejection_reason = data.get('rejection_reason', '')
 
-        current_app.logger.info(f"Pay at cafe response: booking_id={booking_id}, action={action}, vendor_id={vendor_id}")
+        current_app.logger.info(f"Accept pay at cafe booking: booking_id={booking_id}, vendor_id={vendor_id}")
 
         # Validation
-        if not all([booking_id, action, vendor_id]):
-            return jsonify({"success": False, "message": "booking_id, action, and vendor_id are required"}), 400
+        if not all([booking_id, vendor_id]):
+            return jsonify({"success": False, "message": "booking_id and vendor_id are required"}), 400
 
-        if action not in ['accept', 'reject']:
-            return jsonify({"success": False, "message": "action must be 'accept' or 'reject'"}), 400
-
-        # Fetch booking with related data
+        # Fetch booking
         booking = Booking.query.filter_by(id=booking_id).first()
         if not booking:
             return jsonify({"success": False, "message": "Booking not found"}), 404
@@ -1904,75 +1899,180 @@ def respond_to_pay_at_cafe_booking():
         if not available_game or available_game.vendor_id != vendor_id:
             return jsonify({"success": False, "message": "Unauthorized - This booking doesn't belong to your vendor"}), 403
 
-        # Get related objects for processing
+        # Get related objects
         user = User.query.filter_by(id=booking.user_id).first()
         slot_obj = Slot.query.filter_by(id=booking.slot_id).first()
         vendor = Vendor.query.filter_by(id=vendor_id).first()
 
+        # Accept the booking - change status to confirmed
+        booking.status = 'confirmed'
+        booking.updated_at = datetime.utcnow()
+        
+        # Create access code for confirmed booking
+        code = generate_access_code()
+        access_code_entry = AccessBookingCode(access_code=code)
+        db.session.add(access_code_entry)
+        db.session.flush()
+        booking.access_code_id = access_code_entry.id
+        
+        # Create transaction record for the confirmed booking
+        transaction = Transaction(
+            booking_id=booking.id,
+            vendor_id=vendor_id,
+            user_id=booking.user_id,
+            user_name=user.name if user else "Unknown",
+            original_amount=available_game.single_slot_price,
+            discounted_amount=0,
+            amount=available_game.single_slot_price,
+            mode_of_payment="pay_at_cafe",
+            booking_date=datetime.utcnow().date(),
+            booked_date=booking.created_at.date() if booking.created_at else datetime.utcnow().date(),
+            booking_time=datetime.utcnow().time(),
+            booking_type="pay_at_cafe"
+        )
+        db.session.add(transaction)
+        db.session.flush()
+        
+        # Add to vendor analytics
+        BookingService.insert_into_vendor_dashboard_table(transaction.id, -1)
+        BookingService.insert_into_vendor_promo_table(transaction.id, -1)
+        
+        current_app.logger.info(f"Booking {booking_id} accepted and confirmed by vendor {vendor_id}")
+        
+        # Emit acceptance notification via socket
         socketio = current_app.extensions.get('socketio')
+        if socketio:
+            socketio.emit('pay_at_cafe_accepted', {
+                'bookingId': booking_id,
+                'vendorId': vendor_id,
+                'userId': booking.user_id,
+                'status': 'confirmed',
+                'access_code': code,
+                'message': 'Your booking has been accepted! Please visit the cafe with this confirmation.',
+                'timestamp': datetime.utcnow().isoformat()
+            })
+        
+        # Send booking confirmation email
+        if user and user.contact_info:
+            booking_mail(
+                gamer_name=user.name,
+                gamer_phone=user.contact_info.phone,
+                gamer_email=user.contact_info.email,
+                cafe_name=vendor.cafe_name if vendor else "Gaming Cafe",
+                booking_date=datetime.utcnow().strftime("%Y-%m-%d"),
+                booked_for_date=booking.created_at.strftime("%Y-%m-%d") if booking.created_at else datetime.utcnow().strftime("%Y-%m-%d"),
+                booking_details=[{
+                    "booking_id": booking.id,
+                    "slot_time": f"{slot_obj.start_time} - {slot_obj.end_time}" if slot_obj else "N/A"
+                }],
+                price_paid=available_game.single_slot_price
+            )
+        
+        # Commit all changes
+        db.session.commit()
+        
+        return jsonify({
+            "success": True,
+            "message": "Booking accepted and confirmed successfully!",
+            "booking_id": booking_id,
+            "status": booking.status,
+            "access_code": code
+        }), 200
 
-        if action == 'accept':
-            # Accept the booking
-            booking.status = 'pending_verified'  # Move to normal payment flow
-            booking.updated_at = datetime.utcnow()
-            
-            current_app.logger.info(f"Booking {booking_id} accepted by vendor {vendor_id}")
-            
-            # Emit acceptance notification
-            if socketio:
-                socketio.emit('pay_at_cafe_accepted', {
-                    'bookingId': booking_id,
-                    'vendorId': vendor_id,
-                    'userId': booking.user_id,
-                    'message': 'Your booking has been accepted by the vendor. You can now proceed with payment.',
-                    'timestamp': datetime.utcnow().isoformat()
-                })
-            
-            message = "Booking accepted successfully! Customer can now proceed with payment."
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.exception(f"Error accepting pay at cafe booking: {e}")
+        return jsonify({
+            "success": False,
+            "message": "Failed to accept booking",
+            "error": str(e)
+        }), 500
 
-        else:  # reject
-            # Reject the booking
-            booking.status = 'rejected'
-            booking.updated_at = datetime.utcnow()
-            
-            # Release the slot using existing service
-            try:
-                BookingService.release_slot(booking.slot_id, booking_id, booking.created_at.strftime('%Y-%m-%d'))
-                current_app.logger.info(f"Slot {booking.slot_id} released for rejected booking {booking_id}")
-            except Exception as e:
-                current_app.logger.error(f"Failed to release slot for booking {booking_id}: {e}")
-            
-            current_app.logger.info(f"Booking {booking_id} rejected by vendor {vendor_id}. Reason: {rejection_reason}")
-            
-            # Emit rejection notification
-            if socketio:
-                socketio.emit('pay_at_cafe_rejected', {
-                    'bookingId': booking_id,
-                    'vendorId': vendor_id,
-                    'userId': booking.user_id,
-                    'reason': rejection_reason,
-                    'message': f'Your booking has been rejected by the vendor. Reason: {rejection_reason or "No reason provided"}',
-                    'timestamp': datetime.utcnow().isoformat()
-                })
-            
-            message = "Booking rejected successfully!"
 
+@booking_blueprint.route('/pay-at-cafe/reject', methods=['POST'])
+def reject_pay_at_cafe_booking():
+    """Reject a pay-at-cafe booking and change status to cancelled"""
+    try:
+        data = request.get_json()
+        booking_id = data.get('booking_id')
+        vendor_id = data.get('vendor_id')
+        rejection_reason = data.get('rejection_reason', 'No reason provided')
+
+        current_app.logger.info(f"Reject pay at cafe booking: booking_id={booking_id}, vendor_id={vendor_id}, reason={rejection_reason}")
+
+        # Validation
+        if not all([booking_id, vendor_id]):
+            return jsonify({"success": False, "message": "booking_id and vendor_id are required"}), 400
+
+        # Fetch booking
+        booking = Booking.query.filter_by(id=booking_id).first()
+        if not booking:
+            return jsonify({"success": False, "message": "Booking not found"}), 404
+
+        if booking.status != 'pending_acceptance':
+            return jsonify({"success": False, "message": "Booking is not pending acceptance"}), 400
+
+        # Verify vendor ownership
+        available_game = AvailableGame.query.filter_by(id=booking.game_id).first()
+        if not available_game or available_game.vendor_id != vendor_id:
+            return jsonify({"success": False, "message": "Unauthorized - This booking doesn't belong to your vendor"}), 403
+
+        # Get related objects
+        user = User.query.filter_by(id=booking.user_id).first()
+        slot_obj = Slot.query.filter_by(id=booking.slot_id).first()
+        vendor = Vendor.query.filter_by(id=vendor_id).first()
+
+        # Reject the booking - change status to cancelled
+        booking.status = 'cancelled'
+        booking.updated_at = datetime.utcnow()
+        
+        # Release the slot using existing service
+        try:
+            BookingService.release_slot(booking.slot_id, booking_id, booking.created_at.strftime('%Y-%m-%d') if booking.created_at else datetime.utcnow().strftime('%Y-%m-%d'))
+            current_app.logger.info(f"Slot {booking.slot_id} released for cancelled booking {booking_id}")
+        except Exception as e:
+            current_app.logger.error(f"Failed to release slot for booking {booking_id}: {e}")
+        
+        current_app.logger.info(f"Booking {booking_id} rejected and cancelled by vendor {vendor_id}. Reason: {rejection_reason}")
+        
+        # Emit rejection notification via socket
+        socketio = current_app.extensions.get('socketio')
+        if socketio:
+            socketio.emit('pay_at_cafe_rejected', {
+                'bookingId': booking_id,
+                'vendorId': vendor_id,
+                'userId': booking.user_id,
+                'status': 'cancelled',
+                'reason': rejection_reason,
+                'message': f'Your booking has been rejected by the vendor. Reason: {rejection_reason}',
+                'timestamp': datetime.utcnow().isoformat()
+            })
+        
+        # Send rejection email to customer
+        if user and user.contact_info:
+            reject_booking_mail(
+                gamer_name=user.name,
+                gamer_email=user.contact_info.email,
+                cafe_name=vendor.cafe_name if vendor else "Gaming Cafe",
+                reason=rejection_reason
+            )
+        
         # Commit changes
         db.session.commit()
         
         return jsonify({
             "success": True,
-            "message": message,
+            "message": "Booking rejected and cancelled successfully!",
             "booking_id": booking_id,
             "status": booking.status,
-            "action": action
+            "reason": rejection_reason
         }), 200
 
     except Exception as e:
         db.session.rollback()
-        current_app.logger.exception(f"Error responding to pay at cafe booking: {e}")
+        current_app.logger.exception(f"Error rejecting pay at cafe booking: {e}")
         return jsonify({
             "success": False,
-            "message": "Failed to process booking response",
+            "message": "Failed to reject booking",
             "error": str(e)
         }), 500
