@@ -600,26 +600,26 @@ def confirm_booking():
 
             # Emit after DB state is consistent; you can emit pre-commit if you prefer,
             # but post-commit avoids clients seeing uncommitted state.
+            # booking service: after emit_booking_event(...) to vendor room
             try:
                 socketio = current_app.extensions.get('socketio')
-                # Same event name "booking", same payload keys
-                emit_booking_event(
-                    socketio,
-                    event="booking",
-                    data=event_payload,
-                    vendor_id=vendor_id
-                    # namespace=... if your clients use a custom namespace
-                )
+
+                # 1) Existing vendor room emit
+                emit_booking_event(socketio, event="booking", data=event_payload, vendor_id=vendor_id)
+
+                # 2) Admin tap: emit every booking event to a dedicated admin room for the dashboard bridge
+                # This lets the dashboard receive ALL events upstream without pre-joining every vendor room.
+                socketio.emit("booking_admin", event_payload, to="dashboard_admin")
+
                 current_app.logger.info(
-                    "confirm_booking.emit_done booking_id=%s vendor_id=%s room=%s",
-                    booking_id_val, vendor_id, f"vendor_{vendor_id}"
+                    "confirm_booking.emit_done booking_id=%s vendor_id=%s room=%s admin_room=%s",
+                    booking_id_val, vendor_id, f"vendor_{vendor_id}", "dashboard_admin"
                 )
             except Exception as e:
                 current_app.logger.exception(
                     "confirm_booking.emit_failed booking_id=%s vendor_id=%s error=%s",
                     booking_id_val, vendor_id, e
                 )
-
 
             # Send booking confirmation email
             booking_mail(
