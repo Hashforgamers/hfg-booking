@@ -1153,9 +1153,15 @@ def new_booking(vendor_id):
             return jsonify({"message": "Missing required fields"}), 400
 
         user = (
-            db.session.query(User).filter(User.id == user_id).first()
+            db.session.query(User)
+            .join(ContactInfo)
+            .filter(and_(User.id == user_id, ContactInfo.parent_type == 'user'))
+            .first()
             if user_id
-            else db.session.query(User).join(ContactInfo).filter(ContactInfo.email == email).first()
+            else db.session.query(User)
+            .join(ContactInfo)
+            .filter(and_(ContactInfo.email == email, ContactInfo.parent_type == 'user'))
+            .first()
         )
 
         if not user:
