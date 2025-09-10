@@ -17,7 +17,19 @@ def send_email(subject, recipients, body, html=None):
         current_app.logger.error(f"Failed to send email: {e}")
 
     
-def booking_mail(gamer_name, gamer_phone, gamer_email, cafe_name, booking_date, booked_for_date, booking_details, price_paid):
+def booking_mail(
+    gamer_name,
+    gamer_phone,
+    gamer_email,
+    cafe_name,
+    booking_date,
+    booked_for_date,
+    booking_details,
+    price_paid,
+    extra_meals=None,  # new parameter, default None
+    extra_controller_fare=0,
+    waive_off_amount=0
+):
     # booking_details = list of dicts: [{booking_id: 1, slot_time: "10:00 AM - 11:00 AM"}, ...]
 
     booking_table_rows = "".join([
@@ -28,6 +40,61 @@ def booking_mail(gamer_name, gamer_phone, gamer_email, cafe_name, booking_date, 
         </tr>
         """ for b in booking_details
     ])
+
+    # Prepare extra meals rows if provided
+    extra_meals_rows = ""
+    total_extra_meals_price = 0
+    if extra_meals:
+        extra_meals_rows = """
+        <h3 style="margin-top: 30px;">🍽️ Extra Meals & Services</h3>
+        <table style="width: 100%; border-collapse: collapse; margin-top: 10px;">
+            <thead>
+                <tr style="background-color: #f0f0f0;">
+                    <th style="padding: 8px; border: 1px solid #ddd;">Item</th>
+                    <th style="padding: 8px; border: 1px solid #ddd;">Quantity</th>
+                    <th style="padding: 8px; border: 1px solid #ddd;">Unit Price</th>
+                    <th style="padding: 8px; border: 1px solid #ddd;">Total</th>
+                </tr>
+            </thead>
+            <tbody>
+        """
+        for meal in extra_meals:
+            name = meal.get("name")
+            quantity = meal.get("quantity", 1)
+            unit_price = meal.get("unit_price", 0)
+            total_price = meal.get("total_price", 0)
+            total_extra_meals_price += total_price
+            extra_meals_rows += f"""
+            <tr>
+                <td style="padding: 8px; border: 1px solid #ddd;">{name}</td>
+                <td style="padding: 8px; border: 1px solid #ddd; text-align: center;">{quantity}</td>
+                <td style="padding: 8px; border: 1px solid #ddd; text-align: right;">₹{unit_price:.2f}</td>
+                <td style="padding: 8px; border: 1px solid #ddd; text-align: right;">₹{total_price:.2f}</td>
+            </tr>
+            """
+        extra_meals_rows += "</tbody></table>"
+
+    # Add extra controller fare row if given
+    extra_controller_fare_row = ""
+    if extra_controller_fare and extra_controller_fare > 0:
+        extra_controller_fare_row = f"""
+        <tr>
+            <td style="padding: 8px; border: 1px solid #ddd;" colspan="3"><strong>Extra Controller Fare</strong></td>
+            <td style="padding: 8px; border: 1px solid #ddd; text-align: right;">₹{extra_controller_fare:.2f}</td>
+        </tr>
+        """
+
+    # Add waive-off row if given
+    waive_off_row = ""
+    if waive_off_amount and waive_off_amount > 0:
+        waive_off_row = f"""
+        <tr>
+            <td style="padding: 8px; border: 1px solid #ddd;" colspan="3"><strong>Waive Off Amount</strong></td>
+            <td style="padding: 8px; border: 1px solid #ddd; text-align: right;">-₹{waive_off_amount:.2f}</td>
+        </tr>
+        """
+
+    final_price = price_paid  # this should already account for everything, just display
 
     send_email(
         subject="🎮 Booking Confirmed – Hash Gaming Café",
@@ -55,7 +122,7 @@ def booking_mail(gamer_name, gamer_phone, gamer_email, cafe_name, booking_date, 
                     <tr><td style="padding: 8px; font-weight: bold;">Gaming Café:</td><td>{cafe_name}</td></tr>
                     <tr><td style="padding: 8px; font-weight: bold;">Booking Date:</td><td>{booking_date}</td></tr>
                     <tr><td style="padding: 8px; font-weight: bold;">Booked For:</td><td>{booked_for_date}</td></tr>
-                    <tr><td style="padding: 8px; font-weight: bold;">Price Paid:</td><td>₹{price_paid}</td></tr>
+                    <tr><td style="padding: 8px; font-weight: bold;">Price Paid:</td><td>₹{final_price:.2f}</td></tr>
                 </table>
 
                 <h3 style="margin-top: 30px;">🕒 Booking ID & Slot Time</h3>
@@ -68,8 +135,12 @@ def booking_mail(gamer_name, gamer_phone, gamer_email, cafe_name, booking_date, 
                     </thead>
                     <tbody>
                         {booking_table_rows}
+                        {extra_controller_fare_row}
+                        {waive_off_row}
                     </tbody>
                 </table>
+
+                {extra_meals_rows}
 
                 <p style="margin-top: 30px;">If you have any questions or need help, feel free to contact us. Enjoy your game!</p>
                 <p>Cheers,<br><strong>The Hash Team</strong></p>
@@ -83,6 +154,7 @@ def booking_mail(gamer_name, gamer_phone, gamer_email, cafe_name, booking_date, 
         </body>
         </html>"""
     )
+
 
 def reject_booking_mail(gamer_name, gamer_email, cafe_name, reason="No reason provided"):
     send_email(
