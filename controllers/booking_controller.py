@@ -1453,100 +1453,116 @@ def new_booking(vendor_id):
         }), 500
         
         # Add this route to get complete booking details including extra services
+
 @booking_blueprint.route('/booking/<int:booking_id>/details', methods=['GET'])
 def get_booking_details(booking_id):
-    """Get complete booking details including extra services"""
     try:
-        booking = db.session.query(Booking).options(
-            joinedload(Booking.booking_extra_services).joinedload(BookingExtraService.menu_item),
-            joinedload(Booking.game),
-            joinedload(Booking.slot)
-        ).filter(Booking.id == booking_id).first()
-
+        # Eager load related objects to minimize queries
+        booking = (
+            Booking.query
+            .options(
+                joinedload(Booking.booking_extra_services).joinedload(BookingExtraService.menu_item).joinedload('category'),
+                joinedload(Booking.game),
+                joinedload(Booking.slot),
+                joinedload(Booking.user).joinedload('contact_info'),
+                joinedload(Booking.game).joinedload('console')
+            )
+            .filter(Booking.id == booking_id)
+            .first()
+        )
+        
         if not booking:
-            return jsonify({'error': 'Booking not found'}), 404
-
-        # Get user details
-        user = db.session.query(User).filter(User.id == booking.user_id).first()
+            return jsonify({"message": "Booking not found"}), 404
         
-        # Get transaction details
-        transactions = db.session.query(Transaction).filter(
-            Transaction.booking_id == booking_id
-        ).all()
-
-        # Calculate pricing
+        if booking.status != "confirmed":
+            return jsonify({"message": "Booking is not confirmed yet"}), 400
+        
+        user = booking.user
+        contact_info = user.contact_info if user else None
+        slot = booking.slot
+        game = booking.game
+        console = getattr(game, 'console', None)
+        
+        transactions = (
+            Transaction.query.filter(Transaction.booking_id == booking.id).all()
+        )
+        
         base_price = sum(t.amount for t in transactions if t.booking_type == 'direct')
-        extra_controller_cost = sum(t.amount for t in transactions if t.booking_type == 'extra_controller')
+        extra_services_price = 0
+        extra_services_list = []
         
-        # Get extra services details
-        extra_services = []
-        total_extra_services_cost = 0
+        for bes in booking.booking_extra_services:
+            item = bes.menu_item
+            category = getattr(item, 'category', None)
+            extra_services_list.append({
+                "id": bes.id,
+                "menu_item_id": bes.menu_item_id,
+                "menu_item_name": item.name if item else "Unknown",
+                "category_name": category.name if category else "Unknown",
+                "quantity": bes.quantity,
+                "unit_price": float(bes.unit_price),
+                "total_price": float(bes.total_price)
+            })
+            extra_services_price += bes.total_price
         
-        for booking_service in booking.booking_extra_services:
-            service_detail = {
-                'id': booking_service.id,
-                'menu_item_id': booking_service.menu_item_id,
-                'menu_item_name': booking_service.menu_item.name,
-                'category_name': booking_service.menu_item.category.name,
-                'quantity': booking_service.quantity,
-                'unit_price': float(booking_service.unit_price),
-                'total_price': float(booking_service.total_price)
-            }
-            extra_services.append(service_detail)
-            total_extra_services_cost += booking_service.total_price
-
-        result = {
-            'booking_id': booking.id,
-            'status': booking.status,
-            'user': {
-                'id': user.id,
-                'name': user.name,
-                'email': user.contact_info.email if user.contact_info else None,
-                'phone': user.contact_info.phone if user.contact_info else None
+        extra_controller_price = sum(t.amount for t in transactions if t.booking_type == 'extra_controller')
+        total_amount = base_price + extra_services_price + extra_controller_price
+        
+        # Format slot times nicely
+        def format_time(t):
+            if t:
+                return t.strftime('%I:%M %p')
+            return 'N/A'
+        
+        response = {
+            "booking_id": booking.id,
+            "status": booking.status,
+            "user": {
+                "id": user.id if user else None,
+                "name": user.name if user else "Unknown",
+                "email": contact_info.email if contact_info else None,
+                "phone": contact_info.phone if contact_info else None
             },
-            'game': {
-                'id': booking.game.id,
-                'name': booking.game.game_name,
-                'vendor_id': booking.game.vendor_id
+            "game": {
+                "id": game.id if game else None,
+                "name": game.game_name if game else "Unknown",
+                "vendor_id": game.vendor_id if game else None
             },
-            'slot': {
-                'id': booking.slot_id,
-                'start_time': str(booking.slot.start_time),
-                'end_time': str(booking.slot.end_time)
+            "console": {
+                "id": console.id if console else None,
+                "model_number": console.model_number if console else "Unknown"
             },
-            'pricing': {
-                'base_price': float(base_price),
-                'extra_services_cost': float(total_extra_services_cost),
-                'extra_controller_cost': float(extra_controller_cost),
-                'total_amount': float(base_price + total_extra_services_cost + extra_controller_cost)
+            "slot": {
+                "id": slot.id if slot else None,
+                "start_time": format_time(getattr(slot, 'start_time', None)),
+                "end_time": format_time(getattr(slot, 'end_time', None))
             },
-            'extra_services': extra_services,
-            'transactions': [
+            "pricing": {
+                "base_price": float(base_price),
+                "extra_services_price": float(extra_services_price),
+                "extra_controller_price": float(extra_controller_price),
+                "total_amount": float(total_amount)
+            },
+            "extra_services": extra_services_list,
+            "transactions": [
                 {
-                    'id': t.id,
-                    'original_amount': float(t.original_amount),
-                    'discounted_amount': float(t.discounted_amount),
-                    'final_amount': float(t.amount),
-                    'payment_mode': t.mode_of_payment,
-                    'booking_type': t.booking_type,
-                    'settlement_status': t.settlement_status
-                }
-                for t in transactions
+                    "id": t.id,
+                    "original_amount": float(t.original_amount),
+                    "discounted_amount": float(t.discounted_amount),
+                    "final_amount": float(t.amount),
+                    "mode_of_payment": t.mode_of_payment,
+                    "booking_type": t.booking_type,
+                    "settlement_status": t.settlement_status
+                } for t in transactions
             ]
         }
-
-        return jsonify({
-            'success': True,
-            'booking': result
-        }), 200
-
-    except Exception as e:
-        current_app.logger.error(f"Error fetching booking details {booking_id}: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
         
+        return jsonify({"success": True, "booking": response}), 200
+
+    except Exception as ex:
+        current_app.logger.error(f"Error fetching booking details {booking_id}: {ex}")
+        return jsonify({"success": False, "error": str(ex)}), 500
+
         # Quick validation route for menu items
 @booking_blueprint.route('/vendor/<int:vendor_id>/validate-meals', methods=['POST'])
 def validate_selected_meals(vendor_id):
