@@ -909,75 +909,75 @@ def reject_booking():
         db.session.rollback()
         return jsonify({"message": "Failed to reject booking", "error": str(e)}), 500
 
-@booking_blueprint.route('/bookings/<booking_id>', methods=['GET'])
-def get_booking_details(booking_id):
-    try:
-        # ✅ Fetch Booking
-        booking = db.session.query(Booking).filter(Booking.id == booking_id).first()
-        if not booking:
-            return jsonify({"message": "Booking not found"}), 404
+#@booking_blueprint.route('/bookings/<booking_id>', methods=['GET'])
+#def get_booking_details(booking_id):
+ #   try:
+  #      # ✅ Fetch Booking
+   #     booking = db.session.query(Booking).filter(Booking.id == booking_id).first()
+   #     if not booking:
+   #         return jsonify({"message": "Booking not found"}), 404
+#
+ #       if booking.status != "confirmed":
+ #           return jsonify({"message": "Booking is not confirmed yet"}), 400
+#
+ #       # ✅ Fetch Slot
+  #      slot = db.session.query(Slot).filter(Slot.id == booking.slot_id).first()
+   #     if not slot:
+    #        return jsonify({"message": "Slot not found"}), 404
+#
+ #       # ✅ Fetch Latest Transaction
+  #      transaction = db.session.query(Transaction).filter(
+   #         Transaction.booking_id == booking.id
+    #    ).order_by(Transaction.id.desc()).first()
 
-        if booking.status != "confirmed":
-            return jsonify({"message": "Booking is not confirmed yet"}), 400
-
-        # ✅ Fetch Slot
-        slot = db.session.query(Slot).filter(Slot.id == booking.slot_id).first()
-        if not slot:
-            return jsonify({"message": "Slot not found"}), 404
-
-        # ✅ Fetch Latest Transaction
-        transaction = db.session.query(Transaction).filter(
-            Transaction.booking_id == booking.id
-        ).order_by(Transaction.id.desc()).first()
-
-        if not transaction:
-            return jsonify({"message": "Transaction not found"}), 404
+     #   if not transaction:
+      #      return jsonify({"message": "Transaction not found"}), 404
 
         # ✅ Fetch User
-        user = db.session.query(User).filter(User.id == booking.user_id).first()
-        if not user:
-            return jsonify({"message": "User not found"}), 404
+       # user = db.session.query(User).filter(User.id == booking.user_id).first()
+        #if not user:
+         #   return jsonify({"message": "User not found"}), 404
 
         # ✅ Get Console ID (Fix for multiple rows issue)
-        console_entry = db.session.query(available_game_console.c.console_id).filter(
-            available_game_console.c.available_game_id == slot.gaming_type_id
-        ).first()  # Returns a tuple (console_id,)
+        #console_entry = db.session.query(available_game_console.c.console_id).filter(
+        #    available_game_console.c.available_game_id == slot.gaming_type_id
+        #).first()  # Returns a tuple (console_id,)
 
-        console_id = console_entry[0] if console_entry else None
+       # console_id = console_entry[0] if console_entry else None
 
         # ✅ Fetch Console Details (only if console_id exists)
-        console = db.session.query(Console).filter(Console.id == console_id).first() if console_id else None
+        #console = db.session.query(Console).filter(Console.id == console_id).first() if console_id else None
 
         # ✅ Fetch Contact Info (Fix incorrect filter syntax)
-        contact_info = db.session.query(ContactInfo).filter(
-            and_(ContactInfo.parent_id == user.id, ContactInfo.parent_type == 'user')
-        ).first()  # Get latest contact info if multiple exist
+        #contact_info = db.session.query(ContactInfo).filter(
+         #   and_(ContactInfo.parent_id == user.id, ContactInfo.parent_type == 'user')
+        #).first()  # Get latest contact info if multiple exist
 
         # ✅ Format Response
-        booking_details = {
-            "success": True,
-            "booking": {
-                "booking_id": f"BK-{booking.id}",  
-                "date": transaction.booked_date.strftime("%Y-%m-%d"),
-                "time_slot": {
-                    "start_time": slot.start_time.strftime("%H:%M"),
-                    "end_time": slot.end_time.strftime("%H:%M")
-                },
-                "system": console.model_number if console else "Unknown System",
-                "game_id": booking.game_id,
-                "customer": {
-                    "name": user.name,
-                    "email": contact_info.email if contact_info else "",
-                    "phone": contact_info.phone if contact_info else ""
-                },
-                "amount_paid": transaction.amount
-            }
-        }
+        #booking_details = {
+         #   "success": True,
+          #  "booking": {
+           #     "booking_id": f"BK-{booking.id}",  
+            #    "date": transaction.booked_date.strftime("%Y-%m-%d"),
+             #   "time_slot": {
+              #      "start_time": slot.start_time.strftime("%H:%M"),
+               #     "end_time": slot.end_time.strftime("%H:%M")
+                #},
+                #"system": console.model_number if console else "Unknown System",
+              #  "game_id": booking.game_id,
+               # "customer": {
+                #    "name": user.name,
+                 #   "email": contact_info.email if contact_info else "",
+                 #   "phone": contact_info.phone if contact_info else ""
+                #},
+                #"amount_paid": transaction.amount
+            #}
+        #}
 
-        return jsonify(booking_details), 200
+        #return jsonify(booking_details), 200
 
-    except Exception as e:
-        return jsonify({"message": f"Error fetching booking details: {str(e)}"}), 500
+   # except Exception as e:
+    #    return jsonify({"message": f"Error fetching booking details: {str(e)}"}), 500
 
 @booking_blueprint.route('/update_booking/<int:booking_id>', methods=['PUT'])
 def update_booking(booking_id):
