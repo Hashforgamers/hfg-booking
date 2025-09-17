@@ -35,3 +35,13 @@ def register_socketio_events(socket: SocketIO):
             current_app.logger.info(f"Vendor {vendor_id} joined their room")
         else:
             current_app.logger.warning("connect_vendor called without vendor_id")
+
+    @socketio.on("connect_admin")
+    def handle_vendor_connect(data):
+        """
+        Vendor joins their own room based on vendor_id.
+        Example client emit:
+            socket.emit("connect_vendor", { vendor_id: 123 });
+        """
+        join_room(f"dashboard_admin")
+        current_app.logger.warning("connect_admin called")
