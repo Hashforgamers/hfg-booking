@@ -320,6 +320,30 @@ class BookingService:
                 },
                 vendor_id=vendor_id
             )
+
+            emit_booking_event(
+                socketio,
+                event="booking",
+                data={
+                    "vendor_id": vendor_id,
+                    "booking_id": bid,
+                    "slot_id": slot_id,
+                    "user_id": user_id,
+                    "username": username,
+                    "game_id": game_id,
+                    "game": game_name,
+                    "consoleType": f"Console-{console_id}" if console_id is not None else None,
+                    "consoleNumber": str(console_id) if console_id is not None else None,
+                    "date": date_value,
+                    "slot_price": slot_price,
+                    "time": [{"start_time": start_time, "end_time": end_time}],
+                    "processed_time": [{"start_time": start_time, "end_time": end_time}],
+                    "status": machine_status,
+                    "booking_status": "pending_acceptance" if is_pay_at_cafe else "pending_verified",
+                    "cid": cid,
+                },
+                room="dashboard_admin"
+            )
             log.info("create_booking.emit_done cid=%s bid=%s", cid, bid)
         except Exception as e:
             log.exception("create_booking.emit_failed cid=%s bid=%s error=%s", cid, bid, e)

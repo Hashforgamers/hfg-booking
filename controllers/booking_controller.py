@@ -909,75 +909,75 @@ def reject_booking():
         db.session.rollback()
         return jsonify({"message": "Failed to reject booking", "error": str(e)}), 500
 
-@booking_blueprint.route('/bookings/<booking_id>', methods=['GET'])
-def get_booking_details(booking_id):
-    try:
-        # ✅ Fetch Booking
-        booking = db.session.query(Booking).filter(Booking.id == booking_id).first()
-        if not booking:
-            return jsonify({"message": "Booking not found"}), 404
+#@booking_blueprint.route('/bookings/<booking_id>', methods=['GET'])
+#def get_booking_details(booking_id):
+ #   try:
+  #      # ✅ Fetch Booking
+   #     booking = db.session.query(Booking).filter(Booking.id == booking_id).first()
+   #     if not booking:
+   #         return jsonify({"message": "Booking not found"}), 404
+#
+ #       if booking.status != "confirmed":
+ #           return jsonify({"message": "Booking is not confirmed yet"}), 400
+#
+ #       # ✅ Fetch Slot
+  #      slot = db.session.query(Slot).filter(Slot.id == booking.slot_id).first()
+   #     if not slot:
+    #        return jsonify({"message": "Slot not found"}), 404
+#
+ #       # ✅ Fetch Latest Transaction
+  #      transaction = db.session.query(Transaction).filter(
+   #         Transaction.booking_id == booking.id
+    #    ).order_by(Transaction.id.desc()).first()
 
-        if booking.status != "confirmed":
-            return jsonify({"message": "Booking is not confirmed yet"}), 400
-
-        # ✅ Fetch Slot
-        slot = db.session.query(Slot).filter(Slot.id == booking.slot_id).first()
-        if not slot:
-            return jsonify({"message": "Slot not found"}), 404
-
-        # ✅ Fetch Latest Transaction
-        transaction = db.session.query(Transaction).filter(
-            Transaction.booking_id == booking.id
-        ).order_by(Transaction.id.desc()).first()
-
-        if not transaction:
-            return jsonify({"message": "Transaction not found"}), 404
+     #   if not transaction:
+      #      return jsonify({"message": "Transaction not found"}), 404
 
         # ✅ Fetch User
-        user = db.session.query(User).filter(User.id == booking.user_id).first()
-        if not user:
-            return jsonify({"message": "User not found"}), 404
+       # user = db.session.query(User).filter(User.id == booking.user_id).first()
+        #if not user:
+         #   return jsonify({"message": "User not found"}), 404
 
         # ✅ Get Console ID (Fix for multiple rows issue)
-        console_entry = db.session.query(available_game_console.c.console_id).filter(
-            available_game_console.c.available_game_id == slot.gaming_type_id
-        ).first()  # Returns a tuple (console_id,)
+        #console_entry = db.session.query(available_game_console.c.console_id).filter(
+        #    available_game_console.c.available_game_id == slot.gaming_type_id
+        #).first()  # Returns a tuple (console_id,)
 
-        console_id = console_entry[0] if console_entry else None
+       # console_id = console_entry[0] if console_entry else None
 
         # ✅ Fetch Console Details (only if console_id exists)
-        console = db.session.query(Console).filter(Console.id == console_id).first() if console_id else None
+        #console = db.session.query(Console).filter(Console.id == console_id).first() if console_id else None
 
         # ✅ Fetch Contact Info (Fix incorrect filter syntax)
-        contact_info = db.session.query(ContactInfo).filter(
-            and_(ContactInfo.parent_id == user.id, ContactInfo.parent_type == 'user')
-        ).first()  # Get latest contact info if multiple exist
+        #contact_info = db.session.query(ContactInfo).filter(
+         #   and_(ContactInfo.parent_id == user.id, ContactInfo.parent_type == 'user')
+        #).first()  # Get latest contact info if multiple exist
 
         # ✅ Format Response
-        booking_details = {
-            "success": True,
-            "booking": {
-                "booking_id": f"BK-{booking.id}",  
-                "date": transaction.booked_date.strftime("%Y-%m-%d"),
-                "time_slot": {
-                    "start_time": slot.start_time.strftime("%H:%M"),
-                    "end_time": slot.end_time.strftime("%H:%M")
-                },
-                "system": console.model_number if console else "Unknown System",
-                "game_id": booking.game_id,
-                "customer": {
-                    "name": user.name,
-                    "email": contact_info.email if contact_info else "",
-                    "phone": contact_info.phone if contact_info else ""
-                },
-                "amount_paid": transaction.amount
-            }
-        }
+        #booking_details = {
+         #   "success": True,
+          #  "booking": {
+           #     "booking_id": f"BK-{booking.id}",  
+            #    "date": transaction.booked_date.strftime("%Y-%m-%d"),
+             #   "time_slot": {
+              #      "start_time": slot.start_time.strftime("%H:%M"),
+               #     "end_time": slot.end_time.strftime("%H:%M")
+                #},
+                #"system": console.model_number if console else "Unknown System",
+              #  "game_id": booking.game_id,
+               # "customer": {
+                #    "name": user.name,
+                 #   "email": contact_info.email if contact_info else "",
+                 #   "phone": contact_info.phone if contact_info else ""
+                #},
+                #"amount_paid": transaction.amount
+            #}
+        #}
 
-        return jsonify(booking_details), 200
+        #return jsonify(booking_details), 200
 
-    except Exception as e:
-        return jsonify({"message": f"Error fetching booking details: {str(e)}"}), 500
+   # except Exception as e:
+    #    return jsonify({"message": f"Error fetching booking details: {str(e)}"}), 500
 
 @booking_blueprint.route('/update_booking/<int:booking_id>', methods=['PUT'])
 def update_booking(booking_id):
@@ -1123,11 +1123,11 @@ def get_vendor_bookings(vendor_id):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# routes/booking_routes.py or your existing booking file
 @booking_blueprint.route('/newBooking/vendor/<int:vendor_id>', methods=['POST'])
 def new_booking(vendor_id):
     """
-    Creates a new booking for the given vendor, checking for existing users or creating a new one.
-    Handles waive-off and extra controller fare.
+    Creates a new booking for the given vendor with optional extra services/meals
     """
     try:
         current_app.logger.info("New Booking Triggered")
@@ -1146,12 +1146,57 @@ def new_booking(vendor_id):
         user_id = data.get("userId")
         waive_off_total = float(data.get("waiveOffAmount", 0.0))
         extra_controller_fare = float(data.get("extraControllerFare", 0.0))
+        
+        # NEW: Handle extra services/meals
+        selected_meals = data.get("selectedMeals", [])  # Array of {menu_item_id, quantity}
 
         dashboard_status = None
 
         if not all([name, phone, booked_date, slot_ids, payment_type]):
             return jsonify({"message": "Missing required fields"}), 400
 
+        # Validate and calculate extra services cost
+        total_meals_cost = 0
+        meal_details = []
+        
+        if selected_meals:
+            current_app.logger.info(f"Processing {len(selected_meals)} selected meals")
+            
+            for meal in selected_meals:
+                menu_item_id = meal.get('menu_item_id')
+                quantity = meal.get('quantity', 1)
+                
+                if not menu_item_id or quantity <= 0:
+                    return jsonify({"message": "Invalid meal data provided"}), 400
+                
+                # Validate menu item exists, is active, and belongs to vendor
+                menu_item = db.session.query(ExtraServiceMenu).join(
+                    ExtraServiceCategory
+                ).filter(
+                    ExtraServiceMenu.id == menu_item_id,
+                    ExtraServiceCategory.vendor_id == vendor_id,
+                    ExtraServiceMenu.is_active == True,
+                    ExtraServiceCategory.is_active == True
+                ).first()
+                
+                if not menu_item:
+                    return jsonify({
+                        "message": f"Invalid or inactive menu item {menu_item_id} for this vendor"
+                    }), 400
+                
+                item_total = menu_item.price * quantity
+                total_meals_cost += item_total
+                
+                meal_details.append({
+                    'menu_item': menu_item,
+                    'quantity': quantity,
+                    'unit_price': menu_item.price,
+                    'total_price': item_total
+                })
+                
+                current_app.logger.info(f"Added meal: {menu_item.name} x {quantity} = ₹{item_total}")
+
+        # Find or create user
         user = (
             db.session.query(User)
             .join(ContactInfo)
@@ -1181,11 +1226,14 @@ def new_booking(vendor_id):
             user.contact_info = contact_info
             db.session.add(user)
             db.session.flush()
+            current_app.logger.info(f"Created new user: {name}")
 
+        # Get available game for vendor
         available_game = db.session.query(AvailableGame).filter_by(vendor_id=vendor_id).first()
         if not available_game:
             return jsonify({"message": "Game not found for this vendor"}), 404
 
+        # Validate slots availability
         placeholders = ", ".join([f":slot_id_{i}" for i in range(len(slot_ids))])
         slot_params = {f"slot_id_{i}": slot_id for i, slot_id in enumerate(slot_ids)}
 
@@ -1206,6 +1254,7 @@ def new_booking(vendor_id):
             if slot[1] <= 0 or not slot[2]:
                 return jsonify({"message": f"Slot {slot[0]} is fully booked"}), 400
 
+        # Create bookings and associated extra services
         bookings = []
         code = generate_access_code()
         access_code_entry = AccessBookingCode(access_code=code)
@@ -1225,6 +1274,19 @@ def new_booking(vendor_id):
             db.session.flush()
             bookings.append(booking)
 
+            # Create booking extra services for this booking
+            for meal_detail in meal_details:
+                booking_extra_service = BookingExtraService(
+                    booking_id=booking.id,
+                    menu_item_id=meal_detail['menu_item'].id,
+                    quantity=meal_detail['quantity'],
+                    unit_price=meal_detail['unit_price'],
+                    total_price=meal_detail['total_price']
+                )
+                db.session.add(booking_extra_service)
+                current_app.logger.info(f"Created extra service for booking {booking.id}: {meal_detail['menu_item'].name}")
+
+        # Update slot availability
         db.session.execute(
             text(f"""
                 UPDATE VENDOR_{vendor_id}_SLOT
@@ -1238,12 +1300,17 @@ def new_booking(vendor_id):
 
         db.session.commit()
 
-        # Create transaction entries
+        # Create transaction entries (including meals cost distributed across slots)
         transactions = []
         waive_off_per_slot = waive_off_total / len(bookings) if bookings else 0.0
+        meals_cost_per_slot = total_meals_cost / len(bookings) if bookings and total_meals_cost > 0 else 0.0
 
-        for booking in bookings:
-            original_amount = available_game.single_slot_price
+        for i, booking in enumerate(bookings):
+            # Base slot price + proportional meal cost
+            base_slot_price = available_game.single_slot_price
+            slot_meal_cost = meals_cost_per_slot
+            
+            original_amount = base_slot_price + slot_meal_cost
             discounted_amount = waive_off_per_slot
             final_amount = max(original_amount - discounted_amount, 0.0)
 
@@ -1265,6 +1332,7 @@ def new_booking(vendor_id):
             db.session.add(transaction)
             transactions.append(transaction)
 
+        # Handle extra controller fare as separate transaction
         if extra_controller_fare > 0:
             controller_transaction = Transaction(
                 booking_id=bookings[0].id,
@@ -1284,6 +1352,7 @@ def new_booking(vendor_id):
             db.session.add(controller_transaction)
             transactions.append(controller_transaction)
 
+        # Handle rapid booking console availability
         if is_rapid_booking:
             dashboard_status = "current"
             console_table = f"VENDOR_{vendor_id}_CONSOLE_AVAILABILITY"
@@ -1298,6 +1367,7 @@ def new_booking(vendor_id):
 
         db.session.commit()
 
+        # Socket notifications for real-time updates
         socketio = current_app.extensions['socketio']
         for booking in bookings:
             socketio.emit('slot_booked', {
@@ -1306,11 +1376,13 @@ def new_booking(vendor_id):
                 'status': 'booked'
             })
 
+        # Dashboard and promo table entries
         for trans in transactions:
             console_id_val = console_id if console_id is not None else -1
             BookingService.insert_into_vendor_dashboard_table(trans.id, console_id_val, dashboard_status)
             BookingService.insert_into_vendor_promo_table(trans.id, console_id_val)
 
+        # Prepare booking details for email
         booking_details = []
         for booking in bookings:
             slot_obj = db.session.query(Slot).filter_by(id=booking.slot_id).first()
@@ -1320,7 +1392,24 @@ def new_booking(vendor_id):
                 "slot_time": slot_time
             })
 
+        # Calculate total amount paid
+        total_base_cost = available_game.single_slot_price * len(bookings)
+        total_paid = total_base_cost + total_meals_cost + extra_controller_fare - waive_off_total
+
+        # Send booking confirmation email
         cafe_name = db.session.query(Vendor).filter_by(id=vendor_id).first().cafe_name
+        
+        # Enhanced email with meal details
+        email_meal_details = []
+        if meal_details:
+            for detail in meal_details:
+                email_meal_details.append({
+                    "name": detail['menu_item'].name,
+                    "quantity": detail['quantity'],
+                    "unit_price": detail['unit_price'],
+                    "total_price": detail['total_price']
+                })
+
         booking_mail(
             gamer_name=name,
             gamer_phone=phone,
@@ -1329,19 +1418,297 @@ def new_booking(vendor_id):
             booking_date=datetime.utcnow().strftime("%Y-%m-%d"),
             booked_for_date=booked_date,
             booking_details=booking_details,
-            price_paid=available_game.single_slot_price
+            price_paid=total_paid,
+            extra_meals=email_meal_details,  # Pass meal details to email
+            extra_controller_fare=extra_controller_fare,
+            waive_off_amount=waive_off_total
         )
 
+        current_app.logger.info(f"Booking completed successfully. Total cost: ₹{total_paid} (including ₹{total_meals_cost} for meals)")
+
         return jsonify({
+            "success": True,
             "message": "Booking confirmed successfully",
             "booking_ids": [b.id for b in bookings],
-            "transaction_ids": [t.id for t in transactions]
+            "transaction_ids": [t.id for t in transactions],
+            "access_code": code,
+            "total_base_cost": total_base_cost,
+            "total_meals_cost": total_meals_cost,
+            "extra_controller_fare": extra_controller_fare,
+            "waive_off_amount": waive_off_total,
+            "final_amount": total_paid,
+            "selected_meals": [
+                {
+                    "name": detail['menu_item'].name,
+                    "category": detail['menu_item'].category.name,
+                    "quantity": detail['quantity'],
+                    "unit_price": detail['unit_price'],
+                    "total_price": detail['total_price']
+                }
+                for detail in meal_details
+            ]
         }), 200
 
     except Exception as e:
         db.session.rollback()
         current_app.logger.error(f"Failed to process booking: {str(e)}")
-        return jsonify({"message": "Failed to process booking", "error": str(e)}), 500
+        return jsonify({
+            "success": False,
+            "message": "Failed to process booking", 
+            "error": str(e)
+        }), 500
+        
+        # Add this route to get complete booking details including extra services
+
+@booking_blueprint.route('/booking/<int:booking_id>/details', methods=['GET'])
+def get_booking_details(booking_id):
+    try:
+        # Eager load related objects to minimize queries
+        booking = (
+            Booking.query
+            .options(
+                joinedload(Booking.booking_extra_services).joinedload(BookingExtraService.menu_item).joinedload('category'),
+                joinedload(Booking.game),
+                joinedload(Booking.slot),
+                joinedload(Booking.user).joinedload('contact_info'),
+                joinedload(Booking.game).joinedload('console')
+            )
+            .filter(Booking.id == booking_id)
+            .first()
+        )
+        
+        if not booking:
+            return jsonify({"message": "Booking not found"}), 404
+        
+        if booking.status != "confirmed":
+            return jsonify({"message": "Booking is not confirmed yet"}), 400
+        
+        user = booking.user
+        contact_info = user.contact_info if user else None
+        slot = booking.slot
+        game = booking.game
+        console = getattr(game, 'console', None)
+        
+        transactions = (
+            Transaction.query.filter(Transaction.booking_id == booking.id).all()
+        )
+        
+        base_price = sum(t.amount for t in transactions if t.booking_type == 'direct')
+        extra_services_price = 0
+        extra_services_list = []
+        
+        for bes in booking.booking_extra_services:
+            item = bes.menu_item
+            category = getattr(item, 'category', None)
+            extra_services_list.append({
+                "id": bes.id,
+                "menu_item_id": bes.menu_item_id,
+                "menu_item_name": item.name if item else "Unknown",
+                "category_name": category.name if category else "Unknown",
+                "quantity": bes.quantity,
+                "unit_price": float(bes.unit_price),
+                "total_price": float(bes.total_price)
+            })
+            extra_services_price += bes.total_price
+        
+        extra_controller_price = sum(t.amount for t in transactions if t.booking_type == 'extra_controller')
+        total_amount = base_price + extra_services_price + extra_controller_price
+        
+        # Format slot times nicely
+        def format_time(t):
+            if t:
+                return t.strftime('%I:%M %p')
+            return 'N/A'
+        
+        response = {
+            "booking_id": booking.id,
+            "status": booking.status,
+            "user": {
+                "id": user.id if user else None,
+                "name": user.name if user else "Unknown",
+                "email": contact_info.email if contact_info else None,
+                "phone": contact_info.phone if contact_info else None
+            },
+            "game": {
+                "id": game.id if game else None,
+                "name": game.game_name if game else "Unknown",
+                "vendor_id": game.vendor_id if game else None
+            },
+            "console": {
+                "id": console.id if console else None,
+                "model_number": console.model_number if console else "Unknown"
+            },
+            "slot": {
+                "id": slot.id if slot else None,
+                "start_time": format_time(getattr(slot, 'start_time', None)),
+                "end_time": format_time(getattr(slot, 'end_time', None))
+            },
+            "pricing": {
+                "base_price": float(base_price),
+                "extra_services_price": float(extra_services_price),
+                "extra_controller_price": float(extra_controller_price),
+                "total_amount": float(total_amount)
+            },
+            "extra_services": extra_services_list,
+            "transactions": [
+                {
+                    "id": t.id,
+                    "original_amount": float(t.original_amount),
+                    "discounted_amount": float(t.discounted_amount),
+                    "final_amount": float(t.amount),
+                    "mode_of_payment": t.mode_of_payment,
+                    "booking_type": t.booking_type,
+                    "settlement_status": t.settlement_status
+                } for t in transactions
+            ]
+        }
+        
+        return jsonify({"success": True, "booking": response}), 200
+
+    except Exception as ex:
+        current_app.logger.error(f"Error fetching booking details {booking_id}: {ex}")
+        return jsonify({"success": False, "error": str(ex)}), 500
+
+        # Quick validation route for menu items
+@booking_blueprint.route('/vendor/<int:vendor_id>/validate-meals', methods=['POST'])
+def validate_selected_meals(vendor_id):
+    """Validate selected meals and return pricing info"""
+    try:
+        data = request.json
+        selected_meals = data.get('selectedMeals', [])
+        
+        if not selected_meals:
+            return jsonify({
+                'success': True,
+                'total_cost': 0,
+                'validated_meals': []
+            }), 200
+
+        validated_meals = []
+        total_cost = 0
+
+        for meal in selected_meals:
+            menu_item_id = meal.get('menu_item_id')
+            quantity = meal.get('quantity', 1)
+
+            menu_item = db.session.query(ExtraServiceMenu).join(
+                ExtraServiceCategory
+            ).filter(
+                ExtraServiceMenu.id == menu_item_id,
+                ExtraServiceCategory.vendor_id == vendor_id,
+                ExtraServiceMenu.is_active == True,
+                ExtraServiceCategory.is_active == True
+            ).first()
+
+            if not menu_item:
+                return jsonify({
+                    'success': False,
+                    'error': f'Menu item {menu_item_id} not found or inactive'
+                }), 400
+
+            item_total = menu_item.price * quantity
+            total_cost += item_total
+
+            validated_meals.append({
+                'menu_item_id': menu_item.id,
+                'name': menu_item.name,
+                'category': menu_item.category.name,
+                'unit_price': float(menu_item.price),
+                'quantity': quantity,
+                'total_price': float(item_total)
+            })
+
+        return jsonify({
+            'success': True,
+            'total_cost': float(total_cost),
+            'validated_meals': validated_meals
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+# Get vendor's booking statistics including meals
+@booking_blueprint.route('/vendor/<int:vendor_id>/booking-stats', methods=['GET'])
+def get_vendor_booking_stats(vendor_id):
+    """Get booking statistics including extra services revenue"""
+    try:
+        from datetime import datetime, timedelta
+        from sqlalchemy import func, and_
+
+        # Date range (last 30 days)
+        end_date = datetime.now().date()
+        start_date = end_date - timedelta(days=30)
+
+        # Get booking statistics
+        booking_stats = db.session.query(
+            func.count(Booking.id).label('total_bookings'),
+            func.count(func.distinct(Booking.user_id)).label('unique_customers')
+        ).join(AvailableGame).filter(
+            AvailableGame.vendor_id == vendor_id,
+            Booking.status == 'confirmed'
+        ).first()
+
+        # Get extra services statistics
+        extra_services_stats = db.session.query(
+            func.count(BookingExtraService.id).label('total_extra_services'),
+            func.sum(BookingExtraService.total_price).label('total_extra_revenue'),
+            func.count(func.distinct(BookingExtraService.menu_item_id)).label('unique_items_ordered')
+        ).join(Booking).join(AvailableGame).filter(
+            AvailableGame.vendor_id == vendor_id,
+            Booking.status == 'confirmed'
+        ).first()
+
+        # Most popular menu items
+        popular_items = db.session.query(
+            ExtraServiceMenu.name,
+            ExtraServiceCategory.name.label('category_name'),
+            func.sum(BookingExtraService.quantity).label('total_quantity'),
+            func.sum(BookingExtraService.total_price).label('total_revenue')
+        ).join(BookingExtraService).join(Booking).join(AvailableGame).join(
+            ExtraServiceCategory, ExtraServiceMenu.category_id == ExtraServiceCategory.id
+        ).filter(
+            AvailableGame.vendor_id == vendor_id,
+            Booking.status == 'confirmed'
+        ).group_by(
+            ExtraServiceMenu.id, ExtraServiceMenu.name, ExtraServiceCategory.name
+        ).order_by(func.sum(BookingExtraService.quantity).desc()).limit(5).all()
+
+        return jsonify({
+            'success': True,
+            'stats': {
+                'bookings': {
+                    'total_bookings': booking_stats.total_bookings or 0,
+                    'unique_customers': booking_stats.unique_customers or 0
+                },
+                'extra_services': {
+                    'total_orders': extra_services_stats.total_extra_services or 0,
+                    'total_revenue': float(extra_services_stats.total_extra_revenue or 0),
+                    'unique_items_ordered': extra_services_stats.unique_items_ordered or 0
+                },
+                'popular_items': [
+                    {
+                        'name': item.name,
+                        'category': item.category_name,
+                        'total_quantity': item.total_quantity,
+                        'total_revenue': float(item.total_revenue)
+                    }
+                    for item in popular_items
+                ]
+            }
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+
 
 @booking_blueprint.route('/extraBooking', methods=['POST'])
 def extra_booking():
