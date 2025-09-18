@@ -1148,7 +1148,7 @@ def new_booking(vendor_id):
         extra_controller_fare = float(data.get("extraControllerFare", 0.0))
         
         # NEW: Handle extra services/meals
-        selected_meals = data.get("selectedMeals", [])  # Array of {menu_item_id, quantity}
+        selected_meals = data.get("selectedMeals", [])
 
         # ✅ CRITICAL FIX: Log received console type
         current_app.logger.info(f"📋 RECEIVED CONSOLE TYPE: {console_type}")
@@ -1162,17 +1162,14 @@ def new_booking(vendor_id):
         if not console_type:
             return jsonify({"message": "Console type is required"}), 400
 
-        # ✅ ENHANCED: Get all available games for vendor first to see what attributes exist
+        # ✅ ENHANCED: Get all available games for vendor first to see what we have
         all_games = db.session.query(AvailableGame).filter_by(vendor_id=vendor_id).all()
         
         current_app.logger.info(f"🔍 Available games for vendor {vendor_id}:")
         for game in all_games:
-            # Log all available attributes to see what we can match on
-            game_attrs = {attr: getattr(game, attr) for attr in dir(game) 
-                         if not attr.startswith('_') and not callable(getattr(game, attr))}
-            current_app.logger.info(f"  Game ID {game.id}: {game_attrs}")
+            current_app.logger.info(f"  Game ID {game.id}: name='{game.game_name}', price={game.single_slot_price}")
 
-        # ✅ STRATEGY 1: Try to match by ID if consoleId is provided
+        # ✅ STRATEGY 1: Try to match by console_id if provided (from frontend)
         available_game = None
         
         if console_id:
@@ -1181,98 +1178,126 @@ def new_booking(vendor_id):
                 vendor_id=vendor_id, 
                 id=console_id
             ).first()
-        
-        # ✅ STRATEGY 2: Try to match by console type name (try different possible attribute names)
+            if available_game:
+                current_app.logger.info(f"✅ Found game by ID: {available_game.game_name}")
+
+        # ✅ STRATEGY 2: Try to match by console type using game_name
         if not available_game:
             current_app.logger.info(f"🔍 Trying to find game by console type: {console_type}")
             console_type_lower = console_type.lower()
             
-            # Try different possible attribute names that might contain console info
-            possible_attributes = ['name', 'game_name', 'console_type', 'type', 'console_name', 'title']
-            
-            for attr in possible_attributes:
-                if hasattr(AvailableGame, attr):
-                    current_app.logger.info(f"  Checking attribute: {attr}")
+            try:
+                if console_type_lower == 'pc':
+                    # Try different PC variations
+                    available_game = db.session.query(AvailableGame).filter(
+                        AvailableGame.vendor_id == vendor_id,
+                        AvailableGame.game_name.ilike('%pc%')
+                    ).first()
                     
-                    if console_type_lower == 'pc':
+                    if not available_game:
                         available_game = db.session.query(AvailableGame).filter(
                             AvailableGame.vendor_id == vendor_id,
-                            or_(
-                                getattr(AvailableGame, attr).ilike('%pc%'),
-                                getattr(AvailableGame, attr).ilike('%gaming%'),
-                                getattr(AvailableGame, attr).ilike('%computer%')
-                            )
+                            AvailableGame.game_name.ilike('%gaming%')
                         ).first()
-                    elif console_type_lower == 'ps5':
+                        
+                    if not available_game:
                         available_game = db.session.query(AvailableGame).filter(
                             AvailableGame.vendor_id == vendor_id,
-                            or_(
-                                getattr(AvailableGame, attr).ilike('%ps5%'),
-                                getattr(AvailableGame, attr).ilike('%playstation%'),
-                                getattr(AvailableGame, attr).ilike('%sony%')
-                            )
+                            AvailableGame.game_name.ilike('%computer%')
                         ).first()
-                    elif console_type_lower == 'xbox':
-                        available_game = db.session.query(AvailableGame).filter(
-                            AvailableGame.vendor_id == vendor_id,
-                            or_(
-                                getattr(AvailableGame, attr).ilike('%xbox%'),
-                                getattr(AvailableGame, attr).ilike('%microsoft%'),
-                                getattr(AvailableGame, attr).ilike('%series%')
-                            )
-                        ).first()
-                    elif console_type_lower == 'vr':
-                        available_game = db.session.query(AvailableGame).filter(
-                            AvailableGame.vendor_id == vendor_id,
-                            or_(
-                                getattr(AvailableGame, attr).ilike('%vr%'),
-                                getattr(AvailableGame, attr).ilike('%virtual%'),
-                                getattr(AvailableGame, attr).ilike('%reality%'),
-                                getattr(AvailableGame, attr).ilike('%oculus%'),
-                                getattr(AvailableGame, attr).ilike('%meta%')
-                            )
-                        ).first()
+                        
+                elif console_type_lower == 'ps5':
+                    # Try different PS5 variations
+                    available_game = db.session.query(AvailableGame).filter(
+                        AvailableGame.vendor_id == vendor_id,
+                        AvailableGame.game_name.ilike('%ps5%')
+                    ).first()
                     
-                    if available_game:
-                        current_app.logger.info(f"✅ Found match using attribute '{attr}': {getattr(available_game, attr)}")
-                        break
+                    if not available_game:
+                        available_game = db.session.query(AvailableGame).filter(
+                            AvailableGame.vendor_id == vendor_id,
+                            AvailableGame.game_name.ilike('%playstation%')
+                        ).first()
+                        
+                    if not available_game:
+                        available_game = db.session.query(AvailableGame).filter(
+                            AvailableGame.vendor_id == vendor_id,
+                            AvailableGame.game_name.ilike('%sony%')
+                        ).first()
+                        
+                elif console_type_lower == 'xbox':
+                    # Try different Xbox variations
+                    available_game = db.session.query(AvailableGame).filter(
+                        AvailableGame.vendor_id == vendor_id,
+                        AvailableGame.game_name.ilike('%xbox%')
+                    ).first()
+                    
+                    if not available_game:
+                        available_game = db.session.query(AvailableGame).filter(
+                            AvailableGame.vendor_id == vendor_id,
+                            AvailableGame.game_name.ilike('%microsoft%')
+                        ).first()
+                        
+                elif console_type_lower == 'vr':
+                    # Try different VR variations
+                    available_game = db.session.query(AvailableGame).filter(
+                        AvailableGame.vendor_id == vendor_id,
+                        AvailableGame.game_name.ilike('%vr%')
+                    ).first()
+                    
+                    if not available_game:
+                        available_game = db.session.query(AvailableGame).filter(
+                            AvailableGame.vendor_id == vendor_id,
+                            AvailableGame.game_name.ilike('%virtual%')
+                        ).first()
+                        
+                    if not available_game:
+                        available_game = db.session.query(AvailableGame).filter(
+                            AvailableGame.vendor_id == vendor_id,
+                            AvailableGame.game_name.ilike('%reality%')
+                        ).first()
+                
+                if available_game:
+                    current_app.logger.info(f"✅ Found match by pattern: {available_game.game_name}")
+                    
+            except Exception as e:
+                current_app.logger.warning(f"Error in pattern matching: {str(e)}")
 
-        # ✅ STRATEGY 3: Manual mapping based on console type (if we know the pattern)
+        # ✅ STRATEGY 3: Manual ID mapping (customize based on your actual game IDs)
         if not available_game:
             current_app.logger.info(f"🔍 Using manual console type mapping")
             
-            # You might need to adjust these mappings based on your actual data
-            console_type_mapping = {
-                'PC': 1,    # Adjust these IDs based on your actual database
-                'PS5': 2,
-                'Xbox': 3,
-                'VR': 4
+            # 🎯 IMPORTANT: Update these mappings based on the logged game IDs above
+            # Check your backend logs to see the actual game IDs and names for your vendor
+            console_type_id_mapping = {
+                'PC': None,    # Example: 'PC': 1 (set to actual PC game ID)
+                'PS5': None,   # Example: 'PS5': 2 (set to actual PS5 game ID)  
+                'Xbox': None,  # Example: 'Xbox': 3 (set to actual Xbox game ID)
+                'VR': None     # Example: 'VR': 4 (set to actual VR game ID)
             }
             
-            mapped_id = console_type_mapping.get(console_type)
+            mapped_id = console_type_id_mapping.get(console_type)
             if mapped_id:
                 available_game = db.session.query(AvailableGame).filter_by(
                     vendor_id=vendor_id,
                     id=mapped_id
                 ).first()
+                if available_game:
+                    current_app.logger.info(f"✅ Found match by manual mapping: ID {mapped_id} -> {available_game.game_name}")
 
-        # ✅ STRATEGY 4: Fallback to first available game (original behavior)
+        # ✅ STRATEGY 4: Fallback to first available game (original behavior)  
         if not available_game:
             current_app.logger.warning(f"⚠️ No specific match found, using first available game for vendor {vendor_id}")
             available_game = db.session.query(AvailableGame).filter_by(vendor_id=vendor_id).first()
+            if available_game:
+                current_app.logger.info(f"⚠️ Using fallback game: {available_game.game_name}")
 
         if not available_game:
             current_app.logger.error(f"❌ No games found for vendor {vendor_id}")
             return jsonify({"message": "Game not found for this vendor"}), 404
 
-        # ✅ LOG the selected game for debugging (safely get attributes)
-        game_name = "Unknown"
-        for attr in ['name', 'game_name', 'console_name', 'title']:
-            if hasattr(available_game, attr):
-                game_name = getattr(available_game, attr)
-                break
-
-        current_app.logger.info(f"🎮 SELECTED GAME: ID={available_game.id}, Name={game_name}, Requested_Type={console_type}")
+        # ✅ LOG the final selected game
+        current_app.logger.info(f"🎮 FINAL SELECTED GAME: ID={available_game.id}, Name='{available_game.game_name}', Price={available_game.single_slot_price}, Requested_Type={console_type}")
 
         # Validate and calculate extra services cost
         total_meals_cost = 0
@@ -1372,17 +1397,17 @@ def new_booking(vendor_id):
         for slot_id in slot_ids:
             slot_obj = db.session.query(Slot).filter_by(id=slot_id).first()
             
-            # ✅ CRITICAL FIX: Use the correct game_id based on console type
+            # ✅ CRITICAL FIX: Use the correct game_id based on console type matching
             booking = Booking(
                 slot_id=slot_id,
-                game_id=available_game.id,  # ✅ Now uses the correct game based on console type matching
+                game_id=available_game.id,  # ✅ Now uses the matched game ID
                 user_id=user.id,
                 status="confirmed",
                 access_code_id=access_code_entry.id
             )
             
             # ✅ LOG each booking creation
-            current_app.logger.info(f"📝 CREATING BOOKING: slot_id={slot_id}, game_id={available_game.id}, requested_console_type={console_type}")
+            current_app.logger.info(f"📝 CREATING BOOKING: slot_id={slot_id}, game_id={available_game.id}, game_name='{available_game.game_name}', requested_console_type={console_type}")
             
             db.session.add(booking)
             db.session.flush()
@@ -1533,13 +1558,13 @@ def new_booking(vendor_id):
             booked_for_date=booked_date,
             booking_details=booking_details,
             price_paid=total_paid,
-            extra_meals=email_meal_details,  # Pass meal details to email
+            extra_meals=email_meal_details,
             extra_controller_fare=extra_controller_fare,
             waive_off_amount=waive_off_total
         )
 
-        # ✅ ENHANCED SUCCESS LOG with safe attribute access
-        current_app.logger.info(f"✅ BOOKING SUCCESS: requested_console_type={console_type}, game_id={available_game.id}, game_name={game_name}, total_cost=₹{total_paid}")
+        # ✅ ENHANCED SUCCESS LOG
+        current_app.logger.info(f"✅ BOOKING SUCCESS: requested_console_type={console_type}, matched_game_id={available_game.id}, matched_game_name='{available_game.game_name}', total_cost=₹{total_paid}")
 
         return jsonify({
             "success": True,
@@ -1547,9 +1572,9 @@ def new_booking(vendor_id):
             "booking_ids": [b.id for b in bookings],
             "transaction_ids": [t.id for t in transactions],
             "access_code": code,
-            "requested_console_type": console_type,  # ✅ What was requested
-            "matched_game_id": available_game.id,     # ✅ What game ID was used
-            "matched_game_name": game_name,           # ✅ What game name was matched
+            "requested_console_type": console_type,           # What was requested from frontend
+            "matched_game_id": available_game.id,             # What game ID was actually used
+            "matched_game_name": available_game.game_name,    # What game name was matched
             "total_base_cost": total_base_cost,
             "total_meals_cost": total_meals_cost,
             "extra_controller_fare": extra_controller_fare,
@@ -1578,6 +1603,7 @@ def new_booking(vendor_id):
             "message": "Failed to process booking", 
             "error": str(e)
         }), 500
+
 
 
         
