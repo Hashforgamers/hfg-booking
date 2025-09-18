@@ -1150,10 +1150,81 @@ def new_booking(vendor_id):
         # NEW: Handle extra services/meals
         selected_meals = data.get("selectedMeals", [])  # Array of {menu_item_id, quantity}
 
+        # ✅ CRITICAL FIX: Log received console type
+        current_app.logger.info(f"📋 RECEIVED CONSOLE TYPE: {console_type}")
+
         dashboard_status = None
 
         if not all([name, phone, booked_date, slot_ids, payment_type]):
             return jsonify({"message": "Missing required fields"}), 400
+
+        # ✅ CRITICAL FIX: Validate and get the correct game based on console type
+        if not console_type:
+            return jsonify({"message": "Console type is required"}), 400
+
+        # Find the specific game/console based on console type for this vendor
+        available_game = db.session.query(AvailableGame).filter(
+            AvailableGame.vendor_id == vendor_id,
+            AvailableGame.console_name.ilike(f'%{console_type}%')  # Match console type
+        ).first()
+
+        # ✅ FALLBACK: If exact match not found, try alternative matching strategies
+        if not available_game:
+            current_app.logger.warning(f"Direct match not found for console type: {console_type}")
+            
+            # Try different matching strategies
+            console_type_lower = console_type.lower()
+            
+            if console_type_lower == 'pc':
+                available_game = db.session.query(AvailableGame).filter(
+                    AvailableGame.vendor_id == vendor_id,
+                    or_(
+                        AvailableGame.console_name.ilike('%pc%'),
+                        AvailableGame.console_name.ilike('%gaming%'),
+                        AvailableGame.console_name.ilike('%computer%')
+                    )
+                ).first()
+            elif console_type_lower == 'ps5':
+                available_game = db.session.query(AvailableGame).filter(
+                    AvailableGame.vendor_id == vendor_id,
+                    or_(
+                        AvailableGame.console_name.ilike('%ps5%'),
+                        AvailableGame.console_name.ilike('%playstation%'),
+                        AvailableGame.console_name.ilike('%sony%')
+                    )
+                ).first()
+            elif console_type_lower == 'xbox':
+                available_game = db.session.query(AvailableGame).filter(
+                    AvailableGame.vendor_id == vendor_id,
+                    or_(
+                        AvailableGame.console_name.ilike('%xbox%'),
+                        AvailableGame.console_name.ilike('%microsoft%'),
+                        AvailableGame.console_name.ilike('%series%')
+                    )
+                ).first()
+            elif console_type_lower == 'vr':
+                available_game = db.session.query(AvailableGame).filter(
+                    AvailableGame.vendor_id == vendor_id,
+                    or_(
+                        AvailableGame.console_name.ilike('%vr%'),
+                        AvailableGame.console_name.ilike('%virtual%'),
+                        AvailableGame.console_name.ilike('%reality%'),
+                        AvailableGame.console_name.ilike('%oculus%'),
+                        AvailableGame.console_name.ilike('%meta%')
+                    )
+                ).first()
+
+        # ✅ FINAL FALLBACK: If still not found, get first available for vendor
+        if not available_game:
+            current_app.logger.warning(f"No specific match found, using first available game for vendor {vendor_id}")
+            available_game = db.session.query(AvailableGame).filter_by(vendor_id=vendor_id).first()
+
+        if not available_game:
+            current_app.logger.error(f"No games found for vendor {vendor_id}")
+            return jsonify({"message": "Game not found for this vendor"}), 404
+
+        # ✅ LOG the selected game for debugging
+        current_app.logger.info(f"🎮 SELECTED GAME: ID={available_game.id}, Console={available_game.console_name}, Type={console_type}")
 
         # Validate and calculate extra services cost
         total_meals_cost = 0
@@ -1222,11 +1293,6 @@ def new_booking(vendor_id):
             db.session.flush()
             current_app.logger.info(f"Created new user: {name}")
 
-        # Get available game for vendor
-        available_game = db.session.query(AvailableGame).filter_by(vendor_id=vendor_id).first()
-        if not available_game:
-            return jsonify({"message": "Game not found for this vendor"}), 404
-
         # Validate slots availability
         placeholders = ", ".join([f":slot_id_{i}" for i in range(len(slot_ids))])
         slot_params = {f"slot_id_{i}": slot_id for i, slot_id in enumerate(slot_ids)}
@@ -1257,13 +1323,19 @@ def new_booking(vendor_id):
 
         for slot_id in slot_ids:
             slot_obj = db.session.query(Slot).filter_by(id=slot_id).first()
+            
+            # ✅ CRITICAL FIX: Use the correct game_id based on console type
             booking = Booking(
                 slot_id=slot_id,
-                game_id=available_game.id,
+                game_id=available_game.id,  # ✅ Now uses the correct game based on console type
                 user_id=user.id,
                 status="confirmed",
                 access_code_id=access_code_entry.id
             )
+            
+            # ✅ LOG each booking creation
+            current_app.logger.info(f"📝 CREATING BOOKING: slot_id={slot_id}, game_id={available_game.id}, console_type={console_type}")
+            
             db.session.add(booking)
             db.session.flush()
             bookings.append(booking)
@@ -1418,7 +1490,8 @@ def new_booking(vendor_id):
             waive_off_amount=waive_off_total
         )
 
-        current_app.logger.info(f"Booking completed successfully. Total cost: ₹{total_paid} (including ₹{total_meals_cost} for meals)")
+        # ✅ ENHANCED SUCCESS LOG
+        current_app.logger.info(f"✅ BOOKING SUCCESS: console_type={console_type}, game_id={available_game.id}, console_name={available_game.console_name}, total_cost=₹{total_paid}")
 
         return jsonify({
             "success": True,
@@ -1426,6 +1499,9 @@ def new_booking(vendor_id):
             "booking_ids": [b.id for b in bookings],
             "transaction_ids": [t.id for t in transactions],
             "access_code": code,
+            "console_type": console_type,  # ✅ Return console type for verification
+            "game_id": available_game.id,   # ✅ Return game ID for verification
+            "console_name": available_game.console_name,  # ✅ Return console name for verification
             "total_base_cost": total_base_cost,
             "total_meals_cost": total_meals_cost,
             "extra_controller_fare": extra_controller_fare,
@@ -1451,6 +1527,7 @@ def new_booking(vendor_id):
             "message": "Failed to process booking", 
             "error": str(e)
         }), 500
+
         
         # Add this route to get complete booking details including extra services
 
