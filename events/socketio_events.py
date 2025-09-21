@@ -48,6 +48,7 @@ def register_socketio_events(socket: SocketIO):
         Example client emit:
             socket.emit("connect_admin", {});
         """
+        current_app.logger.info(f"Admin connect called with data={data}")
         join_room("dashboard_admin")
         current_app.logger.info("Admin joined dashboard_admin")
         emit("admin_connected", {"ts": datetime.utcnow().isoformat() + "Z"}, room="dashboard_admin")
