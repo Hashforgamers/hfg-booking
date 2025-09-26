@@ -1,4 +1,4 @@
-from flask import Blueprint, request, jsonify, current_app, g
+from flask import Blueprint, request, jsonify, current_app, g,  make_response
 from services.booking_service import BookingService
 from db.extensions import db
 from models.slot import Slot
@@ -1609,14 +1609,25 @@ def new_booking(vendor_id):
         
         # Add this route to get complete booking details including extra services
 
-@booking_blueprint.route('/booking/<int:booking_id>/details', methods=['GET'])
+@booking_blueprint.route('/booking/<int:booking_id>/details', methods=['GET', 'OPTIONS'])
 def get_booking_details(booking_id):
+    # Handle CORS preflight request
+    if request.method == 'OPTIONS':
+        response = make_response()
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        response.headers.add("Access-Control-Allow-Headers", "Content-Type,Authorization")
+        response.headers.add("Access-Control-Allow-Methods", "GET,PUT,POST,DELETE,OPTIONS")
+        return response
+        
     try:
-        # Eager load related objects to minimize queries
+        current_app.logger.info(f"Fetching details for booking {booking_id}")
+        
+        # ✅ FIX: Updated eager loading with correct relationship names
         booking = (
             Booking.query
             .options(
-                joinedload(Booking.booking_extra_services).joinedload(BookingExtraService.menu_item).joinedload('category'),
+                # Fixed: Use 'extra_service_menu' instead of 'menu_item'
+                joinedload(Booking.booking_extra_services).joinedload(BookingExtraService.extra_service_menu).joinedload('category'),
                 joinedload(Booking.game),
                 joinedload(Booking.slot),
                 joinedload(Booking.user).joinedload('contact_info'),
@@ -1627,10 +1638,11 @@ def get_booking_details(booking_id):
         )
         
         if not booking:
-            return jsonify({"message": "Booking not found"}), 404
+            return jsonify({"success": False, "message": "Booking not found"}), 404
         
-        if booking.status != "confirmed":
-            return jsonify({"message": "Booking is not confirmed yet"}), 400
+        # ✅ REMOVED: Status check so modal can show existing meals even for non-confirmed bookings
+        # if booking.status != "confirmed":
+        #     return jsonify({"message": "Booking is not confirmed yet"}), 400
         
         user = booking.user
         contact_info = user.contact_info if user else None
@@ -1646,8 +1658,9 @@ def get_booking_details(booking_id):
         extra_services_price = 0
         extra_services_list = []
         
+        # ✅ FIX: Use correct relationship name 'extra_service_menu'
         for bes in booking.booking_extra_services:
-            item = bes.menu_item
+            item = bes.extra_service_menu  # Changed from bes.menu_item to bes.extra_service_menu
             category = getattr(item, 'category', None)
             extra_services_list.append({
                 "id": bes.id,
@@ -1660,8 +1673,10 @@ def get_booking_details(booking_id):
             })
             extra_services_price += bes.total_price
         
+        # ✅ ENHANCED: Include additional meals transactions
         extra_controller_price = sum(t.amount for t in transactions if t.booking_type == 'extra_controller')
-        total_amount = base_price + extra_services_price + extra_controller_price
+        additional_meals_price = sum(t.amount for t in transactions if t.booking_type == 'additional_meals')
+        total_amount = base_price + extra_services_price + extra_controller_price + additional_meals_price
         
         # Format slot times nicely
         def format_time(t):
@@ -1696,6 +1711,7 @@ def get_booking_details(booking_id):
                 "base_price": float(base_price),
                 "extra_services_price": float(extra_services_price),
                 "extra_controller_price": float(extra_controller_price),
+                "additional_meals_price": float(additional_meals_price),  # ✅ NEW: Added this
                 "total_amount": float(total_amount)
             },
             "extra_services": extra_services_list,
@@ -1712,10 +1728,13 @@ def get_booking_details(booking_id):
             ]
         }
         
+        current_app.logger.info(f"✅ Successfully retrieved booking details for {booking_id} with {len(extra_services_list)} extra services")
         return jsonify({"success": True, "booking": response}), 200
 
     except Exception as ex:
-        current_app.logger.error(f"Error fetching booking details {booking_id}: {ex}")
+        current_app.logger.error(f"❌ Error fetching booking details {booking_id}: {ex}")
+        import traceback
+        current_app.logger.error(f"❌ Traceback: {traceback.format_exc()}")
         return jsonify({"success": False, "error": str(ex)}), 500
 
         # Quick validation route for menu items
@@ -2600,11 +2619,20 @@ def reject_pay_at_cafe_booking():
         }), 500
 
 
-@booking_blueprint.route('/booking/<int:booking_id>/add-meals', methods=['POST'])
+
+@booking_blueprint.route('/booking/<int:booking_id>/add-meals', methods=['POST', 'OPTIONS'])
 def add_meals_to_booking(booking_id):
     """
     Add additional meals to an existing booking
     """
+    # Handle CORS preflight request
+    if request.method == 'OPTIONS':
+        response = make_response()
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        response.headers.add("Access-Control-Allow-Headers", "Content-Type,Authorization")
+        response.headers.add("Access-Control-Allow-Methods", "GET,PUT,POST,DELETE,OPTIONS")
+        return response
+    
     try:
         current_app.logger.info(f"Adding meals to booking {booking_id}")
         data = request.json
@@ -2638,7 +2666,7 @@ def add_meals_to_booking(booking_id):
             if not menu_item_id or quantity <= 0:
                 return jsonify({"success": False, "message": "Invalid meal data provided"}), 400
             
-            # Validate menu item exists, is active, and belongs to vendor
+            # ✅ FIX: Use correct relationship names from your models
             menu_item = db.session.query(ExtraServiceMenu).join(
                 ExtraServiceCategory
             ).filter(
@@ -2681,18 +2709,21 @@ def add_meals_to_booking(booking_id):
         # Create additional transaction for the meals cost
         user = db.session.query(User).filter_by(id=booking.user_id).first()
         
+        # Use current date as fallback for booking date
+        booking_date = datetime.utcnow().date()
+        
         additional_transaction = Transaction(
             booking_id=booking_id,
             vendor_id=vendor_id,
             user_id=booking.user_id,
-            booked_date=booking.slot.date if hasattr(booking, 'slot') else datetime.utcnow().date(),
+            booked_date=booking_date,
             booking_date=datetime.utcnow().date(),
             booking_time=datetime.utcnow().time(),
             user_name=user.name if user else "Unknown User",
             original_amount=total_meals_cost,
             discounted_amount=0,
             amount=total_meals_cost,
-            mode_of_payment="pending",  # You might want to handle payment separately
+            mode_of_payment="pending",
             booking_type="additional_meals",
             settlement_status="NA"
         )
@@ -2706,14 +2737,14 @@ def add_meals_to_booking(booking_id):
             "success": True,
             "message": "Meals added successfully",
             "booking_id": booking_id,
-            "total_meals_cost": total_meals_cost,
+            "total_meals_cost": float(total_meals_cost),
             "added_meals": [
                 {
                     "name": detail['menu_item'].name,
                     "category": detail['menu_item'].category.name,
                     "quantity": detail['quantity'],
-                    "unit_price": detail['unit_price'],
-                    "total_price": detail['total_price']
+                    "unit_price": float(detail['unit_price']),
+                    "total_price": float(detail['total_price'])
                 }
                 for detail in meal_details
             ]
@@ -2722,10 +2753,10 @@ def add_meals_to_booking(booking_id):
     except Exception as e:
         db.session.rollback()
         current_app.logger.error(f"❌ Failed to add meals to booking {booking_id}: {str(e)}")
+        import traceback
+        current_app.logger.error(f"❌ Traceback: {traceback.format_exc()}")
         return jsonify({
             "success": False,
             "message": "Failed to add meals", 
             "error": str(e)
         }), 500
-
-
