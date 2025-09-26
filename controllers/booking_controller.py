@@ -2598,3 +2598,196 @@ def reject_pay_at_cafe_booking():
             "message": "Failed to reject booking",
             "error": str(e)
         }), 500
+
+
+@booking_blueprint.route('/booking/<int:booking_id>/add-meals', methods=['POST'])
+def add_meals_to_booking(booking_id):
+    """
+    Add additional meals to an existing booking
+    """
+    try:
+        current_app.logger.info(f"Adding meals to booking {booking_id}")
+        data = request.json
+        
+        # Get meals from request
+        meals = data.get("meals", [])
+        if not meals:
+            return jsonify({"success": False, "message": "No meals provided"}), 400
+        
+        # Validate booking exists and get vendor_id
+        booking = db.session.query(Booking).filter_by(id=booking_id).first()
+        if not booking:
+            return jsonify({"success": False, "message": "Booking not found"}), 404
+        
+        # Get vendor_id from the booking's game
+        available_game = db.session.query(AvailableGame).filter_by(id=booking.game_id).first()
+        if not available_game:
+            return jsonify({"success": False, "message": "Game not found"}), 404
+        
+        vendor_id = available_game.vendor_id
+        current_app.logger.info(f"Adding meals to booking {booking_id} for vendor {vendor_id}")
+        
+        # Validate and process meals
+        meal_details = []
+        total_meals_cost = 0
+        
+        for meal in meals:
+            menu_item_id = meal.get('menu_item_id')
+            quantity = meal.get('quantity', 1)
+            
+            if not menu_item_id or quantity <= 0:
+                return jsonify({"success": False, "message": "Invalid meal data provided"}), 400
+            
+            # Validate menu item exists, is active, and belongs to vendor
+            menu_item = db.session.query(ExtraServiceMenu).join(
+                ExtraServiceCategory
+            ).filter(
+                ExtraServiceMenu.id == menu_item_id,
+                ExtraServiceCategory.vendor_id == vendor_id,
+                ExtraServiceMenu.is_active == True,
+                ExtraServiceCategory.is_active == True
+            ).first()
+            
+            if not menu_item:
+                return jsonify({
+                    "success": False,
+                    "message": f"Invalid or inactive menu item {menu_item_id} for this vendor"
+                }), 400
+            
+            item_total = menu_item.price * quantity
+            total_meals_cost += item_total
+            
+            meal_details.append({
+                'menu_item': menu_item,
+                'quantity': quantity,
+                'unit_price': menu_item.price,
+                'total_price': item_total
+            })
+            
+            current_app.logger.info(f"Adding meal: {menu_item.name} x {quantity} = ₹{item_total}")
+        
+        # Create booking extra services for the existing booking
+        for meal_detail in meal_details:
+            booking_extra_service = BookingExtraService(
+                booking_id=booking_id,
+                menu_item_id=meal_detail['menu_item'].id,
+                quantity=meal_detail['quantity'],
+                unit_price=meal_detail['unit_price'],
+                total_price=meal_detail['total_price']
+            )
+            db.session.add(booking_extra_service)
+            current_app.logger.info(f"Created extra service for booking {booking_id}: {meal_detail['menu_item'].name}")
+        
+        # Create additional transaction for the meals cost
+        user = db.session.query(User).filter_by(id=booking.user_id).first()
+        
+        additional_transaction = Transaction(
+            booking_id=booking_id,
+            vendor_id=vendor_id,
+            user_id=booking.user_id,
+            booked_date=booking.slot.date if hasattr(booking, 'slot') else datetime.utcnow().date(),
+            booking_date=datetime.utcnow().date(),
+            booking_time=datetime.utcnow().time(),
+            user_name=user.name if user else "Unknown User",
+            original_amount=total_meals_cost,
+            discounted_amount=0,
+            amount=total_meals_cost,
+            mode_of_payment="pending",  # You might want to handle payment separately
+            booking_type="additional_meals",
+            settlement_status="NA"
+        )
+        db.session.add(additional_transaction)
+        
+        db.session.commit()
+        
+        current_app.logger.info(f"✅ Successfully added {len(meal_details)} meals to booking {booking_id}, total cost: ₹{total_meals_cost}")
+        
+        return jsonify({
+            "success": True,
+            "message": "Meals added successfully",
+            "booking_id": booking_id,
+            "total_meals_cost": total_meals_cost,
+            "added_meals": [
+                {
+                    "name": detail['menu_item'].name,
+                    "category": detail['menu_item'].category.name,
+                    "quantity": detail['quantity'],
+                    "unit_price": detail['unit_price'],
+                    "total_price": detail['total_price']
+                }
+                for detail in meal_details
+            ]
+        }), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"❌ Failed to add meals to booking {booking_id}: {str(e)}")
+        return jsonify({
+            "success": False,
+            "message": "Failed to add meals", 
+            "error": str(e)
+        }), 500
+
+
+@booking_blueprint.route('/booking/<int:booking_id>/details', methods=['GET'])
+def get_booking_details(booking_id):
+    """
+    Get detailed information about a booking including extra services/meals
+    """
+    try:
+        current_app.logger.info(f"Fetching details for booking {booking_id}")
+        
+        # Get booking with related data
+        booking = db.session.query(Booking).filter_by(id=booking_id).first()
+        if not booking:
+            return jsonify({"success": False, "message": "Booking not found"}), 404
+        
+        # Get extra services/meals for this booking
+        extra_services = db.session.query(BookingExtraService).join(
+            ExtraServiceMenu
+        ).join(
+            ExtraServiceCategory
+        ).filter(
+            BookingExtraService.booking_id == booking_id
+        ).all()
+        
+        # Format extra services data
+        extra_services_data = []
+        for service in extra_services:
+            extra_services_data.append({
+                "id": service.id,
+                "menu_item_name": service.menu_item.name,
+                "category_name": service.menu_item.category.name,
+                "quantity": service.quantity,
+                "unit_price": float(service.unit_price),
+                "total_price": float(service.total_price)
+            })
+        
+        # Get user information
+        user = db.session.query(User).filter_by(id=booking.user_id).first()
+        
+        # Get slot information
+        slot = db.session.query(Slot).filter_by(id=booking.slot_id).first()
+        
+        booking_data = {
+            "booking_id": booking.id,
+            "user_name": user.name if user else "Unknown User",
+            "slot_time": f"{slot.start_time} - {slot.end_time}" if slot else "N/A",
+            "status": booking.status,
+            "extra_services": extra_services_data
+        }
+        
+        current_app.logger.info(f"✅ Retrieved {len(extra_services_data)} extra services for booking {booking_id}")
+        
+        return jsonify({
+            "success": True,
+            "booking": booking_data
+        }), 200
+        
+    except Exception as e:
+        current_app.logger.error(f"❌ Failed to fetch booking details {booking_id}: {str(e)}")
+        return jsonify({
+            "success": False,
+            "message": "Failed to fetch booking details", 
+            "error": str(e)
+        }), 500
