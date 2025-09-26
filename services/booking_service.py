@@ -365,7 +365,7 @@ class BookingService:
             try:
                 booking = Booking.query.get(booking_id)
 
-                if booking and booking.status == "pending_verified":
+                if booking and booking.status  in ["pending_verified", "cancelled"]:
                     # ✅ Get vendor_id from available_games
                     available_game = db.session.execute(
                         text("SELECT vendor_id FROM available_games WHERE id = (SELECT gaming_type_id FROM slots WHERE id = :slot_id)"),
@@ -390,8 +390,9 @@ class BookingService:
                     db.session.commit()
 
                     # ✅ Update booking status
-                    booking.status = 'verification_failed'
-                    db.session.commit()
+                    if booking.status == "pending_verified":
+                        booking.status = 'verification_failed'
+                        db.session.commit()
 
                     # ✅ Emit WebSocket event to update slot status
                     socketio = current_app.extensions['socketio']
