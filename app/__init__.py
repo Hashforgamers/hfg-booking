@@ -7,6 +7,8 @@ from flask_socketio import SocketIO
 from flask_cors import CORS
 import logging
 import os
+import eventlet
+
 # import redis
 from redis import Redis
 from rq import Queue  # Import RQ Queue
@@ -25,7 +27,14 @@ import utils.common as common
 def create_app():
     app = Flask(__name__)
     # Initialize SocketIO globally
-    socketio = SocketIO(app, cors_allowed_origins="*", transports=['websocket', 'polling'], async_mode="gevent", logger=True, engineio_logger=True)
+    socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    async_mode="eventlet",  # Use eventlet
+    logger=True,
+    engineio_logger=True,
+    transports=["websocket", "polling"]
+)
 
     app.config.from_object(Config)
     app.config['REDIS_URL'] = os.getenv("REDIS_URL", "rediss://red-culflulds78s73bqveqg:h6uqD1Bivbn7K5y3RRSECELE2Jwp2us3@oregon-redis.render.com:6379")
