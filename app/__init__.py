@@ -40,12 +40,6 @@ def create_app():
     # Initialize Mail Server
     mail.init_app(app)
 
-    # Initialize SocketIO with the app
-    socketio.init_app(app, message_queue=app.config['REDIS_URL'])
-
-    # Register WebSocket events with the socketio instance
-    register_socketio_events(socketio)  # Pass socketio here to register events
-
     # Register blueprints
     app.register_blueprint(booking_blueprint, url_prefix='/api')
     app.register_blueprint(slot_blueprint, url_prefix='/api')
@@ -69,4 +63,7 @@ def create_app():
     # Add scheduler to app.extensions
     app.extensions['scheduler'] = scheduler
     
-    return app, socketio  # Return both app and socketio as a tuple
+    socketio.init_app(app, message_queue=app.config['REDIS_URL'])
+    register_socketio_events(socketio)
+
+    return app, socketio

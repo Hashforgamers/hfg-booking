@@ -12,8 +12,10 @@ services:
       - DATABASE_URI=postgresql://neondb_owner:Od9UnVJ2Wvfr@ep-patient-sound-a8cq577j-pooler.eastus2.azure.neon.tech/neondb?sslmode=require
       - DEBUG_MODE=true
       - REDIS_URL=rediss://red-culflulds78s73bqveqg:h6uqD1Bivbn7K5y3RRSECELE2Jwp2us3@oregon-redis.render.com:6379
-      - MAIL_SERVER=smtp.hashforgamers.co.in
-      - MAIL_PORT=587
+      - MAIL_SERVER=mail.smtp2go.com
+      - MAIL_PORT=2525
+      - MAIL_USE_TLS=true
+      - MAIL_USE_SSL=false
       - MAIL_USERNAME=support@hashforgamers.co.in
       - MAIL_PASSWORD=h3b:@yasDm
       - MAIL_DEFAULT_SENDER=support@hashforgamers.co.in
