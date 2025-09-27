@@ -21,4 +21,7 @@ COPY . /app
 EXPOSE 5053 9182
 
 # Start Flask app, RQ worker, and RQ dashboard in a single container
-CMD ["sh", "-c", "python app.py & rq worker --url $REDIS_URL booking_tasks & rq-scheduler --url $REDIS_URL & rqscheduler --interval 60 & rq-dashboard --redis-url $REDIS_URL --port 9181"]
+CMD sh -c "gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 1 'app:create_app()[0]' -b 0.0.0.0:5054 & \
+           rq worker --url $REDIS_URL booking_tasks & \
+           rq-dashboard --redis-url $REDIS_URL --port 9181 & \
+           rqscheduler --url $REDIS_URL --interval 60"
