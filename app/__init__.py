@@ -1,78 +1,51 @@
-from gevent import monkey
-monkey.patch_all()
-
 from flask import Flask
-from flask import current_app
-from flask_socketio import SocketIO
 from flask_cors import CORS
-import logging
-import os
-import eventlet
-
-# import redis
-from redis import Redis
-from rq import Queue  # Import RQ Queue
-from rq_scheduler import Scheduler  # Import RQ Scheduler
-from datetime import datetime, timedelta
-
+from flask_socketio import SocketIO
 from db.extensions import db, migrate, mail
 from controllers.booking_controller import booking_blueprint
 from controllers.slot_controller import slot_blueprint
 from controllers.game_controller import game_blueprint
 from .config import Config
-from events.socketio_events import register_socketio_events  # Import the socket event registration function
-from rq.registry import FinishedJobRegistry
-import utils.common as common
+from events.socketio_events import register_socketio_events
+from redis import Redis
+from rq import Queue
+from rq_scheduler import Scheduler
+
+import logging
+import os
+
+# Initialize socketio with Eventlet
+socketio = SocketIO(async_mode="eventlet", cors_allowed_origins="*", logger=True, engineio_logger=True)
 
 def create_app():
     app = Flask(__name__)
-    # Initialize SocketIO globally
-    socketio = SocketIO(
-    app,
-    cors_allowed_origins="*",
-    async_mode="eventlet",  # Use eventlet
-    logger=True,
-    engineio_logger=True,
-    transports=["websocket", "polling"]
-)
-
     app.config.from_object(Config)
-    app.config['REDIS_URL'] = os.getenv("REDIS_URL", "rediss://red-culflulds78s73bqveqg:h6uqD1Bivbn7K5y3RRSECELE2Jwp2us3@oregon-redis.render.com:6379")
 
-    # Initialize CORS
-    CORS(app, resources={r"/*": {"origins": "*"}})
-
-    # Initialize extensions
+    # Extensions
     db.init_app(app)
     migrate.init_app(app, db)
-
-    # Initialize Mail Server
     mail.init_app(app)
+    CORS(app)
 
-    # Register blueprints
-    app.register_blueprint(booking_blueprint, url_prefix='/api')
-    app.register_blueprint(slot_blueprint, url_prefix='/api')
-    app.register_blueprint(game_blueprint, url_prefix='/api')
+    # Blueprints
+    app.register_blueprint(booking_blueprint, url_prefix="/api")
+    app.register_blueprint(slot_blueprint, url_prefix="/api")
+    app.register_blueprint(game_blueprint, url_prefix="/api")
 
     # Configure logging
     debug_mode = os.getenv("DEBUG_MODE", "false").lower() == "true"
     log_level = logging.DEBUG if debug_mode else logging.WARNING
     logging.basicConfig(level=log_level, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-    # Initialize Redis connection
-    redis_conn = Redis.from_url(app.config['REDIS_URL'])
-    redis_conn.set('key', 'redis-py')
-    redis_conn.get('key')
-    app.logger.info(f"Ping Redis: {redis_conn.ping()}") 
 
-    # Create RQ Queue & Scheduler
-    queue = Queue('booking_tasks', connection=redis_conn)
+    # Redis + RQ
+    redis_conn = Redis.from_url(app.config.get("REDIS_URL"))
+    queue = Queue("booking_tasks", connection=redis_conn)
     scheduler = Scheduler(queue=queue, connection=redis_conn)
+    app.extensions["scheduler"] = scheduler
 
-    # Add scheduler to app.extensions
-    app.extensions['scheduler'] = scheduler
-    
-    socketio.init_app(app, message_queue=app.config['REDIS_URL'])
+    # SocketIO
+    socketio.init_app(app, message_queue=app.config.get("REDIS_URL"))
     register_socketio_events(socketio)
 
     return app, socketio
