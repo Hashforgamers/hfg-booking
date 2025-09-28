@@ -16,6 +16,8 @@ class User(db.Model):
     # Adding the parent_type column explicitly
     parent_type = Column(String(50), nullable=False, default='user')
 
+    platform = Column(String(50), nullable=False, default='app')
+
     # Relationship to ContactInfo
     contact_info = relationship(
         'ContactInfo',
