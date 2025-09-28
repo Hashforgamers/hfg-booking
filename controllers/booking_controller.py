@@ -1359,7 +1359,8 @@ def new_booking(vendor_id):
                 avatar_path="Not defined",
                 name=name,
                 game_username = name.lower().replace(" ", "_") + str(random.randint(1000, 9999)),
-                parent_type="user"
+                parent_type="user",
+                platform="dashboard"
             )
             contact_info = ContactInfo(
                 phone=phone,
@@ -1744,6 +1745,7 @@ def get_booking_details(booking_id):
         return jsonify({"success": False, "error": str(ex)}), 500
 
         # Quick validation route for menu items
+
 @booking_blueprint.route('/vendor/<int:vendor_id>/validate-meals', methods=['POST'])
 def validate_selected_meals(vendor_id):
     """Validate selected meals and return pricing info"""
