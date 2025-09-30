@@ -15,7 +15,9 @@ import logging
 import os
 
 # Initialize socketio with Eventlet
-socketio = SocketIO(async_mode="eventlet", cors_allowed_origins="*", logger=True, engineio_logger=True)
+socketio = SocketIO(async_mode="eventlet", cors_allowed_origins=[
+    "http://localhost:3000", "https://dev-dashboard.hashforgamers.co.in", "https://dashboard.hashforgamers.co.in"
+    ], logger=True, engineio_logger=True)
 
 def create_app():
     app = Flask(__name__)
@@ -25,7 +27,7 @@ def create_app():
     db.init_app(app)
     migrate.init_app(app, db)
     mail.init_app(app)
-    CORS(app)
+    CORS(app, origins=["http://localhost:3000", "https://dev-dashboard.hashforgamers.co.in", "https://dashboard.hashforgamers.co.in"])
 
     # Blueprints
     app.register_blueprint(booking_blueprint, url_prefix="/api")
