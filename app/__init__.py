@@ -30,8 +30,17 @@ def create_app():
     db.init_app(app)
     migrate.init_app(app, db)
     mail.init_app(app)
+<<<<<<< HEAD
     
     CORS(app, origins=["http://localhost:3000", "https://dev-dashboard.hashforgamers.co.in", "https://dashboard.hashforgamers.co.in"])
+=======
+    CORS(app, 
+         origins=["http://localhost:3000", "https://dev-dashboard.hashforgamers.co.in", "https://dashboard.hashforgamers.co.in"],
+         resources={r"/api/*": {"origins": ["http://localhost:3000", "https://dev-dashboard.hashforgamers.co.in", "https://dashboard.hashforgamers.co.in"]}},
+         allow_headers=["Content-Type", "Authorization"],
+         methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+
+>>>>>>> 110e519 (added cors)
 
 
     # Blueprints

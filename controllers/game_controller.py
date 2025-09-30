@@ -3,6 +3,7 @@ from services.booking_service import BookingService
 from models.availableGame import AvailableGame
 from models.openingDays import OpeningDay
 from datetime import datetime
+from flask_cors import cross_origin
 
 game_blueprint = Blueprint('game', __name__)
 
@@ -99,6 +100,7 @@ def cancel_booking(booking_id):
 
 
 @game_blueprint.route('/getAllConsole/vendor/<int:vendor_id>', methods=['GET'])
+@cross_origin(origins=["http://localhost:3000", "https://dev-dashboard.hashforgamers.co.in", "https://dashboard.hashforgamers.co.in"])
 def get_all_console_by_vendor_id(vendor_id):
 
     # Query games by vendor_id
