@@ -25,14 +25,16 @@ socketio = SocketIO(async_mode="eventlet", cors_allowed_origins=[
 def create_app():
     app = Flask(__name__)
     app.config.from_object(Config)
-
-    # Extensions
+     # Extensions
+     
     db.init_app(app)
     migrate.init_app(app, db)
     mail.init_app(app)
-    
-    CORS(app, origins=["http://localhost:3000", "https://dev-dashboard.hashforgamers.co.in", "https://dashboard.hashforgamers.co.in"])
-
+    CORS(app, 
+         origins=["http://localhost:3000", "https://dev-dashboard.hashforgamers.co.in", "https://dashboard.hashforgamers.co.in"],
+         resources={r"/api/*": {"origins": ["http://localhost:3000", "https://dev-dashboard.hashforgamers.co.in", "https://dashboard.hashforgamers.co.in"]}},
+         allow_headers=["Content-Type", "Authorization"],
+         methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
 
     # Blueprints
     app.register_blueprint(booking_blueprint, url_prefix="/api")
