@@ -13,6 +13,8 @@ class Config:
     )
     SQLALCHEMY_TRACK_MODIFICATIONS = False
 
+    REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")  # default fallback
+
     # Add safe engine options for Neon / Postgres
     SQLALCHEMY_ENGINE_OPTIONS = {
         "pool_pre_ping": True,    # Test connection before using
