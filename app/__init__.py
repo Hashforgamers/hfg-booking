@@ -21,9 +21,10 @@ socketio = SocketIO(
         "http://localhost:3000",
         "https://dev-dashboard.hashforgamers.co.in",
         "https://dashboard.hashforgamers.co.in",
+        "https://amritb.github.io",   # ✅ added here
     ],
     logger=True,
-    engineio_logger=True,
+    engineio_logger=True
 )
 
 def create_app():
