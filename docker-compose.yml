@@ -4,8 +4,8 @@ services:
   booking_service:
     build: .
     ports:
-      - "5054:5054" # Flask App
-      - "9181:9181" # RQ Dashboard
+      - "5054:5054"
+      - "9181:9181"
     environment:
       - FLASK_APP=app.py
       - FLASK_RUN_HOST=0.0.0.0
@@ -34,4 +34,3 @@ services:
         rq worker --url $REDIS_URL booking_tasks & \
         rq-dashboard --redis-url $REDIS_URL --port 9181 & \
         rqscheduler --url $REDIS_URL --interval 60"
-
