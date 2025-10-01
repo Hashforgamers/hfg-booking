@@ -14,7 +14,7 @@ from rq_scheduler import Scheduler
 import logging
 import os
 
-# Initialize socketio once (do not bind to app yet)
+# Initialize socketio once
 socketio = SocketIO(
     async_mode="eventlet",
     cors_allowed_origins=[
@@ -23,7 +23,7 @@ socketio = SocketIO(
         "https://dashboard.hashforgamers.co.in",
     ],
     logger=True,
-    engineio_logger=True
+    engineio_logger=True,
 )
 
 def create_app():
@@ -69,4 +69,7 @@ def create_app():
     socketio.init_app(app, message_queue=app.config["REDIS_URL"])
     register_socketio_events(socketio)
 
-    return app, socketio
+    return app  # ✅ only return Flask app
+
+# Expose app for Gunicorn
+app = create_app()
