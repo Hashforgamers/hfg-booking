@@ -20,3 +20,6 @@ razorpay
 firebase-admin
 pyjwt
 cryptography
+gunicorn
+flask-socketio
+eventlet
