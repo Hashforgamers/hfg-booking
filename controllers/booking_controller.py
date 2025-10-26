@@ -1738,6 +1738,7 @@ def get_booking_details(booking_id):
         return jsonify({"success": False, "error": str(ex)}), 500
 
         # Quick validation route for menu items
+
 @booking_blueprint.route('/vendor/<int:vendor_id>/validate-meals', methods=['POST'])
 def validate_selected_meals(vendor_id):
     """Validate selected meals and return pricing info"""
@@ -1797,7 +1798,6 @@ def validate_selected_meals(vendor_id):
             'success': False,
             'error': str(e)
         }), 500
-
 
 # Get vendor's booking statistics including meals
 @booking_blueprint.route('/vendor/<int:vendor_id>/booking-stats', methods=['GET'])
@@ -1874,9 +1874,6 @@ def get_vendor_booking_stats(vendor_id):
             'success': False,
             'error': str(e)
         }), 500
-
-
-
 
 @booking_blueprint.route('/extraBooking', methods=['POST'])
 def extra_booking():
@@ -2305,9 +2302,7 @@ def release_slot_controller():
     finally:
         db.session.remove()
         
-
 # Add these endpoints to your booking_controller.py
-
 @booking_blueprint.route('/pay-at-cafe/pending/<int:vendor_id>', methods=['GET'])
 def get_pending_pay_at_cafe_bookings(vendor_id):
     """Get all pending pay-at-cafe bookings for a vendor"""
@@ -2411,7 +2406,6 @@ def get_pending_pay_at_cafe_bookings(vendor_id):
             'success': False,
             'error': str(e)
         }), 500
-
 
 @booking_blueprint.route('/pay-at-cafe/accept', methods=['POST'])
 def accept_pay_at_cafe_booking():
@@ -2529,7 +2523,6 @@ def accept_pay_at_cafe_booking():
             "error": str(e)
         }), 500
 
-
 @booking_blueprint.route('/pay-at-cafe/reject', methods=['POST'])
 def reject_pay_at_cafe_booking():
     """Reject a pay-at-cafe booking and change status to cancelled"""
@@ -2617,8 +2610,6 @@ def reject_pay_at_cafe_booking():
             "message": "Failed to reject booking",
             "error": str(e)
         }), 500
-
-
 
 @booking_blueprint.route('/booking/<int:booking_id>/add-meals', methods=['POST', 'OPTIONS'])
 def add_meals_to_booking(booking_id):
@@ -2760,3 +2751,149 @@ def add_meals_to_booking(booking_id):
             "message": "Failed to add meals", 
             "error": str(e)
         }), 500
+
+@booking_blueprint.route('/kiosk/next-slot/vendor/<int:vendor_id>', methods=['POST'])
+def kiosk_book_next_slot(vendor_id):
+    """
+    Kiosk extension booking for the immediate next slot.
+    Payload:
+    {
+      "bookingType": "extension",
+      "consoleId": 84,
+      "gameId": 47,
+      "slotId": 841,           # next Slot.id (optional if you prefer server-derivation from currentEndTime)
+      "userId": 56,
+      "paymentType": "pending"
+    }
+    """
+    try:
+        body = request.get_json(force=True) or {}
+        console_id = int(body["consoleId"])
+        game_id = int(body["gameId"])
+        slot_id = int(body["slotId"])
+        user_id = int(body["userId"])
+        payment_type = body.get("paymentType", "pending")
+
+        # 0) Resolve schedule to compute start/end for vendor dashboard
+        slot_row = db.session.query(Slot).filter_by(id=slot_id).first()
+        if not slot_row or slot_row.gaming_type_id != game_id:
+            return jsonify({"success": False, "message": "Invalid slot for game"}), 400
+
+        # Assume local-date booking; if client passes bookedDate use that instead
+        booked_date = datetime.utcnow().date()
+        start_dt = datetime.combine(booked_date, slot_row.start_time)
+        end_dt = datetime.combine(booked_date, slot_row.end_time)
+
+        vendor_slot_table = f"VENDOR_{vendor_id}_SLOT"
+        console_table = f"VENDOR_{vendor_id}_CONSOLE_AVAILABILITY"
+        booking_table = f"VENDOR_{vendor_id}_DASHBOARD"
+
+        # 1) Capacity: lock vendor slot row and decrement
+        row = db.session.execute(text(f"""
+            SELECT is_available, available_slot
+            FROM {vendor_slot_table}
+            WHERE vendor_id=:vid AND date=:dt AND slot_id=:sid
+            FOR UPDATE
+        """), {"vid": vendor_id, "dt": booked_date, "sid": slot_id}).mappings().first()
+        if not row:
+            return jsonify({"success": False, "message": "Vendor slot row missing"}), 404
+        if not row["is_available"] or int(row["available_slot"]) <= 0:
+            return jsonify({"success": False, "message": "Slot unavailable"}), 409
+
+        db.session.execute(text(f"""
+            UPDATE {vendor_slot_table}
+            SET available_slot = available_slot - 1,
+                is_available = CASE WHEN available_slot - 1 > 0 THEN TRUE ELSE FALSE END
+            WHERE vendor_id=:vid AND date=:dt AND slot_id=:sid
+        """), {"vid": vendor_id, "dt": booked_date, "sid": slot_id})
+
+        # 2) Console: lock availability and occupy
+        c_row = db.session.execute(text(f"""
+            SELECT is_available FROM {console_table}
+            WHERE console_id=:cid AND game_id=:gid
+            FOR UPDATE
+        """), {"cid": console_id, "gid": game_id}).first()
+        # Console may be FALSE during current hour; we still proceed for immediate next hour continuity.
+        db.session.execute(text(f"""
+            UPDATE {console_table} SET is_available = FALSE
+            WHERE console_id=:cid AND game_id=:gid
+        """), {"cid": console_id, "gid": game_id})
+
+        # 3) Create booking (provisional; payment at final settle)
+        booking = Booking(
+            slot_id=slot_id,
+            game_id=game_id,
+            user_id=user_id,
+            status="confirmed"
+        )
+        db.session.add(booking)
+        db.session.flush()
+        new_book_id = booking.id
+
+        # Price for audit
+        price_row = db.session.execute(text("SELECT single_slot_price FROM available_games WHERE id=:gid"),
+                                       {"gid": game_id}).fetchone()
+        single_price = int(price_row.single_slot_price) if price_row and price_row.single_slot_price is not None else None
+
+        # 4) Insert vendor dashboard row and flip to current
+        db.session.execute(text(f"""
+            INSERT INTO {booking_table}
+                (book_id, game_id, date, start_time, end_time, book_status, console_id, payment_status, username)
+            VALUES
+                (:bid, :gid, :dt, :st, :et, 'upcoming', NULL, 'pending', NULL)
+        """), {"bid": new_book_id, "gid": game_id, "dt": booked_date, "st": start_dt, "et": end_dt})
+
+        db.session.execute(text(f"""
+            UPDATE {booking_table}
+            SET book_status='current', console_id=:cid
+            WHERE book_id=:bid AND game_id=:gid
+        """), {"cid": console_id, "bid": new_book_id, "gid": game_id})
+
+        db.session.commit()
+        
+        socketio = current_app.extensions.get('socketio')
+
+        # 5) Real-time notifications
+        room = f"vendor_{vendor_id}"
+        socketio.emit("current_slot", {
+            "slot_id": slot_id,
+            "book_id": new_book_id,
+            "start_time": start_dt.isoformat(),
+            "end_time": end_dt.isoformat(),
+            "status": "current",
+            "console_id": console_id,
+            "user_id": user_id,
+            "game_id": game_id,
+            "date": booked_date.isoformat(),
+            "single_slot_price": single_price
+        }, room=room)
+
+        rem = db.session.execute(text(f"""
+            SELECT COUNT(*) AS remaining
+            FROM {console_table}
+            WHERE game_id=:gid AND is_available=TRUE
+        """), {"gid": game_id}).fetchone()
+        remaining = int(rem.remaining) if rem and rem.remaining is not None else None
+
+        socketio.emit("console_availability", {
+            "vendorId": vendor_id,
+            "game_id": game_id,
+            "console_id": console_id,
+            "is_available": False,
+            "remaining_available_for_game": remaining
+        }, room=room)
+
+        return jsonify({
+            "success": True,
+            "message": "Next slot booked and console assigned",
+            "booking_id": new_book_id,
+            "slot_id": slot_id,
+            "start_time": start_dt.isoformat(),
+            "end_time": end_dt.isoformat(),
+            "provisional": True
+        }), 201
+
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.exception("kiosk_book_next_slot error")
+        return jsonify({"success": False, "message": "Server error", "error": str(e)}), 500
