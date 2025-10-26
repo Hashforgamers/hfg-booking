@@ -2835,18 +2835,26 @@ def kiosk_book_next_slot(vendor_id):
                                        {"gid": game_id}).fetchone()
         single_price = int(price_row.single_slot_price) if price_row and price_row.single_slot_price is not None else None
 
-        # 4) Insert vendor dashboard row and flip to current
+        # 4) Insert vendor dashboard row (schema expects TIME, no payment_status column)
         db.session.execute(text(f"""
             INSERT INTO {booking_table}
-                (book_id, game_id, date, start_time, end_time, book_status, console_id, payment_status, username)
+                (book_id, game_id, date, start_time, end_time, book_status, console_id, username, user_id, game_name, status, extra_pay_status)
             VALUES
-                (:bid, :gid, :dt, :st, :et, 'upcoming', NULL, 'pending', NULL)
-        """), {"bid": new_book_id, "gid": game_id, "dt": booked_date, "st": start_dt, "et": end_dt})
+                (:bid, :gid, :dt, :st::time, :et::time, 'upcoming', NULL, NULL, :uid, NULL, TRUE, FALSE)
+        """), {
+            "bid": new_book_id,
+            "gid": game_id,
+            "dt": booked_date,
+            "st": start_dt,     # cast to TIME in SQL
+            "et": end_dt,       # cast to TIME in SQL
+            "uid": user_id
+        })
 
+        # Flip to current and assign console
         db.session.execute(text(f"""
             UPDATE {booking_table}
-            SET book_status='current', console_id=:cid
-            WHERE book_id=:bid AND game_id=:gid
+            SET book_status = 'current', console_id = :cid
+            WHERE book_id = :bid AND game_id = :gid
         """), {"cid": console_id, "bid": new_book_id, "gid": game_id})
 
         db.session.commit()
