@@ -2762,7 +2762,7 @@ def kiosk_book_next_slot(vendor_id):
       "bookingType": "extension",
       "consoleId": 84,
       "gameId": 47,
-      "slotId": 841,        # Next Slot.id
+      "slotId": 841,
       "userId": 56,
       "paymentType": "pending"
     }
@@ -2770,7 +2770,7 @@ def kiosk_book_next_slot(vendor_id):
     try:
         body = request.get_json(force=True) or {}
         console_id = int(body["consoleId"])
-        game_id = int(body["gameId"])
+        game_id = int(body["GameId"]) if "GameId" in body else int(body["gameId"])
         slot_id = int(body["slotId"])
         user_id = int(body["userId"])
         payment_type = body.get("paymentType", "pending")
@@ -2830,10 +2830,14 @@ def kiosk_book_next_slot(vendor_id):
             status="confirmed"
         )
         db.session.add(booking)
-        db.session.flush()  # get booking.id before commit
+        db.session.flush()
         new_book_id = booking.id
 
-        # --- 4) Fetch single slot price (for audit/logging) ---
+        # --- 4) Get user name for dashboard ---
+        user = db.session.query(User).filter_by(id=user_id).first()
+        username = user.name if user and user.name else "Unknown"
+
+        # --- 5) Get single slot price (for frontend) ---
         price_row = db.session.execute(text("""
             SELECT single_slot_price
             FROM available_games
@@ -2841,25 +2845,26 @@ def kiosk_book_next_slot(vendor_id):
         """), {"gid": game_id}).fetchone()
         single_price = int(price_row.single_slot_price) if price_row and price_row.single_slot_price else None
 
-        # --- 5) Insert into vendor dashboard table ---
+        # --- 6) Insert into vendor dashboard ---
         db.session.execute(text(f"""
             INSERT INTO {booking_table}
                 (book_id, game_id, date, start_time, end_time,
                  book_status, console_id, username, user_id, game_name,
                  status, extra_pay_status)
             VALUES
-                (:bid, :gid, :dt, :st, :et, 'upcoming', NULL, NULL, :uid, :gname, TRUE, FALSE)
+                (:bid, :gid, :dt, :st, :et, 'upcoming', NULL, :uname, :uid, :gname, TRUE, FALSE)
         """), {
             "bid": new_book_id,
             "gid": game_id,
             "dt": booked_date,
             "st": start_dt.time(),
             "et": end_dt.time(),
+            "uname": username,
             "uid": user_id,
-            "gname": "pc"   # hardcoded for kiosk
+            "gname": "pc"
         })
 
-        # --- 6) Mark booking as current & assign console ---
+        # --- 7) Mark booking as current and assign console ---
         db.session.execute(text(f"""
             UPDATE {booking_table}
             SET book_status = 'current', console_id = :cid
@@ -2868,11 +2873,10 @@ def kiosk_book_next_slot(vendor_id):
 
         db.session.commit()
 
-        # --- 7) Emit socket events ---
+        # --- 8) Socket updates ---
         socketio = current_app.extensions.get('socketio')
         room = f"vendor_{vendor_id}"
 
-        # Emit booking update
         socketio.emit("current_slot", {
             "slot_id": slot_id,
             "book_id": new_book_id,
@@ -2881,18 +2885,18 @@ def kiosk_book_next_slot(vendor_id):
             "status": "current",
             "console_id": console_id,
             "user_id": user_id,
+            "username": username,
             "game_id": game_id,
             "date": booked_date.isoformat(),
             "single_slot_price": single_price
         }, room=room)
 
-        # Emit updated console availability
-        rem = db.session.execute(text(f"""
+        remaining_row = db.session.execute(text(f"""
             SELECT COUNT(*) AS remaining
             FROM {console_table}
             WHERE game_id = :gid AND is_available = TRUE
         """), {"gid": game_id}).fetchone()
-        remaining = int(rem.remaining) if rem and rem.remaining is not None else 0
+        remaining = int(remaining_row.remaining) if remaining_row else 0
 
         socketio.emit("console_availability", {
             "vendorId": vendor_id,
@@ -2907,6 +2911,7 @@ def kiosk_book_next_slot(vendor_id):
             "message": "Next slot booked and console assigned successfully",
             "booking_id": new_book_id,
             "slot_id": slot_id,
+            "username": username,
             "start_time": start_dt.isoformat(),
             "end_time": end_dt.isoformat(),
             "provisional": True
