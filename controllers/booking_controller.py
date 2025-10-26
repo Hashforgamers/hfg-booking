@@ -2840,15 +2840,17 @@ def kiosk_book_next_slot(vendor_id):
             INSERT INTO {booking_table}
                 (book_id, game_id, date, start_time, end_time, book_status, console_id, username, user_id, game_name, status, extra_pay_status)
             VALUES
-                (:bid, :gid, :dt, :st::time, :et::time, 'upcoming', NULL, NULL, :uid, NULL, TRUE, FALSE)
+                (%(bid)s, %(gid)s, %(dt)s, %(st)s, %(et)s, 'upcoming', NULL, NULL, %(uid)s, %(gname)s, TRUE, FALSE)
         """), {
             "bid": new_book_id,
             "gid": game_id,
             "dt": booked_date,
-            "st": start_dt,     # cast to TIME in SQL
-            "et": end_dt,       # cast to TIME in SQL
-            "uid": user_id
+            "st": start_dt.time(),   # pass time()
+            "et": end_dt.time(),
+            "uid": user_id,
+            "gname": "pc"            #hardcoded as this api will be used by Kiosk
         })
+
 
         # Flip to current and assign console
         db.session.execute(text(f"""
