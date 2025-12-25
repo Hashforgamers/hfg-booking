@@ -4,16 +4,19 @@ from services.pass_service import PassService
 from services.security import auth_required_self
 from db.extensions import db
 from models.passModels import UserPass, CafePass, PassRedemptionLog
-from models.transaction import Transaction  # ✅ ADD this (used in purchase_pass)
+from models.transaction import Transaction
 from decimal import Decimal
-from datetime import datetime, timedelta, time as time_type  # ✅ timedelta added
-from sqlalchemy import or_  # ✅ ADD this
+from datetime import datetime, timedelta, time as time_type
+from sqlalchemy import or_
 import razorpay
 import pytz
 
+
 IST = pytz.timezone("Asia/Kolkata")
 
+
 pass_blueprint = Blueprint('pass', __name__)
+
 
 @pass_blueprint.route('/pass/validate', methods=['POST'])
 def validate_pass():
@@ -88,10 +91,12 @@ def validate_pass():
         current_app.logger.error(f"Pass validation error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
+
 @pass_blueprint.route('/pass/redeem/dashboard', methods=['POST'])
 def redeem_pass_dashboard():
     """
-    Redeem pass from dashboard (manual staff entry).
+    Redeem pass from dashboard (vendor scans pass).
+    Staff ID removed - vendor scans directly.
     """
     try:
         data = request.get_json()
@@ -100,7 +105,6 @@ def redeem_pass_dashboard():
         hours_to_deduct = data.get('hours_to_deduct')
         session_start = data.get('session_start')  # HH:MM format
         session_end = data.get('session_end')      # HH:MM format
-        staff_id = data.get('staff_id')            # Dashboard user ID
         notes = data.get('notes')
         
         if not all([pass_uid, vendor_id, hours_to_deduct]):
@@ -135,9 +139,9 @@ def redeem_pass_dashboard():
         )
         
         if not user_pass:
-            return jsonify({'error': 'Pass not found or invalid'}), 404
+            return jsonify({'error': f'Pass {pass_uid} not found or invalid'}), 404
         
-        # Redeem
+        # Redeem (no staff_id tracking)
         redemption = PassService.redeem_pass_hours(
             user_pass_id=user_pass.id,
             vendor_id=vendor_id,
@@ -145,7 +149,7 @@ def redeem_pass_dashboard():
             redemption_method='dashboard_manual',
             session_start=start_time,
             session_end=end_time,
-            redeemed_by_staff_id=staff_id,
+            redeemed_by_staff_id=None,  # ✅ No staff tracking
             notes=notes
         )
         
@@ -165,6 +169,7 @@ def redeem_pass_dashboard():
         db.session.rollback()
         current_app.logger.error(f"Dashboard redemption error: {str(e)}")
         return jsonify({'error': 'Redemption failed'}), 500
+
 
 @pass_blueprint.route('/pass/redeem/app', methods=['POST'])
 @auth_required_self(decrypt_user=True)
@@ -213,7 +218,8 @@ def redeem_pass_app():
             redemption_method='app_booking',
             booking_id=booking_id,
             session_start=slot.start_time if slot else None,
-            session_end=slot.end_time if slot else None
+            session_end=slot.end_time if slot else None,
+            redeemed_by_staff_id=None  # ✅ No staff tracking
         )
         
         db.session.commit()
@@ -233,6 +239,7 @@ def redeem_pass_app():
         db.session.rollback()
         current_app.logger.error(f"App redemption error: {str(e)}")
         return jsonify({'error': 'Redemption failed'}), 500
+
 
 @pass_blueprint.route('/pass/user/active', methods=['GET'])
 @auth_required_self(decrypt_user=True)
@@ -254,6 +261,7 @@ def get_user_active_passes():
         current_app.logger.error(f"Get active passes error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
+
 @pass_blueprint.route('/pass/<int:user_pass_id>/history', methods=['GET'])
 def get_pass_history(user_pass_id):
     """
@@ -271,6 +279,7 @@ def get_pass_history(user_pass_id):
     except Exception as e:
         current_app.logger.error(f"Get pass history error: {str(e)}")
         return jsonify({'error': str(e)}), 500
+
 
 @pass_blueprint.route('/pass/redemption/<int:redemption_id>/cancel', methods=['POST'])
 def cancel_redemption(redemption_id):
@@ -296,6 +305,7 @@ def cancel_redemption(redemption_id):
     except Exception as e:
         current_app.logger.error(f"Cancel redemption error: {str(e)}")
         return jsonify({'error': str(e)}), 500
+
 
 @pass_blueprint.route('/pass/create-hour-pass', methods=['POST'])
 @auth_required_self(decrypt_user=True)
@@ -333,9 +343,6 @@ def create_hour_pass():
         return jsonify({'error': str(e)}), 500
 
 
-# File: controllers/pass_controller.py
-# ADD THIS ROUTE:
-
 @pass_blueprint.route('/user/passes/purchase', methods=['POST'])
 def purchase_pass():
     """
@@ -343,14 +350,12 @@ def purchase_pass():
     Creates UserPass record with unique pass_uid.
     """
     try:
-        
-        IST = pytz.timezone("Asia/Kolkata")
         data = request.get_json()
         
         user_id = data.get('user_id')
         cafe_pass_id = data.get('cafe_pass_id')
-        payment_id = data.get('payment_id', f'test_pay_{int(datetime.now(IST).timestamp())}')  # Auto-generate if missing
-        payment_mode = data.get('payment_mode', 'payment_gateway')  # or 'wallet'
+        payment_id = data.get('payment_id', f'test_pay_{int(datetime.now(IST).timestamp())}')
+        payment_mode = data.get('payment_mode', 'payment_gateway')
         
         if not all([user_id, cafe_pass_id]):
             return jsonify({'error': 'user_id and cafe_pass_id required'}), 400
@@ -451,10 +456,6 @@ def purchase_pass():
         return jsonify({'error': str(e)}), 500
 
 
-
-# File: controllers/pass_controller.py
-# ADD THIS ROUTE:
-
 @pass_blueprint.route('/vendor/<int:vendor_id>/passes/available', methods=['GET'])
 def get_available_passes_for_purchase(vendor_id):
     """
@@ -462,7 +463,6 @@ def get_available_passes_for_purchase(vendor_id):
     Used by user app to show passes for sale.
     """
     try:
-        
         # Get vendor-specific AND global passes
         passes = CafePass.query.filter(
             CafePass.is_active == True,
