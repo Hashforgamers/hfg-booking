@@ -10,11 +10,11 @@ from models.user import User
 from models.paymentTransactionMapping import PaymentTransactionMapping
 from models.hashWallet import HashWallet
 from models.hashWalletTransaction import HashWalletTransaction
-from models.userPass import UserPass
+from models.passModels import UserPass
 from sqlalchemy.orm import joinedload
 from models.bookingExtraService import BookingExtraService
 from models.extraServiceMenuImage import ExtraServiceMenuImage
-from models.cafePass import CafePass
+from models.passModels import CafePass
 from models.extraServiceMenu import ExtraServiceMenu
 from sqlalchemy import or_
 from utils.realtime import emit_booking_event

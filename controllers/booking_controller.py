@@ -24,7 +24,7 @@ from models.accessBookingCode import AccessBookingCode
 from models.bookingExtraService  import BookingExtraService
 from models.extraServiceCategory import ExtraServiceCategory
 from models.extraServiceMenu import ExtraServiceMenu
-from models.userPass import UserPass
+from models.passModels import UserPass
 from datetime import datetime, timedelta, timezone
 import pytz
 from flask import current_app, jsonify
@@ -356,7 +356,7 @@ def generate_payment_link():
     except Exception as e:
         return jsonify({'message': 'Error creating payment link', 'error': str(e)}), 500
 
-@booking_blueprint.route('/bookings/confirm', methods=['POST'])
+"""@booking_blueprint.route('/bookings/confirm', methods=['POST'])
 def confirm_booking():
     try:
         data = request.get_json(force=True)
@@ -650,7 +650,360 @@ def confirm_booking():
     except Exception as e:
         db.session.rollback()
         current_app.logger.exception("Error confirming booking")
+        return jsonify({'error': str(e)}), 500 """
+
+# controllers/booking_controller.py - UPDATED confirm_booking function
+
+@booking_blueprint.route('/bookings/confirm', methods=['POST'])
+def confirm_booking():
+    try:
+        data = request.get_json(force=True)
+
+        booking_ids = data.get('booking_id')
+        payment_id = data.get('payment_id')
+        book_date_str = data.get('book_date')
+        voucher_code = data.get('voucher_code')
+        payment_mode = data.get('payment_mode', "payment_gateway")
+        
+        # NEW: Hour-based pass parameters
+        use_hour_pass = bool(data.get('use_hour_pass', False))
+        hour_pass_uid = data.get('hour_pass_uid')  # Optional: specific pass
+        
+        # Keep existing date-based pass logic
+        use_pass = bool(data.get('use_pass', False))
+        user_pass_id = data.get('user_pass_id')
+        
+        extra_services_list = data.get('extra_services', [])
+
+        current_app.logger.info(f"Confirm payload: {data}")
+
+        if not booking_ids or not book_date_str:
+            return jsonify({'message': 'booking_id and book_date are required'}), 400
+        
+        # Validate mutual exclusivity
+        if use_hour_pass and use_pass:
+            return jsonify({'message': 'Cannot use both hour-based and date-based pass'}), 400
+        
+        if use_hour_pass and not hour_pass_uid:
+            # Will auto-select best available pass
+            pass
+
+        # Parse book_date
+        try:
+            if 'T' in book_date_str:
+                book_date = datetime.fromisoformat(book_date_str).date()
+            else:
+                book_date = datetime.strptime(book_date_str, '%Y-%m-%d').date()
+        except ValueError:
+            return jsonify({"message": "Invalid book_date format"}), 400
+
+        # Setup Razorpay client
+        RAZORPAY_KEY_ID = current_app.config.get("RAZORPAY_KEY_ID")
+        RAZORPAY_KEY_SECRET = current_app.config.get("RAZORPAY_KEY_SECRET")
+        razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+        razorpay_payment_verified = True
+
+        # Verify Razorpay payment if using gateway
+        if payment_mode == "payment_gateway" and not use_hour_pass:
+            if not payment_id:
+                return jsonify({"message": "payment_id required for payment_gateway mode"}), 400
+            try:
+                payment = razorpay_client.payment.fetch(payment_id)
+                if payment['status'] == 'captured':
+                    razorpay_payment_verified = True
+                else:
+                    return jsonify({"message": "Payment not successful"}), 400
+            except razorpay.errors.RazorpayError as e:
+                return jsonify({"message": "Payment verification failed", "error": str(e)}), 400
+
+        # Create access code
+        code = generate_access_code()
+        access_code_entry = AccessBookingCode(access_code=code)
+        db.session.add(access_code_entry)
+        db.session.flush()
+
+        confirmed_ids = []
+        pass_type_name = None
+        pass_used_id = None
+        user_id = None
+        hour_pass_used = None
+        total_hours_deducted = Decimal('0')
+
+        for booking_id in booking_ids:
+            booking = Booking.query.filter_by(id=booking_id).first()
+            if not booking or booking.status == 'confirmed':
+                continue
+
+            if user_id is None:
+                user_id = booking.user_id
+
+            available_game = AvailableGame.query.filter_by(id=booking.game_id).first()
+            vendor = Vendor.query.filter_by(id=available_game.vendor_id).first() if available_game else None
+            slot_obj = Slot.query.filter_by(id=booking.slot_id).first()
+            user = User.query.filter_by(id=booking.user_id).first()
+
+            if not all([available_game, vendor, slot_obj, user]):
+                current_app.logger.warning(f"Booking {booking_id} missing related data")
+                continue
+
+            # HOUR-BASED PASS LOGIC
+            if use_hour_pass:
+                try:
+                    from services.pass_service import PassService
+                    
+                    # Get valid pass
+                    user_hour_pass = PassService.get_valid_user_pass(
+                        user_id=user.id,
+                        vendor_id=vendor.id,
+                        pass_uid=hour_pass_uid
+                    )
+                    
+                    if not user_hour_pass:
+                        return jsonify({'message': 'No valid hour-based pass found'}), 404
+                    
+                    # Calculate hours for this slot
+                    hours_needed = PassService.calculate_slot_hours(
+                        slot_id=slot_obj.id,
+                        cafe_pass=user_hour_pass.cafe_pass
+                    )
+                    
+                    # Check sufficient balance
+                    if user_hour_pass.remaining_hours < hours_needed:
+                        return jsonify({
+                            'message': f'Insufficient hours. Need: {hours_needed}, Available: {user_hour_pass.remaining_hours}'
+                        }), 400
+                    
+                    # Redeem hours
+                    redemption = PassService.redeem_pass_hours(
+                        user_pass_id=user_hour_pass.id,
+                        vendor_id=vendor.id,
+                        hours_to_deduct=hours_needed,
+                        redemption_method='app_booking',
+                        booking_id=booking.id,
+                        session_start=slot_obj.start_time,
+                        session_end=slot_obj.end_time
+                    )
+                    
+                    hour_pass_used = user_hour_pass
+                    total_hours_deducted += hours_needed
+                    pass_used_id = user_hour_pass.id
+                    pass_type_name = user_hour_pass.cafe_pass.name
+                    
+                    # Slot is free with pass
+                    slot_price = available_game.single_slot_price
+                    discount_amount = slot_price
+                    amount_payable = 0  # Free slot
+                    
+                    current_app.logger.info(
+                        f"Hour pass redeemed: booking_id={booking.id} hours={hours_needed} "
+                        f"remaining={user_hour_pass.remaining_hours}"
+                    )
+                    
+                except ValueError as e:
+                    return jsonify({'message': str(e)}), 400
+                except Exception as e:
+                    current_app.logger.error(f"Hour pass redemption failed: {str(e)}")
+                    return jsonify({'message': 'Pass redemption failed'}), 500
+
+            # EXISTING DATE-BASED PASS LOGIC
+            elif use_pass:
+                active_pass = UserPass.query.filter_by(
+                    id=user_pass_id,
+                    user_id=user.id,
+                    is_active=True,
+                    pass_mode='date_based'  # Ensure date-based
+                ).first()
+                if not active_pass or active_pass.valid_to < book_date:
+                    return jsonify({"message": "Invalid or expired date-based pass"}), 400
+                pass_used_id = active_pass.id
+                pass_type_name = active_pass.cafe_pass.pass_type.name if active_pass.cafe_pass.pass_type else None
+                slot_price = available_game.single_slot_price
+                discount_amount = slot_price
+                amount_payable = 0
+
+            # NO PASS - REGULAR PAYMENT
+            else:
+                slot_price = available_game.single_slot_price
+                discount_amount = 0
+                amount_payable = slot_price
+
+            # Calculate extras total
+            extras_total = 0
+            for extra in extra_services_list:
+                menu_obj = ExtraServiceMenu.query.filter_by(id=extra.get('item_id'), is_active=True).first()
+                if not menu_obj:
+                    continue
+                extras_total += menu_obj.price * extra.get('quantity', 1)
+
+            # Add extras to payable amount
+            amount_payable += extras_total
+
+            # Apply voucher discount (only on remaining amount)
+            voucher = None
+            if voucher_code and amount_payable > 0:
+                voucher = Voucher.query.filter_by(code=voucher_code, user_id=user.id, is_active=True).first()
+                if voucher:
+                    voucher_discount = int(amount_payable * voucher.discount_percentage / 100)
+                    discount_amount += voucher_discount
+                    amount_payable -= voucher_discount
+
+            # Payment processing
+            if payment_mode == "wallet" and amount_payable > 0:
+                BookingService.debit_wallet(user.id, booking.id, amount_payable)
+                payment_mode_used = "wallet"
+            elif use_hour_pass:
+                payment_mode_used = "hour_pass"
+            elif use_pass:
+                payment_mode_used = "date_pass"
+            else:
+                if amount_payable == 0:
+                    payment_mode_used = "free"
+                elif not razorpay_payment_verified:
+                    return jsonify({"message": "Payment not verified"}), 400
+                else:
+                    payment_mode_used = "payment_gateway"
+
+            # Confirm booking
+            booking.status = 'confirmed'
+            booking.updated_at = datetime.utcnow()
+            booking.access_code_id = access_code_entry.id
+
+            # Create transaction
+            transaction = Transaction(
+                booking_id=booking.id,
+                vendor_id=vendor.id,
+                user_id=user.id,
+                user_name=user.name,
+                original_amount=slot_price + extras_total,
+                discounted_amount=discount_amount,
+                amount=amount_payable,
+                mode_of_payment=payment_mode_used,
+                booking_date=datetime.utcnow().date(),
+                booked_date=book_date,
+                booking_time=datetime.utcnow().time(),
+                reference_id=payment_id if payment_mode_used == "payment_gateway" else None
+            )
+            db.session.add(transaction)
+            db.session.flush()
+
+            # Save payment mapping if gateway used
+            if payment_id and payment_mode_used == "payment_gateway":
+                BookingService.save_payment_transaction_mapping(booking.id, transaction.id, payment_id)
+
+            # Save extras
+            BookingExtraService.query.filter_by(booking_id=booking.id).delete()
+            for extra in extra_services_list:
+                menu_obj = ExtraServiceMenu.query.filter_by(id=extra.get('item_id'), is_active=True).first()
+                if not menu_obj:
+                    continue
+
+                quantity = extra.get('quantity', 1)
+                unit_price = menu_obj.price
+                total_price = unit_price * quantity
+
+                booking_extra = BookingExtraService(
+                    booking_id=booking.id,
+                    menu_item_id=menu_obj.id,
+                    quantity=quantity,
+                    unit_price=unit_price,
+                    total_price=total_price
+                )
+                db.session.add(booking_extra)
+
+            # Mark voucher as used
+            if voucher:
+                voucher.is_active = False
+                db.session.add(VoucherRedemptionLog(
+                    user_id=user.id,
+                    voucher_id=voucher.id,
+                    booking_id=booking.id
+                ))
+
+            # Reward Hash Coins (skip if hour pass used to avoid double reward)
+            if not use_hour_pass:
+                user_hash_coin = UserHashCoin.query.filter_by(user_id=user.id).first()
+                if not user_hash_coin:
+                    user_hash_coin = UserHashCoin(user_id=user.id, hash_coins=0)
+                    db.session.add(user_hash_coin)
+                user_hash_coin.hash_coins += 1000
+
+            # Vendor analytics
+            BookingService.insert_into_vendor_dashboard_table(transaction.id, -1)
+            BookingService.insert_into_vendor_promo_table(transaction.id, -1)
+
+            # Emit WebSocket event
+            try:
+                socketio = current_app.extensions.get('socketio')
+                event_payload = build_booking_event_payload(
+                    vendor_id=vendor.id,
+                    booking_id=booking.id,
+                    slot_id=booking.slot_id,
+                    user_id=user.id,
+                    username=user.name,
+                    game_id=booking.game_id,
+                    game_name=available_game.game_name,
+                    date_value=book_date,
+                    slot_price=available_game.single_slot_price,
+                    start_time=slot_obj.start_time,
+                    end_time=slot_obj.end_time,
+                    console_id=None,
+                    status="confirmed",
+                    booking_status="upcoming"
+                )
+                emit_booking_event(socketio, event="booking", data=event_payload, vendor_id=vendor.id)
+                socketio.emit("booking_admin", event_payload, to="dashboard_admin")
+            except Exception as e:
+                current_app.logger.exception(f"WebSocket emit failed: {e}")
+
+            # Send confirmation email
+            booking_mail(
+                gamer_name=user.name,
+                gamer_phone=user.contact_info.phone,
+                gamer_email=user.contact_info.email,
+                cafe_name=vendor.cafe_name,
+                booking_date=datetime.utcnow().strftime("%Y-%m-%d"),
+                booked_for_date=str(book_date),
+                booking_details=[{
+                    "booking_id": booking.id,
+                    "slot_time": f"{slot_obj.start_time} - {slot_obj.end_time}"
+                }],
+                price_paid=amount_payable
+            )
+
+            confirmed_ids.append(booking.id)
+
+        db.session.commit()
+        
+        response = {
+            'message': 'Bookings confirmed successfully',
+            'confirmed_ids': confirmed_ids,
+            'amount_paid': amount_payable
+        }
+        
+        # Add pass info to response
+        if use_hour_pass and hour_pass_used:
+            response.update({
+                'pass_used_type': 'hour_based',
+                'pass_used_id': pass_used_id,
+                'pass_uid': hour_pass_used.pass_uid,
+                'pass_name': pass_type_name,
+                'hours_deducted': float(total_hours_deducted),
+                'remaining_hours': float(hour_pass_used.remaining_hours)
+            })
+        elif use_pass:
+            response.update({
+                'pass_used_type': 'date_based',
+                'pass_used_id': pass_used_id,
+                'pass_type': pass_type_name
+            })
+        
+        return jsonify(response), 200
+
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.exception("Error confirming booking")
         return jsonify({'error': str(e)}), 500
+
 
 @booking_blueprint.route('/redeem-voucher', methods=['POST'])
 @auth_required_self(decrypt_user=True) 
