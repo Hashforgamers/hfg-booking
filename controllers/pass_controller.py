@@ -349,7 +349,7 @@ def purchase_pass():
         
         user_id = data.get('user_id')
         cafe_pass_id = data.get('cafe_pass_id')
-        payment_id = data.get('payment_id')  # Razorpay payment ID
+        payment_id = data.get('payment_id', f'test_pay_{int(datetime.now(IST).timestamp())}')  # Auto-generate if missing
         payment_mode = data.get('payment_mode', 'payment_gateway')  # or 'wallet'
         
         if not all([user_id, cafe_pass_id]):
@@ -360,8 +360,11 @@ def purchase_pass():
         if not cafe_pass or not cafe_pass.is_active:
             return jsonify({'error': 'Pass not available'}), 404
         
-        # Verify Razorpay payment if payment_gateway
+        # ✅ TESTING MODE - Skip Razorpay verification
         if payment_mode == 'payment_gateway':
+            current_app.logger.info(f"[TEST MODE] Skipping Razorpay verification for payment_id: {payment_id}")
+            # In production, uncomment the verification code below:
+            """
             if not payment_id:
                 return jsonify({'error': 'payment_id required'}), 400
             
@@ -374,14 +377,18 @@ def purchase_pass():
                 if payment['status'] != 'captured':
                     return jsonify({'error': 'Payment not successful'}), 400
                     
-            except razorpay.errors.RazorpayError as e:
+            except Exception as e:
+                current_app.logger.error(f"Razorpay verification failed: {str(e)}")
                 return jsonify({'error': f'Payment verification failed: {str(e)}'}), 400
+            """
         
         # Deduct from wallet if wallet payment
         elif payment_mode == 'wallet':
             from models.user import User
             user = User.query.get(user_id)
-            if not user or user.wallet_balance < cafe_pass.price:
+            if not user:
+                return jsonify({'error': 'User not found'}), 404
+            if user.wallet_balance < cafe_pass.price:
                 return jsonify({'error': 'Insufficient wallet balance'}), 400
             user.wallet_balance -= cafe_pass.price
         
@@ -414,7 +421,7 @@ def purchase_pass():
         transaction = Transaction(
             user_id=user_id,
             vendor_id=cafe_pass.vendor_id,
-            user_name=user_pass.user.name if user_pass.user else None,
+            user_name=user_pass.user.name if hasattr(user_pass, 'user') and user_pass.user else None,
             original_amount=cafe_pass.price,
             discounted_amount=0,
             amount=cafe_pass.price,
@@ -422,7 +429,6 @@ def purchase_pass():
             booking_date=datetime.now(IST).date(),
             booking_time=datetime.now(IST).time(),
             reference_id=payment_id,
-            # Add custom field if needed: transaction_type='pass_purchase'
         )
         db.session.add(transaction)
         db.session.commit()
@@ -443,6 +449,7 @@ def purchase_pass():
         db.session.rollback()
         current_app.logger.error(f"Pass purchase failed: {str(e)}")
         return jsonify({'error': str(e)}), 500
+
 
 
 # File: controllers/pass_controller.py
