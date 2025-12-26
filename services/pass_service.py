@@ -5,14 +5,14 @@ from sqlalchemy import and_, or_
 from sqlalchemy.exc import SQLAlchemyError
 from flask import current_app
 from db.extensions import db
-from models.passModels import UserPass
-from models.passModels import CafePass
-from models.passModels import PassRedemptionLog
+from models.passModels import UserPass, CafePass, PassRedemptionLog
 from models.vendor import Vendor
 from models.slot import Slot
 import pytz
 
+
 IST = pytz.timezone("Asia/Kolkata")
+
 
 class PassService:
     
@@ -53,8 +53,8 @@ class PassService:
     
     @staticmethod
     def get_valid_user_pass(
-        user_id: int, 
-        vendor_id: int, 
+        user_id: int = None,
+        vendor_id: int = None,
         pass_uid: str = None,
         check_date: date = None
     ) -> UserPass:
@@ -66,7 +66,7 @@ class PassService:
         2. Otherwise, find best available pass (vendor-specific first, then global)
         
         Args:
-            user_id: User ID
+            user_id: User ID (optional if pass_uid provided)
             vendor_id: Vendor ID where pass will be used
             pass_uid: Optional pass UID for specific pass
             check_date: Date to check validity (default: today)
@@ -76,6 +76,40 @@ class PassService:
         """
         if check_date is None:
             check_date = datetime.now(IST).date()
+        
+        # ✅ If pass_uid provided, find by UID (used by dashboard redemption)
+        if pass_uid:
+            user_pass = UserPass.query.filter_by(
+                pass_uid=pass_uid,
+                is_active=True,
+                pass_mode='hour_based'
+            ).first()
+            
+            if not user_pass:
+                return None
+            
+            # Check expiry
+            if user_pass.valid_to and user_pass.valid_to < check_date:
+                return None
+            
+            # Check hours
+            if user_pass.remaining_hours <= 0:
+                return None
+            
+            # ✅ Check vendor compatibility with proper NULL handling
+            if vendor_id:
+                cafe_pass = CafePass.query.get(user_pass.cafe_pass_id)
+                if cafe_pass and cafe_pass.vendor_id is not None:
+                    # Vendor-specific pass
+                    if cafe_pass.vendor_id != vendor_id:
+                        return None
+                # If vendor_id is None, it's a global pass (valid everywhere)
+            
+            return user_pass
+        
+        # ✅ If user_id provided, find best available pass for that user
+        if not user_id:
+            return None
         
         base_query = db.session.query(UserPass).join(CafePass).filter(
             UserPass.user_id == user_id,
@@ -88,24 +122,11 @@ class PassService:
             )
         )
         
-        # If specific pass_uid provided
-        if pass_uid:
-            user_pass = base_query.filter(UserPass.pass_uid == pass_uid).first()
-            if not user_pass:
-                raise ValueError(f"Pass {pass_uid} not found or invalid")
-            
-            # Check vendor compatibility
-            if user_pass.cafe_pass.vendor_id:
-                if user_pass.cafe_pass.vendor_id != vendor_id:
-                    raise ValueError(f"Pass {pass_uid} is not valid at this vendor")
-            
-            return user_pass
-        
-        # Otherwise, find best available pass
         # Priority: Vendor-specific > Global
-        vendor_pass = base_query.filter(CafePass.vendor_id == vendor_id).first()
-        if vendor_pass:
-            return vendor_pass
+        if vendor_id:
+            vendor_pass = base_query.filter(CafePass.vendor_id == vendor_id).first()
+            if vendor_pass:
+                return vendor_pass
         
         global_pass = base_query.filter(CafePass.vendor_id.is_(None)).first()
         return global_pass
@@ -133,7 +154,7 @@ class PassService:
             booking_id: Optional booking ID (for app bookings)
             session_start: Session start time
             session_end: Session end time
-            redeemed_by_staff_id: Staff user ID (for dashboard redemptions)
+            redeemed_by_staff_id: Staff user ID (optional, can be None)
             notes: Optional notes
             
         Returns:
@@ -185,7 +206,7 @@ class PassService:
                 session_start_time=session_start,
                 session_end_time=session_end,
                 redemption_method=redemption_method,
-                redeemed_by_staff_id=redeemed_by_staff_id,
+                redeemed_by_staff_id=redeemed_by_staff_id,  # ✅ Can be None
                 notes=notes
             )
             
@@ -313,7 +334,7 @@ class PassService:
         )
         
         db.session.add(user_pass)
-        db.session.commit()
+        db.session.flush()  # ✅ Flush to get user_pass.id before commit
         
         current_app.logger.info(
             f"Hour-based pass created: user_id={user_id} pass_id={user_pass.id} "
