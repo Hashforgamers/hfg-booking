@@ -60,13 +60,21 @@ def validate_pass():
             }), 400
         
         # Check vendor compatibility
-        cafe_pass = user_pass.cafe_pass
-        if cafe_pass.vendor_id:
+        cafe_pass = CafePass.query.get(user_pass.cafe_pass_id)
+        if not cafe_pass:
+            return jsonify({
+                'valid': False,
+                'error': 'Associated pass configuration not found'
+            }), 404
+        
+        # Vendor-specific pass must match vendor
+        if cafe_pass.vendor_id is not None:
             if cafe_pass.vendor_id != vendor_id:
                 return jsonify({
                     'valid': False,
                     'error': 'Pass not valid at this vendor'
                 }), 400
+        # If vendor_id is None, it's a global pass (valid everywhere)
         
         # Return pass details
         return jsonify({
@@ -131,9 +139,9 @@ def redeem_pass_dashboard():
             except:
                 return jsonify({'error': 'Invalid session_end format (use HH:MM)'}), 400
         
-        # Get pass
+        # ✅ Get pass using updated PassService
         user_pass = PassService.get_valid_user_pass(
-            user_id=None,  # Will be determined from pass_uid
+            user_id=None,  # Not needed for pass_uid lookup
             vendor_id=vendor_id,
             pass_uid=pass_uid
         )
@@ -141,7 +149,7 @@ def redeem_pass_dashboard():
         if not user_pass:
             return jsonify({'error': f'Pass {pass_uid} not found or invalid'}), 404
         
-        # Redeem (no staff_id tracking)
+        # ✅ Redeem using PassService (no staff_id)
         redemption = PassService.redeem_pass_hours(
             user_pass_id=user_pass.id,
             vendor_id=vendor_id,
@@ -149,7 +157,7 @@ def redeem_pass_dashboard():
             redemption_method='dashboard_manual',
             session_start=start_time,
             session_end=end_time,
-            redeemed_by_staff_id=None,  # ✅ No staff tracking
+            redeemed_by_staff_id=None,
             notes=notes
         )
         
@@ -200,10 +208,15 @@ def redeem_pass_app():
         if not user_pass:
             return jsonify({'error': 'No valid pass found'}), 404
         
+        # Get cafe_pass for calculation
+        cafe_pass = CafePass.query.get(user_pass.cafe_pass_id)
+        if not cafe_pass:
+            return jsonify({'error': 'Pass configuration not found'}), 404
+        
         # Calculate hours based on slot and pass config
         hours_to_deduct = PassService.calculate_slot_hours(
             slot_id=slot_id,
-            cafe_pass=user_pass.cafe_pass
+            cafe_pass=cafe_pass
         )
         
         # Get slot times
@@ -219,7 +232,7 @@ def redeem_pass_app():
             booking_id=booking_id,
             session_start=slot.start_time if slot else None,
             session_end=slot.end_time if slot else None,
-            redeemed_by_staff_id=None  # ✅ No staff tracking
+            redeemed_by_staff_id=None
         )
         
         db.session.commit()
