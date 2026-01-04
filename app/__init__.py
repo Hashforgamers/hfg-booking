@@ -6,6 +6,7 @@ from controllers.booking_controller import booking_blueprint
 from controllers.slot_controller import slot_blueprint
 from controllers.game_controller import game_blueprint
 from controllers.pass_controller import pass_blueprint
+from controllers.private_booking_controller import private_booking_blueprint
 from .config import Config
 from events.socketio_events import register_socketio_events
 from redis import Redis
@@ -55,6 +56,8 @@ def create_app():
     app.register_blueprint(slot_blueprint, url_prefix="/api")
     app.register_blueprint(game_blueprint, url_prefix="/api")
     app.register_blueprint(pass_blueprint, url_prefix='/api')
+    app.register_blueprint(private_booking_blueprint, url_prefix='/api')
+
     # Logging
     debug_mode = os.getenv("DEBUG_MODE", "false").lower() == "true"
     log_level = logging.DEBUG if debug_mode else logging.WARNING
