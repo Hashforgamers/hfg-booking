@@ -68,6 +68,86 @@ def get_slots_on_game_id(vendorId, gameId, date):
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    
+@slot_blueprint.route('/getSlotsBatch/vendor/<int:vendorId>', methods=['POST'])
+def get_slots_batch(vendorId):
+    """
+    Fetch slots for multiple games and dates in ONE optimized query.
+    Request body: { "game_ids": [1, 2, 3], "dates": ["20260105", "20260106", "20260107"] }
+    """
+    try:
+        data = request.json
+        game_ids = data.get('game_ids', [])
+        dates = data.get('dates', [])
+        
+        if not game_ids or not dates:
+            return jsonify({"error": "game_ids and dates are required"}), 400
+        
+        # Validate and format dates
+        formatted_dates = []
+        for date in dates:
+            if len(date) != 8 or not date.isdigit():
+                return jsonify({"error": f"Invalid date format: {date}. Use YYYYMMDD."}), 400
+            formatted_dates.append(f"{date[:4]}-{date[4:6]}-{date[6:8]}")
+        
+        table_name = f"VENDOR_{vendorId}_SLOT"
+        
+        # 🔥 SINGLE OPTIMIZED QUERY - Fetch everything at once
+        sql_query = text(f"""
+            SELECT 
+                vs.slot_id,
+                vs.date,
+                vs.is_available,
+                vs.available_slot,
+                s.start_time,
+                s.end_time,
+                s.gaming_type_id,
+                ag.single_slot_price,
+                ag.id as game_id
+            FROM {table_name} vs
+            INNER JOIN slots s ON s.id = vs.slot_id
+            INNER JOIN available_games ag ON ag.id = s.gaming_type_id
+            WHERE vs.date IN :dates 
+              AND s.gaming_type_id IN :game_ids
+              AND ag.vendor_id = :vendorId
+            ORDER BY vs.date, s.start_time ASC
+        """)
+        
+        result = db.session.execute(
+            sql_query, 
+            {
+                "dates": tuple(formatted_dates), 
+                "game_ids": tuple(game_ids),
+                "vendorId": vendorId
+            }
+        ).fetchall()
+        
+        # 🔥 Group results by date
+        slots_by_date = {}
+        for date in dates:
+            slots_by_date[date] = []
+        
+        for row in result:
+            # Convert date back to YYYYMMDD format
+            date_obj = row[1]  # This is the date from database
+            date_key = date_obj.strftime("%Y%m%d")
+            
+            slots_by_date[date_key].append({
+                "slot_id": row[0],
+                "start_time": row[4].strftime("%H:%M:%S") if hasattr(row[4], 'strftime') else str(row[4]),
+                "end_time": row[5].strftime("%H:%M:%S") if hasattr(row[5], 'strftime') else str(row[5]),
+                "is_available": row[2],
+                "available_slot": row[3],
+                "single_slot_price": row[7],
+                "console_id": row[8]
+            })
+        
+        return jsonify(slots_by_date), 200
+        
+    except Exception as e:
+        current_app.logger.error(f"Batch slots error: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
 
 @slot_blueprint.route('/getSlotList/vendor/<int:vendor_id>/game/<int:game_id>', methods=['GET'])
 def get_next_six_slot_for_game(vendor_id, game_id):
