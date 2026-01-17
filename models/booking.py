@@ -1,17 +1,20 @@
 # models/booking.py
-from sqlalchemy import Column, Integer, ForeignKey, DateTime
+from sqlalchemy import Column, Integer, ForeignKey, DateTime, String, Numeric, Time
 from sqlalchemy.orm import relationship
 from db.extensions import db
 from datetime import datetime
 import pytz
 
+
 from .availableGame import AvailableGame
 from .slot import Slot
 from .accessBookingCode import AccessBookingCode
 
+
 # Helper function to return current IST time
 def current_time_ist():
     return datetime.now(pytz.timezone("Asia/Kolkata"))
+
 
 class Booking(db.Model):
     __tablename__ = 'bookings'
@@ -19,7 +22,23 @@ class Booking(db.Model):
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, nullable=False)
     game_id = Column(Integer, ForeignKey('available_games.id'), nullable=False)
-    slot_id = Column(Integer, ForeignKey('slots.id'), nullable=False)
+    
+    # ✅ NEW: Booking mode
+    booking_mode = Column(
+        String(20), 
+        nullable=False, 
+        default='regular',
+        server_default='regular'
+    )  # 'regular' or 'private'
+    
+    # ✅ slot_id is now nullable for private bookings
+    slot_id = Column(Integer, ForeignKey('slots.id'), nullable=True)
+    
+    # ✅ NEW: Custom time fields for private bookings
+    custom_start_time = Column(Time, nullable=True)
+    custom_end_time = Column(Time, nullable=True)
+    duration_hours = Column(Numeric(5, 2), nullable=True)
+    
     status = db.Column(db.String(20), default='pending_verified')
 
     # ✅ Auto timestamps with IST
@@ -35,14 +54,15 @@ class Booking(db.Model):
     access_code_entry = db.relationship('AccessBookingCode', back_populates='bookings')
 
     def __repr__(self):
-        return f"<Booking user_id={self.user_id} game_id={self.game_id}>"
+        return f"<Booking id={self.id} mode={self.booking_mode} user_id={self.user_id}>"
 
     def to_dict(self):
-        return {
+        """Updated to include private booking fields"""
+        base_dict = {
             'booking_id': self.id,
             'user_id': self.user_id,
             'status': self.status,
-            'slot': self.slot.to_dict_for_booking() if self.slot else None,
+            'booking_mode': self.booking_mode,
             'access_code': self.access_code_entry.access_code if self.access_code_entry else None,
             'book_date': self.transaction.booked_date.isoformat() if self.transaction else None,
             'created_at': self.created_at.astimezone(pytz.timezone("Asia/Kolkata")).isoformat() if self.created_at else None,
@@ -66,3 +86,17 @@ class Booking(db.Model):
                 } for bes in self.booking_extra_services
             ]
         }
+        
+        # ✅ Add slot info for regular bookings
+        if self.booking_mode == 'regular' and self.slot:
+            base_dict['slot'] = self.slot.to_dict_for_booking()
+        
+        # ✅ Add custom time info for private bookings
+        if self.booking_mode == 'private':
+            base_dict.update({
+                'custom_start_time': str(self.custom_start_time) if self.custom_start_time else None,
+                'custom_end_time': str(self.custom_end_time) if self.custom_end_time else None,
+                'duration_hours': float(self.duration_hours) if self.duration_hours else None
+            })
+        
+        return base_dict

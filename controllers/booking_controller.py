@@ -24,7 +24,7 @@ from models.accessBookingCode import AccessBookingCode
 from models.bookingExtraService  import BookingExtraService
 from models.extraServiceCategory import ExtraServiceCategory
 from models.extraServiceMenu import ExtraServiceMenu
-from models.userPass import UserPass
+from models.passModels import UserPass
 from datetime import datetime, timedelta, timezone
 import pytz
 from flask import current_app, jsonify
@@ -356,7 +356,7 @@ def generate_payment_link():
     except Exception as e:
         return jsonify({'message': 'Error creating payment link', 'error': str(e)}), 500
 
-@booking_blueprint.route('/bookings/confirm', methods=['POST'])
+"""@booking_blueprint.route('/bookings/confirm', methods=['POST'])
 def confirm_booking():
     try:
         data = request.get_json(force=True)
@@ -650,7 +650,360 @@ def confirm_booking():
     except Exception as e:
         db.session.rollback()
         current_app.logger.exception("Error confirming booking")
+        return jsonify({'error': str(e)}), 500 """
+
+# controllers/booking_controller.py - UPDATED confirm_booking function
+
+@booking_blueprint.route('/bookings/confirm', methods=['POST'])
+def confirm_booking():
+    try:
+        data = request.get_json(force=True)
+
+        booking_ids = data.get('booking_id')
+        payment_id = data.get('payment_id')
+        book_date_str = data.get('book_date')
+        voucher_code = data.get('voucher_code')
+        payment_mode = data.get('payment_mode', "payment_gateway")
+        
+        # NEW: Hour-based pass parameters
+        use_hour_pass = bool(data.get('use_hour_pass', False))
+        hour_pass_uid = data.get('hour_pass_uid')  # Optional: specific pass
+        
+        # Keep existing date-based pass logic
+        use_pass = bool(data.get('use_pass', False))
+        user_pass_id = data.get('user_pass_id')
+        
+        extra_services_list = data.get('extra_services', [])
+
+        current_app.logger.info(f"Confirm payload: {data}")
+
+        if not booking_ids or not book_date_str:
+            return jsonify({'message': 'booking_id and book_date are required'}), 400
+        
+        # Validate mutual exclusivity
+        if use_hour_pass and use_pass:
+            return jsonify({'message': 'Cannot use both hour-based and date-based pass'}), 400
+        
+        if use_hour_pass and not hour_pass_uid:
+            # Will auto-select best available pass
+            pass
+
+        # Parse book_date
+        try:
+            if 'T' in book_date_str:
+                book_date = datetime.fromisoformat(book_date_str).date()
+            else:
+                book_date = datetime.strptime(book_date_str, '%Y-%m-%d').date()
+        except ValueError:
+            return jsonify({"message": "Invalid book_date format"}), 400
+
+        # Setup Razorpay client
+        RAZORPAY_KEY_ID = current_app.config.get("RAZORPAY_KEY_ID")
+        RAZORPAY_KEY_SECRET = current_app.config.get("RAZORPAY_KEY_SECRET")
+        razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+        razorpay_payment_verified = True
+
+        # Verify Razorpay payment if using gateway
+        if payment_mode == "payment_gateway" and not use_hour_pass:
+            if not payment_id:
+                return jsonify({"message": "payment_id required for payment_gateway mode"}), 400
+            try:
+                payment = razorpay_client.payment.fetch(payment_id)
+                if payment['status'] == 'captured':
+                    razorpay_payment_verified = True
+                else:
+                    return jsonify({"message": "Payment not successful"}), 400
+            except razorpay.errors.RazorpayError as e:
+                return jsonify({"message": "Payment verification failed", "error": str(e)}), 400
+
+        # Create access code
+        code = generate_access_code()
+        access_code_entry = AccessBookingCode(access_code=code)
+        db.session.add(access_code_entry)
+        db.session.flush()
+
+        confirmed_ids = []
+        pass_type_name = None
+        pass_used_id = None
+        user_id = None
+        hour_pass_used = None
+        total_hours_deducted = Decimal('0')
+
+        for booking_id in booking_ids:
+            booking = Booking.query.filter_by(id=booking_id).first()
+            if not booking or booking.status == 'confirmed':
+                continue
+
+            if user_id is None:
+                user_id = booking.user_id
+
+            available_game = AvailableGame.query.filter_by(id=booking.game_id).first()
+            vendor = Vendor.query.filter_by(id=available_game.vendor_id).first() if available_game else None
+            slot_obj = Slot.query.filter_by(id=booking.slot_id).first()
+            user = User.query.filter_by(id=booking.user_id).first()
+
+            if not all([available_game, vendor, slot_obj, user]):
+                current_app.logger.warning(f"Booking {booking_id} missing related data")
+                continue
+
+            # HOUR-BASED PASS LOGIC
+            if use_hour_pass:
+                try:
+                    from services.pass_service import PassService
+                    
+                    # Get valid pass
+                    user_hour_pass = PassService.get_valid_user_pass(
+                        user_id=user.id,
+                        vendor_id=vendor.id,
+                        pass_uid=hour_pass_uid
+                    )
+                    
+                    if not user_hour_pass:
+                        return jsonify({'message': 'No valid hour-based pass found'}), 404
+                    
+                    # Calculate hours for this slot
+                    hours_needed = PassService.calculate_slot_hours(
+                        slot_id=slot_obj.id,
+                        cafe_pass=user_hour_pass.cafe_pass
+                    )
+                    
+                    # Check sufficient balance
+                    if user_hour_pass.remaining_hours < hours_needed:
+                        return jsonify({
+                            'message': f'Insufficient hours. Need: {hours_needed}, Available: {user_hour_pass.remaining_hours}'
+                        }), 400
+                    
+                    # Redeem hours
+                    redemption = PassService.redeem_pass_hours(
+                        user_pass_id=user_hour_pass.id,
+                        vendor_id=vendor.id,
+                        hours_to_deduct=hours_needed,
+                        redemption_method='app_booking',
+                        booking_id=booking.id,
+                        session_start=slot_obj.start_time,
+                        session_end=slot_obj.end_time
+                    )
+                    
+                    hour_pass_used = user_hour_pass
+                    total_hours_deducted += hours_needed
+                    pass_used_id = user_hour_pass.id
+                    pass_type_name = user_hour_pass.cafe_pass.name
+                    
+                    # Slot is free with pass
+                    slot_price = available_game.single_slot_price
+                    discount_amount = slot_price
+                    amount_payable = 0  # Free slot
+                    
+                    current_app.logger.info(
+                        f"Hour pass redeemed: booking_id={booking.id} hours={hours_needed} "
+                        f"remaining={user_hour_pass.remaining_hours}"
+                    )
+                    
+                except ValueError as e:
+                    return jsonify({'message': str(e)}), 400
+                except Exception as e:
+                    current_app.logger.error(f"Hour pass redemption failed: {str(e)}")
+                    return jsonify({'message': 'Pass redemption failed'}), 500
+
+            # EXISTING DATE-BASED PASS LOGIC
+            elif use_pass:
+                active_pass = UserPass.query.filter_by(
+                    id=user_pass_id,
+                    user_id=user.id,
+                    is_active=True,
+                    pass_mode='date_based'  # Ensure date-based
+                ).first()
+                if not active_pass or active_pass.valid_to < book_date:
+                    return jsonify({"message": "Invalid or expired date-based pass"}), 400
+                pass_used_id = active_pass.id
+                pass_type_name = active_pass.cafe_pass.pass_type.name if active_pass.cafe_pass.pass_type else None
+                slot_price = available_game.single_slot_price
+                discount_amount = slot_price
+                amount_payable = 0
+
+            # NO PASS - REGULAR PAYMENT
+            else:
+                slot_price = available_game.single_slot_price
+                discount_amount = 0
+                amount_payable = slot_price
+
+            # Calculate extras total
+            extras_total = 0
+            for extra in extra_services_list:
+                menu_obj = ExtraServiceMenu.query.filter_by(id=extra.get('item_id'), is_active=True).first()
+                if not menu_obj:
+                    continue
+                extras_total += menu_obj.price * extra.get('quantity', 1)
+
+            # Add extras to payable amount
+            amount_payable += extras_total
+
+            # Apply voucher discount (only on remaining amount)
+            voucher = None
+            if voucher_code and amount_payable > 0:
+                voucher = Voucher.query.filter_by(code=voucher_code, user_id=user.id, is_active=True).first()
+                if voucher:
+                    voucher_discount = int(amount_payable * voucher.discount_percentage / 100)
+                    discount_amount += voucher_discount
+                    amount_payable -= voucher_discount
+
+            # Payment processing
+            if payment_mode == "wallet" and amount_payable > 0:
+                BookingService.debit_wallet(user.id, booking.id, amount_payable)
+                payment_mode_used = "wallet"
+            elif use_hour_pass:
+                payment_mode_used = "hour_pass"
+            elif use_pass:
+                payment_mode_used = "date_pass"
+            else:
+                if amount_payable == 0:
+                    payment_mode_used = "free"
+                elif not razorpay_payment_verified:
+                    return jsonify({"message": "Payment not verified"}), 400
+                else:
+                    payment_mode_used = "payment_gateway"
+
+            # Confirm booking
+            booking.status = 'confirmed'
+            booking.updated_at = datetime.utcnow()
+            booking.access_code_id = access_code_entry.id
+
+            # Create transaction
+            transaction = Transaction(
+                booking_id=booking.id,
+                vendor_id=vendor.id,
+                user_id=user.id,
+                user_name=user.name,
+                original_amount=slot_price + extras_total,
+                discounted_amount=discount_amount,
+                amount=amount_payable,
+                mode_of_payment=payment_mode_used,
+                booking_date=datetime.utcnow().date(),
+                booked_date=book_date,
+                booking_time=datetime.utcnow().time(),
+                reference_id=payment_id if payment_mode_used == "payment_gateway" else None
+            )
+            db.session.add(transaction)
+            db.session.flush()
+
+            # Save payment mapping if gateway used
+            if payment_id and payment_mode_used == "payment_gateway":
+                BookingService.save_payment_transaction_mapping(booking.id, transaction.id, payment_id)
+
+            # Save extras
+            BookingExtraService.query.filter_by(booking_id=booking.id).delete()
+            for extra in extra_services_list:
+                menu_obj = ExtraServiceMenu.query.filter_by(id=extra.get('item_id'), is_active=True).first()
+                if not menu_obj:
+                    continue
+
+                quantity = extra.get('quantity', 1)
+                unit_price = menu_obj.price
+                total_price = unit_price * quantity
+
+                booking_extra = BookingExtraService(
+                    booking_id=booking.id,
+                    menu_item_id=menu_obj.id,
+                    quantity=quantity,
+                    unit_price=unit_price,
+                    total_price=total_price
+                )
+                db.session.add(booking_extra)
+
+            # Mark voucher as used
+            if voucher:
+                voucher.is_active = False
+                db.session.add(VoucherRedemptionLog(
+                    user_id=user.id,
+                    voucher_id=voucher.id,
+                    booking_id=booking.id
+                ))
+
+            # Reward Hash Coins (skip if hour pass used to avoid double reward)
+            if not use_hour_pass:
+                user_hash_coin = UserHashCoin.query.filter_by(user_id=user.id).first()
+                if not user_hash_coin:
+                    user_hash_coin = UserHashCoin(user_id=user.id, hash_coins=0)
+                    db.session.add(user_hash_coin)
+                user_hash_coin.hash_coins += 1000
+
+            # Vendor analytics
+            BookingService.insert_into_vendor_dashboard_table(transaction.id, -1)
+            BookingService.insert_into_vendor_promo_table(transaction.id, -1)
+
+            # Emit WebSocket event
+            try:
+                socketio = current_app.extensions.get('socketio')
+                event_payload = build_booking_event_payload(
+                    vendor_id=vendor.id,
+                    booking_id=booking.id,
+                    slot_id=booking.slot_id,
+                    user_id=user.id,
+                    username=user.name,
+                    game_id=booking.game_id,
+                    game_name=available_game.game_name,
+                    date_value=book_date,
+                    slot_price=available_game.single_slot_price,
+                    start_time=slot_obj.start_time,
+                    end_time=slot_obj.end_time,
+                    console_id=None,
+                    status="confirmed",
+                    booking_status="upcoming"
+                )
+                emit_booking_event(socketio, event="booking", data=event_payload, vendor_id=vendor.id)
+                socketio.emit("booking_admin", event_payload, to="dashboard_admin")
+            except Exception as e:
+                current_app.logger.exception(f"WebSocket emit failed: {e}")
+
+            # Send confirmation email
+            booking_mail(
+                gamer_name=user.name,
+                gamer_phone=user.contact_info.phone,
+                gamer_email=user.contact_info.email,
+                cafe_name=vendor.cafe_name,
+                booking_date=datetime.utcnow().strftime("%Y-%m-%d"),
+                booked_for_date=str(book_date),
+                booking_details=[{
+                    "booking_id": booking.id,
+                    "slot_time": f"{slot_obj.start_time} - {slot_obj.end_time}"
+                }],
+                price_paid=amount_payable
+            )
+
+            confirmed_ids.append(booking.id)
+
+        db.session.commit()
+        
+        response = {
+            'message': 'Bookings confirmed successfully',
+            'confirmed_ids': confirmed_ids,
+            'amount_paid': amount_payable
+        }
+        
+        # Add pass info to response
+        if use_hour_pass and hour_pass_used:
+            response.update({
+                'pass_used_type': 'hour_based',
+                'pass_used_id': pass_used_id,
+                'pass_uid': hour_pass_used.pass_uid,
+                'pass_name': pass_type_name,
+                'hours_deducted': float(total_hours_deducted),
+                'remaining_hours': float(hour_pass_used.remaining_hours)
+            })
+        elif use_pass:
+            response.update({
+                'pass_used_type': 'date_based',
+                'pass_used_id': pass_used_id,
+                'pass_type': pass_type_name
+            })
+        
+        return jsonify(response), 200
+
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.exception("Error confirming booking")
         return jsonify({'error': str(e)}), 500
+
 
 @booking_blueprint.route('/redeem-voucher', methods=['POST'])
 @auth_required_self(decrypt_user=True) 
@@ -1123,11 +1476,11 @@ def get_vendor_bookings(vendor_id):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# routes/booking_routes.py or your existing booking file
 @booking_blueprint.route('/newBooking/vendor/<int:vendor_id>', methods=['POST'])
 def new_booking(vendor_id):
     """
     Creates a new booking for the given vendor with optional extra services/meals
+    Supports both regular and private booking modes via toggle
     """
     try:
         current_app.logger.info("New Booking Triggered")
@@ -1146,30 +1499,40 @@ def new_booking(vendor_id):
         user_id = data.get("userId")
         waive_off_total = float(data.get("waiveOffAmount", 0.0))
         extra_controller_fare = float(data.get("extraControllerFare", 0.0))
-        
-        # NEW: Handle extra services/meals
         selected_meals = data.get("selectedMeals", [])
+        
+        # ✅ NEW: Get booking mode from frontend
+        booking_mode = data.get("bookingMode", "regular")
 
-        # ✅ CRITICAL FIX: Log received console type
-        current_app.logger.info(f"📋 RECEIVED CONSOLE TYPE: {console_type}")
+        # ✅ Validate booking mode
+        if booking_mode not in ['regular', 'private']:
+            current_app.logger.warning(f"Invalid booking_mode '{booking_mode}', defaulting to 'regular'")
+            booking_mode = 'regular'
+
+        # ✅ Log received data with booking mode
+        current_app.logger.info(
+            f"📋 Booking Request: vendor={vendor_id}, mode={booking_mode}, "
+            f"console={console_type}, slots={len(slot_ids) if slot_ids else 0}, payment={payment_type}"
+        )
 
         dashboard_status = None
 
+        # Validate required fields
         if not all([name, phone, booked_date, slot_ids, payment_type]):
             return jsonify({"message": "Missing required fields"}), 400
 
-        # ✅ CRITICAL FIX: Validate console type
+        # ✅ Validate console type
         if not console_type:
             return jsonify({"message": "Console type is required"}), 400
 
-        # ✅ ENHANCED: Get all available games for vendor first to see what we have
+        # ✅ Get all available games for vendor
         all_games = db.session.query(AvailableGame).filter_by(vendor_id=vendor_id).all()
         
         current_app.logger.info(f"🔍 Available games for vendor {vendor_id}:")
         for game in all_games:
             current_app.logger.info(f"  Game ID {game.id}: name='{game.game_name}', price={game.single_slot_price}")
 
-        # ✅ STRATEGY 1: Try to match by console_id if provided (from frontend)
+        # ✅ STRATEGY 1: Try to match by console_id if provided
         available_game = None
         
         if console_id:
@@ -1188,7 +1551,6 @@ def new_booking(vendor_id):
             
             try:
                 if console_type_lower == 'pc':
-                    # Try different PC variations
                     available_game = db.session.query(AvailableGame).filter(
                         AvailableGame.vendor_id == vendor_id,
                         AvailableGame.game_name.ilike('%pc%')
@@ -1207,7 +1569,6 @@ def new_booking(vendor_id):
                         ).first()
                         
                 elif console_type_lower == 'ps5':
-                    # Try different PS5 variations
                     available_game = db.session.query(AvailableGame).filter(
                         AvailableGame.vendor_id == vendor_id,
                         AvailableGame.game_name.ilike('%ps5%')
@@ -1226,7 +1587,6 @@ def new_booking(vendor_id):
                         ).first()
                         
                 elif console_type_lower == 'xbox':
-                    # Try different Xbox variations
                     available_game = db.session.query(AvailableGame).filter(
                         AvailableGame.vendor_id == vendor_id,
                         AvailableGame.game_name.ilike('%xbox%')
@@ -1239,7 +1599,6 @@ def new_booking(vendor_id):
                         ).first()
                         
                 elif console_type_lower == 'vr':
-                    # Try different VR variations
                     available_game = db.session.query(AvailableGame).filter(
                         AvailableGame.vendor_id == vendor_id,
                         AvailableGame.game_name.ilike('%vr%')
@@ -1263,29 +1622,7 @@ def new_booking(vendor_id):
             except Exception as e:
                 current_app.logger.warning(f"Error in pattern matching: {str(e)}")
 
-        # ✅ STRATEGY 3: Manual ID mapping (customize based on your actual game IDs)
-        if not available_game:
-            current_app.logger.info(f"🔍 Using manual console type mapping")
-            
-            # 🎯 IMPORTANT: Update these mappings based on the logged game IDs above
-            # Check your backend logs to see the actual game IDs and names for your vendor
-            console_type_id_mapping = {
-                'PC': None,    # Example: 'PC': 1 (set to actual PC game ID)
-                'PS5': None,   # Example: 'PS5': 2 (set to actual PS5 game ID)  
-                'Xbox': None,  # Example: 'Xbox': 3 (set to actual Xbox game ID)
-                'VR': None     # Example: 'VR': 4 (set to actual VR game ID)
-            }
-            
-            mapped_id = console_type_id_mapping.get(console_type)
-            if mapped_id:
-                available_game = db.session.query(AvailableGame).filter_by(
-                    vendor_id=vendor_id,
-                    id=mapped_id
-                ).first()
-                if available_game:
-                    current_app.logger.info(f"✅ Found match by manual mapping: ID {mapped_id} -> {available_game.game_name}")
-
-        # ✅ STRATEGY 4: Fallback to first available game (original behavior)  
+        # ✅ STRATEGY 3: Fallback to first available game
         if not available_game:
             current_app.logger.warning(f"⚠️ No specific match found, using first available game for vendor {vendor_id}")
             available_game = db.session.query(AvailableGame).filter_by(vendor_id=vendor_id).first()
@@ -1296,8 +1633,11 @@ def new_booking(vendor_id):
             current_app.logger.error(f"❌ No games found for vendor {vendor_id}")
             return jsonify({"message": "Game not found for this vendor"}), 404
 
-        # ✅ LOG the final selected game
-        current_app.logger.info(f"🎮 FINAL SELECTED GAME: ID={available_game.id}, Name='{available_game.game_name}', Price={available_game.single_slot_price}, Requested_Type={console_type}")
+        # ✅ LOG the final selected game with booking mode
+        current_app.logger.info(
+            f"🎮 FINAL SELECTED GAME: ID={available_game.id}, Name='{available_game.game_name}', "
+            f"Price={available_game.single_slot_price}, Requested_Type={console_type}, Mode={booking_mode}"
+        )
 
         # Validate and calculate extra services cost
         total_meals_cost = 0
@@ -1313,7 +1653,7 @@ def new_booking(vendor_id):
                 if not menu_item_id or quantity <= 0:
                     return jsonify({"message": "Invalid meal data provided"}), 400
                 
-                # Validate menu item exists, is active, and belongs to vendor
+                # Validate menu item
                 menu_item = db.session.query(ExtraServiceMenu).join(
                     ExtraServiceCategory
                 ).filter(
@@ -1358,9 +1698,9 @@ def new_booking(vendor_id):
                 fid=generate_fid(),
                 avatar_path="Not defined",
                 name=name,
-                game_username = name.lower().replace(" ", "_") + str(random.randint(1000, 9999)),
-                parent_type="user",
-                platform="dashboard"
+                game_username=name.lower().replace(" ", "_") + str(random.randint(1000, 9999)),
+                parent_type="user"
+
             )
             contact_info = ContactInfo(
                 phone=phone,
@@ -1373,54 +1713,51 @@ def new_booking(vendor_id):
             db.session.flush()
             current_app.logger.info(f"Created new user: {name}")
 
-        # Validate slots availability
-        placeholders = ", ".join([f":slot_id_{i}" for i in range(len(slot_ids))])
-        slot_params = {f"slot_id_{i}": slot_id for i, slot_id in enumerate(slot_ids)}
+        # Get socketio instance
+        socketio = current_app.extensions.get('socketio')
 
-        slot_entries = db.session.execute(
-            text(f"""
-                SELECT slot_id, available_slot, is_available
-                FROM VENDOR_{vendor_id}_SLOT
-                WHERE slot_id IN ({placeholders})
-                AND date = :booked_date
-            """),
-            {"booked_date": booked_date, **slot_params}
-        ).fetchall()
-
-        if len(slot_entries) != len(slot_ids):
-            return jsonify({"message": "One or more slots not found or unavailable"}), 400
-
-        for slot in slot_entries:
-            if slot[1] <= 0 or not slot[2]:
-                return jsonify({"message": f"Slot {slot[0]} is fully booked"}), 400
-
-        # Create bookings and associated extra services
+        # ✅ MODIFIED: Use BookingService.create_booking with booking_mode
         bookings = []
-        code = generate_access_code()
-        access_code_entry = AccessBookingCode(access_code=code)
-        db.session.add(access_code_entry)
-        db.session.flush()
-
+        failed_slots = []
+        
         for slot_id in slot_ids:
-            slot_obj = db.session.query(Slot).filter_by(id=slot_id).first()
-            
-            # ✅ CRITICAL FIX: Use the correct game_id based on console type matching
-            booking = Booking(
-                slot_id=slot_id,
-                game_id=available_game.id,  # ✅ Now uses the matched game ID
-                user_id=user.id,
-                status="confirmed",
-                access_code_id=access_code_entry.id
-            )
-            
-            # ✅ LOG each booking creation
-            current_app.logger.info(f"📝 CREATING BOOKING: slot_id={slot_id}, game_id={available_game.id}, game_name='{available_game.game_name}', requested_console_type={console_type}")
-            
-            db.session.add(booking)
-            db.session.flush()
-            bookings.append(booking)
+            try:
+                # ✅ Use the service method instead of direct creation
+                booking = BookingService.create_booking(
+                    slot_id=slot_id,
+                    game_id=available_game.id,
+                    user_id=user.id,
+                    socketio=socketio,
+                    book_date=datetime.strptime(booked_date, '%Y-%m-%d').date(),
+                    is_pay_at_cafe=(payment_type == 'Cash'),
+                    booking_mode=booking_mode  # ✅ PASS BOOKING MODE HERE
+                )
+                
+                bookings.append(booking)
+                
+                current_app.logger.info(
+                    f"📝 CREATED BOOKING: id={booking.id}, mode={booking_mode}, "
+                    f"slot_id={slot_id}, game='{available_game.game_name}', status={booking.status}"
+                )
+                
+            except ValueError as e:
+                current_app.logger.error(f"Failed to book slot {slot_id}: {str(e)}")
+                failed_slots.append(slot_id)
+                continue
 
-            # Create booking extra services for this booking
+        # Check if any bookings were created
+        if not bookings:
+            return jsonify({
+                "success": False,
+                "message": "Failed to create any bookings",
+                "failed_slots": failed_slots
+            }), 400
+
+        # ✅ Since BookingService.create_booking already handles slot decrement,
+        # we don't need to manually update VENDOR_X_SLOT table here
+
+        # Add extra services to bookings
+        for booking in bookings:
             for meal_detail in meal_details:
                 booking_extra_service = BookingExtraService(
                     booking_id=booking.id,
@@ -1430,29 +1767,28 @@ def new_booking(vendor_id):
                     total_price=meal_detail['total_price']
                 )
                 db.session.add(booking_extra_service)
-                current_app.logger.info(f"Created extra service for booking {booking.id}: {meal_detail['menu_item'].name}")
+                current_app.logger.info(f"Added extra service to booking {booking.id}: {meal_detail['menu_item'].name}")
 
-        # Update slot availability
-        db.session.execute(
-            text(f"""
-                UPDATE VENDOR_{vendor_id}_SLOT
-                SET available_slot = available_slot - 1,
-                    is_available = CASE WHEN available_slot - 1 = 0 THEN FALSE ELSE is_available END
-                WHERE slot_id IN ({placeholders})
-                AND date = :booked_date;
-            """),
-            {"booked_date": booked_date, **slot_params}
-        )
+        # Generate access code
+        code = generate_access_code()
+        access_code_entry = AccessBookingCode(access_code=code)
+        db.session.add(access_code_entry)
+        db.session.flush()
+
+        # Update bookings with access code and confirmed status
+        for booking in bookings:
+            booking.access_code_id = access_code_entry.id
+            booking.status = "confirmed"
+            booking.updated_at = datetime.utcnow()
 
         db.session.commit()
 
-        # Create transaction entries (including meals cost distributed across slots)
+        # Create transaction entries
         transactions = []
         waive_off_per_slot = waive_off_total / len(bookings) if bookings else 0.0
         meals_cost_per_slot = total_meals_cost / len(bookings) if bookings and total_meals_cost > 0 else 0.0
 
-        for i, booking in enumerate(bookings):
-            # Base slot price + proportional meal cost
+        for booking in bookings:
             base_slot_price = available_game.single_slot_price
             slot_meal_cost = meals_cost_per_slot
             
@@ -1478,7 +1814,7 @@ def new_booking(vendor_id):
             db.session.add(transaction)
             transactions.append(transaction)
 
-        # Handle extra controller fare as separate transaction
+        # Handle extra controller fare
         if extra_controller_fare > 0:
             controller_transaction = Transaction(
                 booking_id=bookings[0].id,
@@ -1513,15 +1849,6 @@ def new_booking(vendor_id):
 
         db.session.commit()
 
-        # Socket notifications for real-time updates
-        socketio = current_app.extensions['socketio']
-        for booking in bookings:
-            socketio.emit('slot_booked', {
-                'slot_id': booking.slot_id,
-                'booking_id': booking.id,
-                'status': 'booked'
-            })
-
         # Dashboard and promo table entries
         for trans in transactions:
             console_id_val = console_id if console_id is not None else -1
@@ -1545,7 +1872,6 @@ def new_booking(vendor_id):
         # Send booking confirmation email
         cafe_name = db.session.query(Vendor).filter_by(id=vendor_id).first().cafe_name
         
-        # Enhanced email with meal details
         email_meal_details = []
         if meal_details:
             for detail in meal_details:
@@ -1570,18 +1896,24 @@ def new_booking(vendor_id):
             waive_off_amount=waive_off_total
         )
 
-        # ✅ ENHANCED SUCCESS LOG
-        current_app.logger.info(f"✅ BOOKING SUCCESS: requested_console_type={console_type}, matched_game_id={available_game.id}, matched_game_name='{available_game.game_name}', total_cost=₹{total_paid}")
+        # ✅ ENHANCED SUCCESS LOG with booking mode
+        current_app.logger.info(
+            f"✅ BOOKING SUCCESS: mode={booking_mode}, console_type={console_type}, "
+            f"game_id={available_game.id}, game_name='{available_game.game_name}', "
+            f"bookings_created={len(bookings)}, failed_slots={len(failed_slots)}, total_cost=₹{total_paid}"
+        )
 
-        return jsonify({
+        # ✅ Build response with booking mode
+        response = {
             "success": True,
-            "message": "Booking confirmed successfully",
+            "message": f"{'Private' if booking_mode == 'private' else 'Regular'} booking confirmed successfully",
             "booking_ids": [b.id for b in bookings],
             "transaction_ids": [t.id for t in transactions],
             "access_code": code,
-            "requested_console_type": console_type,           # What was requested from frontend
-            "matched_game_id": available_game.id,             # What game ID was actually used
-            "matched_game_name": available_game.game_name,    # What game name was matched
+            "booking_mode": booking_mode,  # ✅ Return booking mode
+            "requested_console_type": console_type,
+            "matched_game_id": available_game.id,
+            "matched_game_name": available_game.game_name,
             "total_base_cost": total_base_cost,
             "total_meals_cost": total_meals_cost,
             "extra_controller_fare": extra_controller_fare,
@@ -1597,7 +1929,15 @@ def new_booking(vendor_id):
                 }
                 for detail in meal_details
             ]
-        }), 200
+        }
+
+        # ✅ Add failed slots info if any
+        if failed_slots:
+            response['partial_success'] = True
+            response['failed_slots'] = failed_slots
+            response['message'] = f"Created {len(bookings)} bookings ({booking_mode} mode), {len(failed_slots)} slots failed"
+
+        return jsonify(response), 200
 
     except Exception as e:
         db.session.rollback()
@@ -1610,6 +1950,7 @@ def new_booking(vendor_id):
             "message": "Failed to process booking", 
             "error": str(e)
         }), 500
+
 
 
 
@@ -1806,7 +2147,6 @@ def validate_selected_meals(vendor_id):
             'error': str(e)
         }), 500
 
-
 # Get vendor's booking statistics including meals
 @booking_blueprint.route('/vendor/<int:vendor_id>/booking-stats', methods=['GET'])
 def get_vendor_booking_stats(vendor_id):
@@ -1882,9 +2222,6 @@ def get_vendor_booking_stats(vendor_id):
             'success': False,
             'error': str(e)
         }), 500
-
-
-
 
 @booking_blueprint.route('/extraBooking', methods=['POST'])
 def extra_booking():
@@ -2313,9 +2650,7 @@ def release_slot_controller():
     finally:
         db.session.remove()
         
-
 # Add these endpoints to your booking_controller.py
-
 @booking_blueprint.route('/pay-at-cafe/pending/<int:vendor_id>', methods=['GET'])
 def get_pending_pay_at_cafe_bookings(vendor_id):
     """Get all pending pay-at-cafe bookings for a vendor"""
@@ -2419,7 +2754,6 @@ def get_pending_pay_at_cafe_bookings(vendor_id):
             'success': False,
             'error': str(e)
         }), 500
-
 
 @booking_blueprint.route('/pay-at-cafe/accept', methods=['POST'])
 def accept_pay_at_cafe_booking():
@@ -2537,7 +2871,6 @@ def accept_pay_at_cafe_booking():
             "error": str(e)
         }), 500
 
-
 @booking_blueprint.route('/pay-at-cafe/reject', methods=['POST'])
 def reject_pay_at_cafe_booking():
     """Reject a pay-at-cafe booking and change status to cancelled"""
@@ -2625,8 +2958,6 @@ def reject_pay_at_cafe_booking():
             "message": "Failed to reject booking",
             "error": str(e)
         }), 500
-
-
 
 @booking_blueprint.route('/booking/<int:booking_id>/add-meals', methods=['POST', 'OPTIONS'])
 def add_meals_to_booking(booking_id):
@@ -2768,3 +3099,173 @@ def add_meals_to_booking(booking_id):
             "message": "Failed to add meals", 
             "error": str(e)
         }), 500
+
+@booking_blueprint.route('/kiosk/next-slot/vendor/<int:vendor_id>', methods=['POST'])
+def kiosk_book_next_slot(vendor_id):
+    """
+    Kiosk extension booking for the immediate next slot.
+
+    Expected payload:
+    {
+      "bookingType": "extension",
+      "consoleId": 84,
+      "gameId": 47,
+      "slotId": 841,
+      "userId": 56,
+      "paymentType": "pending"
+    }
+    """
+    try:
+        body = request.get_json(force=True) or {}
+        console_id = int(body["consoleId"])
+        game_id = int(body["GameId"]) if "GameId" in body else int(body["gameId"])
+        slot_id = int(body["slotId"])
+        user_id = int(body["userId"])
+        payment_type = body.get("paymentType", "pending")
+
+        # --- 0) Validate and prepare booking times ---
+        slot_row = db.session.query(Slot).filter_by(id=slot_id).first()
+        if not slot_row or slot_row.gaming_type_id != game_id:
+            return jsonify({"success": False, "message": "Invalid slot for this game"}), 400
+
+        booked_date = datetime.utcnow().date()
+        start_dt = datetime.combine(booked_date, slot_row.start_time)
+        end_dt = datetime.combine(booked_date, slot_row.end_time)
+
+        vendor_slot_table = f"VENDOR_{vendor_id}_SLOT"
+        console_table = f"VENDOR_{vendor_id}_CONSOLE_AVAILABILITY"
+        booking_table = f"VENDOR_{vendor_id}_DASHBOARD"
+
+        # --- 1) Lock and update slot availability ---
+        row = db.session.execute(text(f"""
+            SELECT is_available, available_slot
+            FROM {vendor_slot_table}
+            WHERE vendor_id = :vid AND date = :dt AND slot_id = :sid
+            FOR UPDATE
+        """), {"vid": vendor_id, "dt": booked_date, "sid": slot_id}).mappings().first()
+
+        if not row:
+            return jsonify({"success": False, "message": "Vendor slot not found"}), 404
+        if not row["is_available"] or int(row["available_slot"]) <= 0:
+            return jsonify({"success": False, "message": "Slot unavailable"}), 409
+
+        db.session.execute(text(f"""
+            UPDATE {vendor_slot_table}
+            SET available_slot = available_slot - 1,
+                is_available = CASE WHEN available_slot - 1 > 0 THEN TRUE ELSE FALSE END
+            WHERE vendor_id = :vid AND date = :dt AND slot_id = :sid
+        """), {"vid": vendor_id, "dt": booked_date, "sid": slot_id})
+
+        # --- 2) Lock and update console availability ---
+        db.session.execute(text(f"""
+            SELECT is_available
+            FROM {console_table}
+            WHERE console_id = :cid AND game_id = :gid
+            FOR UPDATE
+        """), {"cid": console_id, "gid": game_id})
+        
+        db.session.execute(text(f"""
+            UPDATE {console_table}
+            SET is_available = FALSE
+            WHERE console_id = :cid AND game_id = :gid
+        """), {"cid": console_id, "gid": game_id})
+
+        # --- 3) Create booking record ---
+        booking = Booking(
+            slot_id=slot_id,
+            game_id=game_id,
+            user_id=user_id,
+            status="confirmed"
+        )
+        db.session.add(booking)
+        db.session.flush()
+        new_book_id = booking.id
+
+        # --- 4) Get user name for dashboard ---
+        user = db.session.query(User).filter_by(id=user_id).first()
+        username = user.name if user and user.name else "Unknown"
+
+        # --- 5) Get single slot price (for frontend) ---
+        price_row = db.session.execute(text("""
+            SELECT single_slot_price
+            FROM available_games
+            WHERE id = :gid
+        """), {"gid": game_id}).fetchone()
+        single_price = int(price_row.single_slot_price) if price_row and price_row.single_slot_price else None
+
+        # --- 6) Insert into vendor dashboard ---
+        db.session.execute(text(f"""
+            INSERT INTO {booking_table}
+                (book_id, game_id, date, start_time, end_time,
+                 book_status, console_id, username, user_id, game_name,
+                 status, extra_pay_status)
+            VALUES
+                (:bid, :gid, :dt, :st, :et, 'upcoming', NULL, :uname, :uid, :gname, TRUE, FALSE)
+        """), {
+            "bid": new_book_id,
+            "gid": game_id,
+            "dt": booked_date,
+            "st": start_dt.time(),
+            "et": end_dt.time(),
+            "uname": username,
+            "uid": user_id,
+            "gname": "pc"
+        })
+
+        # --- 7) Mark booking as current and assign console ---
+        db.session.execute(text(f"""
+            UPDATE {booking_table}
+            SET book_status = 'current', console_id = :cid
+            WHERE book_id = :bid AND game_id = :gid
+        """), {"cid": console_id, "bid": new_book_id, "gid": game_id})
+
+        db.session.commit()
+
+        # --- 8) Socket updates ---
+        socketio = current_app.extensions.get('socketio')
+        room = f"vendor_{vendor_id}"
+
+        socketio.emit("current_slot", {
+            "slot_id": slot_id,
+            "book_id": new_book_id,
+            "start_time": start_dt.isoformat(),
+            "end_time": end_dt.isoformat(),
+            "status": "current",
+            "console_id": console_id,
+            "user_id": user_id,
+            "username": username,
+            "game_id": game_id,
+            "date": booked_date.isoformat(),
+            "single_slot_price": single_price
+        }, room=room)
+
+        remaining_row = db.session.execute(text(f"""
+            SELECT COUNT(*) AS remaining
+            FROM {console_table}
+            WHERE game_id = :gid AND is_available = TRUE
+        """), {"gid": game_id}).fetchone()
+        remaining = int(remaining_row.remaining) if remaining_row else 0
+
+        socketio.emit("console_availability", {
+            "vendorId": vendor_id,
+            "game_id": game_id,
+            "console_id": console_id,
+            "is_available": False,
+            "remaining_available_for_game": remaining
+        }, room=room)
+
+        return jsonify({
+            "success": True,
+            "message": "Next slot booked and console assigned successfully",
+            "booking_id": new_book_id,
+            "slot_id": slot_id,
+            "username": username,
+            "start_time": start_dt.isoformat(),
+            "end_time": end_dt.isoformat(),
+            "provisional": True
+        }), 201
+
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.exception("kiosk_book_next_slot error")
+        return jsonify({"success": False, "message": "Server error", "error": str(e)}), 500

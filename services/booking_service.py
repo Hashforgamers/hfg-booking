@@ -10,11 +10,11 @@ from models.user import User
 from models.paymentTransactionMapping import PaymentTransactionMapping
 from models.hashWallet import HashWallet
 from models.hashWalletTransaction import HashWalletTransaction
-from models.userPass import UserPass
+from models.passModels import UserPass
 from sqlalchemy.orm import joinedload
 from models.bookingExtraService import BookingExtraService
 from models.extraServiceMenuImage import ExtraServiceMenuImage
-from models.cafePass import CafePass
+from models.passModels import CafePass
 from models.extraServiceMenu import ExtraServiceMenu
 from sqlalchemy import or_
 from utils.realtime import emit_booking_event
@@ -44,16 +44,12 @@ class BookingService:
         .filter(Booking.user_id == user_id)\
         .all()
 
-    # @staticmethod
-    # def get_user_bookings(user_id):
-    #     return Booking.query.filter_by(user_id=user_id).all()
-
     @staticmethod
     def cancel_booking(booking_id):
         booking = Booking.query.get(booking_id)
         if not booking:
             raise ValueError("Booking does not exist.")
-        
+
         # Free up the slot for the game
         game = AvailableGame.query.get(booking.game_id)
         game.total_slot += 1
@@ -61,7 +57,7 @@ class BookingService:
 
         db.session.delete(booking)
         db.session.commit()
-        
+
         # Emit real-time cancellation event
         socketio.emit('booking_updated', {'booking_id': booking_id, 'status': 'canceled'})
         return {"message": "Booking canceled successfully."}
@@ -70,78 +66,36 @@ class BookingService:
     def verifyPayment(payment_id):
         return payment_id == "1234"
 
-    # @staticmethod
-    # def create_booking_old(slot_id, game_id, user_id, socketio, book_date):
-    #     # ✅ Get vendor_id from available_games
-    #     available_game = db.session.execute(
-    #         text("SELECT vendor_id FROM available_games WHERE id = (SELECT gaming_type_id FROM slots WHERE id = :slot_id)"),
-    #         {"slot_id": slot_id}
-    #     ).fetchone()
-
-    #     if not available_game:
-    #         raise ValueError("Vendor not found for this slot.")
-
-    #     vendor_id = available_game[0]
-
-    #     current_app.logger.info(f"Test1 {vendor_id} . {slot_id}, {book_date}")
-
-    #     # ✅ Check availability in the VENDOR_{vendor_id}_SLOT table
-    #     slot_entry = db.session.execute(
-    #         text(f"""
-    #             SELECT * FROM VENDOR_{vendor_id}_SLOT
-    #             WHERE slot_id = :slot_id AND date = :book_date
-    #         """),
-    #         {"slot_id": slot_id, "book_date": book_date}
-    #     ).fetchone()
-
-    #     current_app.logger.info(f"Test {slot_entry} .")
-
-    #     if not slot_entry or slot_entry[0] <= 0:
-    #         raise ValueError("Slot is fully booked for this date.")
-
-    #     try:
-    #         # ✅ Decrease `available_slot` by 1 in the table
-    #         update_query = text(f"""
-    #             UPDATE VENDOR_{vendor_id}_SLOT
-    #             SET available_slot = available_slot - 1,
-    #                 is_available = CASE WHEN available_slot - 1 = 0 THEN FALSE ELSE is_available END
-    #             WHERE slot_id = :slot_id
-    #             AND date = :book_date;
-    #         """)
-    #         db.session.execute(update_query, {"slot_id": slot_id, "book_date": book_date})
-    #         db.session.commit()
-
-    #         # ✅ Create booking
-    #         booking = Booking(slot_id=slot_id, game_id=game_id, user_id=user_id, status='pending_verified')
-    #         db.session.add(booking)
-    #         db.session.commit()
-
-    #         socketio.emit('slot_pending', {'slot_id': slot_id, 'booking': booking.id, 'status': 'pending'})
-
-    #         if socketio:
-    #             socketio.emit(
-    #                 "booking_updated",
-    #                 {
-    #                     "booking_id": booking.id,
-    #                     "slot_id": slot_id,
-    #                     "status": "pending_verified"
-    #                 },
-    #                 room=f"vendor_{vendor_id}"
-    #             )
-
-    #         return booking
-
-    #     except Exception as e:
-    #         db.session.rollback()
-    #         raise ValueError(f"Failed to create booking: {str(e)}")
-
     @staticmethod
-    def create_booking(slot_id: int, game_id: int, user_id: int, socketio, book_date, is_pay_at_cafe: bool = False):
+    def create_booking(
+        slot_id: int, 
+        game_id: int, 
+        user_id: int, 
+        socketio, 
+        book_date, 
+        is_pay_at_cafe: bool = False,
+        booking_mode: str = 'regular'  # ✅ NEW PARAMETER
+    ):
+        """
+        Create a booking with specified mode.
+
+        Args:
+            booking_mode: 'regular' or 'private' - for tracking/display purposes
+                          Both modes follow same slot availability and payment rules
+        """
         cid = getattr(g, "cid", None) or str(uuid.uuid4())
         log = current_app.logger
 
-        log.info("create_booking.start cid=%s slot_id=%s game_id=%s user_id=%s book_date=%s is_pay_at_cafe=%s",
-                 cid, slot_id, game_id, user_id, book_date, is_pay_at_cafe)
+        log.info(
+            "create_booking.start cid=%s slot_id=%s game_id=%s user_id=%s book_date=%s "
+            "is_pay_at_cafe=%s booking_mode=%s",
+            cid, slot_id, game_id, user_id, book_date, is_pay_at_cafe, booking_mode
+        )
+
+        # ✅ Validate booking_mode
+        if booking_mode not in ['regular', 'private']:
+            log.warning(f"Invalid booking_mode '{booking_mode}', defaulting to 'regular'")
+            booking_mode = 'regular'
 
         # STEP 1: Resolve vendor and game meta (BUGFIX: proper unpack)
         try:
@@ -165,11 +119,13 @@ class BookingService:
 
         # Properly unpack the tuple
         vendor_id = ag_row[0]
-        slot_price = ag_row
-        game_name = ag_row
+        slot_price = ag_row[1]
+        game_name = ag_row[2]
 
-        log.info("create_booking.meta_parsed cid=%s vendor_id=%s slot_price=%s game_name=%s",
-                 cid, vendor_id, slot_price, game_name)
+        log.info(
+            "create_booking.meta_parsed cid=%s vendor_id=%s slot_price=%s game_name=%s mode=%s",
+            cid, vendor_id, slot_price, game_name, booking_mode
+        )
 
         # STEP 2A: Lock and read vendor availability row (match schema)
         try:
@@ -251,19 +207,23 @@ class BookingService:
                         cid, vendor_id, slot_id, date_value)
             raise ValueError("Concurrent booking conflict. Please retry.")
 
-        # STEP 4: Create booking
+        # STEP 4: Create booking with booking_mode
         try:
             booking = Booking(
                 slot_id=slot_id,
                 game_id=game_id,
                 user_id=user_id,
+                booking_mode=booking_mode,  # ✅ SET THE MODE HERE
                 status="pending_acceptance" if is_pay_at_cafe else "pending_verified",
                 created_at=datetime.utcnow()
             )
             db.session.add(booking)
             db.session.flush()
             bid = booking.id
-            log.info("create_booking.booking_created cid=%s bid=%s", cid, bid)
+            log.info(
+                "create_booking.booking_created cid=%s bid=%s mode=%s status=%s", 
+                cid, bid, booking_mode, booking.status
+            )
         except Exception as e:
             db.session.rollback()
             log.exception("create_booking.booking_persist_failed cid=%s vendor_id=%s slot_id=%s error=%s",
@@ -286,71 +246,60 @@ class BookingService:
         # STEP 6: Commit DB
         try:
             db.session.commit()
-            log.info("create_booking.db_committed cid=%s bid=%s", cid, bid)
+            log.info("create_booking.db_committed cid=%s bid=%s mode=%s", cid, bid, booking_mode)
         except Exception as e:
             db.session.rollback()
             log.exception("create_booking.db_commit_failed cid=%s bid=%s error=%s", cid, bid, e)
             raise
 
-        # STEP 7: Emit event (non-fatal)
+        # STEP 7: Emit event (non-fatal) with booking_mode
         try:
             machine_status = "pending_acceptance" if is_pay_at_cafe else "pending_verified"
-            log.info("create_booking.emit_prepare cid=%s bid=%s status=%s", cid, bid, machine_status)
+            log.info("create_booking.emit_prepare cid=%s bid=%s status=%s mode=%s", 
+                     cid, bid, machine_status, booking_mode)
 
+            event_data = {
+                "vendor_id": vendor_id,
+                "booking_id": bid,
+                "slot_id": slot_id,
+                "user_id": user_id,
+                "username": username,
+                "game_id": game_id,
+                "game": game_name,
+                "consoleType": f"Console-{console_id}" if console_id is not None else None,
+                "consoleNumber": str(console_id) if console_id is not None else None,
+                "date": date_value,
+                "slot_price": slot_price,
+                "time": [{"start_time": start_time, "end_time": end_time}],
+                "processed_time": [{"start_time": start_time, "end_time": end_time}],
+                "status": machine_status,
+                "booking_status": "pending_acceptance" if is_pay_at_cafe else "pending_verified",
+                "booking_mode": booking_mode,  # ✅ ADD MODE TO EVENT
+                "cid": cid,
+            }
+
+            # Emit to vendor room
             emit_booking_event(
                 socketio,
                 event="booking",
-                data={
-                    "vendor_id": vendor_id,
-                    "booking_id": bid,
-                    "slot_id": slot_id,
-                    "user_id": user_id,
-                    "username": username,
-                    "game_id": game_id,
-                    "game": game_name,
-                    "consoleType": f"Console-{console_id}" if console_id is not None else None,
-                    "consoleNumber": str(console_id) if console_id is not None else None,
-                    "date": date_value,
-                    "slot_price": slot_price,
-                    "time": [{"start_time": start_time, "end_time": end_time}],
-                    "processed_time": [{"start_time": start_time, "end_time": end_time}],
-                    "status": machine_status,
-                    "booking_status": "pending_acceptance" if is_pay_at_cafe else "pending_verified",
-                    "cid": cid,
-                },
+                data=event_data,
                 vendor_id=vendor_id
             )
 
+            # Emit to admin dashboard
             emit_booking_event(
                 socketio,
                 event="booking",
-                data={
-                    "vendor_id": vendor_id,
-                    "booking_id": bid,
-                    "slot_id": slot_id,
-                    "user_id": user_id,
-                    "username": username,
-                    "game_id": game_id,
-                    "game": game_name,
-                    "consoleType": f"Console-{console_id}" if console_id is not None else None,
-                    "consoleNumber": str(console_id) if console_id is not None else None,
-                    "date": date_value,
-                    "slot_price": slot_price,
-                    "time": [{"start_time": start_time, "end_time": end_time}],
-                    "processed_time": [{"start_time": start_time, "end_time": end_time}],
-                    "status": machine_status,
-                    "booking_status": "pending_acceptance" if is_pay_at_cafe else "pending_verified",
-                    "cid": cid,
-                },
+                data=event_data,
                 room="dashboard_admin"
             )
-            log.info("create_booking.emit_done cid=%s bid=%s", cid, bid)
+
+            log.info("create_booking.emit_done cid=%s bid=%s mode=%s", cid, bid, booking_mode)
         except Exception as e:
             log.exception("create_booking.emit_failed cid=%s bid=%s error=%s", cid, bid, e)
 
-        log.info("create_booking.success cid=%s bid=%s", cid, bid)
+        log.info("create_booking.success cid=%s bid=%s mode=%s", cid, bid, booking_mode)
         return booking
-
 
     @staticmethod
     def release_slot(slot_id, booking_id, book_date):
@@ -359,13 +308,13 @@ class BookingService:
 
         # Create the Flask app
         app, _ = create_app()
-        
+
         # Push the application context inside the job
         with app.app_context():
             try:
                 booking = Booking.query.get(booking_id)
 
-                if booking and booking.status  in ["pending_verified", "cancelled"]:
+                if booking and booking.status in ["pending_verified", "cancelled"]:
                     # ✅ Get vendor_id from available_games
                     available_game = db.session.execute(
                         text("SELECT vendor_id FROM available_games WHERE id = (SELECT gaming_type_id FROM slots WHERE id = :slot_id)"),
@@ -412,7 +361,7 @@ class BookingService:
     @staticmethod
     def insert_into_vendor_dashboard_table(trans_id, console_id, status=None):
         """Inserts booking and transaction details into the vendor dashboard table."""
-        
+
         # Fetch required objects
         trans_obj = Transaction.query.filter_by(id=trans_id).first()
         if not trans_obj:
@@ -422,7 +371,7 @@ class BookingService:
         book_obj = Booking.query.filter_by(id=trans_obj.booking_id).first()
         slot_obj = Slot.query.filter_by(id=book_obj.slot_id).first()
         available_game_obj = AvailableGame.query.filter_by(id=book_obj.game_id).first()
-        if status!= None and status == "current":
+        if status != None and status == "current":
             book_status = "current"
         elif book_obj.status == "extra":
             book_status = "extra"
@@ -450,7 +399,7 @@ class BookingService:
             "game_id": book_obj.game_id,
             "game_name": available_game_obj.game_name,
             "console_id": console_id,
-            "book_status":book_status
+            "book_status": book_status
         })
 
         db.session.commit()
@@ -525,7 +474,7 @@ class BookingService:
     def save_payment_transaction_mapping(booking_id, transaction_id, payment_id):
         if not all([booking_id, transaction_id, payment_id]):
             return  # Skip if any of the values are missing
-        
+
         mapping = PaymentTransactionMapping(
             booking_id=booking_id,
             transaction_id=transaction_id,
@@ -575,4 +524,3 @@ class BookingService:
     def get_menu_price(menu_id):
         menu_obj = ExtraServiceMenu.query.filter_by(id=menu_id, is_active=True).first()
         return menu_obj.price if menu_obj else 0
-    
