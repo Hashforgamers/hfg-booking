@@ -3269,3 +3269,123 @@ def kiosk_book_next_slot(vendor_id):
         db.session.rollback()
         current_app.logger.exception("kiosk_book_next_slot error")
         return jsonify({"success": False, "message": "Server error", "error": str(e)}), 500
+
+
+@booking_blueprint.route('/vendor/<int:vendor_id>/slot-bookings', methods=['GET'])
+def get_slot_bookings(vendor_id):
+    """
+    Get all bookings for specific slot(s) and date
+    Query params: slot_ids (comma-separated), date (YYYY-MM-DD)
+    """
+    try:
+        # Get query parameters
+        slot_ids_param = request.args.get('slot_ids')  # e.g., "1,2,3"
+        date_param = request.args.get('date')  # e.g., "2026-01-17"
+        
+        if not slot_ids_param or not date_param:
+            return jsonify({
+                'success': False,
+                'message': 'slot_ids and date are required'
+            }), 400
+        
+        # Parse slot IDs
+        try:
+            slot_ids = [int(sid.strip()) for sid in slot_ids_param.split(',')]
+        except ValueError:
+            return jsonify({
+                'success': False,
+                'message': 'Invalid slot_ids format'
+            }), 400
+        
+        # Parse date
+        try:
+            booking_date = datetime.strptime(date_param, '%Y-%m-%d').date()
+        except ValueError:
+            return jsonify({
+                'success': False,
+                'message': 'Invalid date format. Use YYYY-MM-DD'
+            }), 400
+        
+        current_app.logger.info(
+            f"Fetching bookings for vendor={vendor_id} slots={slot_ids} date={booking_date}"
+        )
+        
+        # Query bookings with all related data
+        # ✅ FIXED: Changed ContactInfo.user_id to ContactInfo.parent_id
+        bookings_query = db.session.query(Booking)\
+            .join(Transaction, Transaction.booking_id == Booking.id)\
+            .join(User, User.id == Booking.user_id)\
+            .join(ContactInfo, (ContactInfo.parent_id == User.id) & (ContactInfo.parent_type == 'user'))\
+            .outerjoin(BookingExtraService, BookingExtraService.booking_id == Booking.id)\
+            .outerjoin(ExtraServiceMenu, ExtraServiceMenu.id == BookingExtraService.menu_item_id)\
+            .filter(
+                Booking.slot_id.in_(slot_ids),
+                Transaction.booked_date == booking_date,
+                Transaction.vendor_id == vendor_id,
+                Booking.status.in_(['confirmed', 'checked_in', 'completed', 'pending_verified', 'pending_acceptance'])
+            )\
+            .options(
+                joinedload(Booking.transaction),
+                joinedload(Booking.slot),
+                joinedload(Booking.booking_extra_services).joinedload(BookingExtraService.extra_service_menu)
+            )\
+            .distinct()\
+            .all()
+        
+        current_app.logger.info(f"Found {len(bookings_query)} bookings")
+        
+        # Format response
+        bookings_data = []
+        for booking in bookings_query:
+            # Get user details
+            user = User.query.filter_by(id=booking.user_id).first()
+            # ✅ FIXED: Changed user_id to parent_id and added parent_type filter
+            contact_info = ContactInfo.query.filter_by(
+                parent_id=user.id,
+                parent_type='user'
+            ).first() if user else None
+            
+            # Get meal selections
+            meals = []
+            for extra_service in booking.booking_extra_services:
+                if extra_service.extra_service_menu:
+                    meals.append({
+                        'name': extra_service.extra_service_menu.name,
+                        'quantity': extra_service.quantity,
+                        'price': float(extra_service.unit_price),
+                        'total': float(extra_service.total_price)
+                    })
+            
+            # Format meal selection display
+            meal_text = "No meal selected"
+            if meals:
+                meal_text = ", ".join([f"{m['quantity']}x {m['name']}" for m in meals])
+            
+            bookings_data.append({
+                'booking_id': booking.id,
+                'booking_fid': f"#BK-{booking.id}",
+                'customer_name': user.name if user else "Unknown",
+                'customer_email': contact_info.email if contact_info else "N/A",
+                'customer_phone': contact_info.phone if contact_info else "N/A",
+                'status': booking.status,
+                'meal_selection': meal_text,
+                'meals': meals,
+                'slot_id': booking.slot_id,
+                'booking_mode': booking.booking_mode,
+                'created_at': booking.created_at.isoformat() if booking.created_at else None,
+                'amount_paid': float(booking.transaction.amount) if booking.transaction else 0
+            })
+        
+        return jsonify({
+            'success': True,
+            'bookings': bookings_data,
+            'count': len(bookings_data)
+        }), 200
+        
+    except Exception as e:
+        current_app.logger.exception(f"Error fetching slot bookings: {str(e)}")
+        return jsonify({
+            'success': False,
+            'message': 'Failed to fetch bookings',
+            'error': str(e)
+        }), 500
