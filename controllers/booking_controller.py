@@ -3304,10 +3304,11 @@ def get_slot_bookings(vendor_id):
         )
         
         # Query bookings with all related data
+        # ✅ FIXED: Changed ContactInfo.user_id to ContactInfo.parent_id
         bookings_query = db.session.query(Booking)\
             .join(Transaction, Transaction.booking_id == Booking.id)\
             .join(User, User.id == Booking.user_id)\
-            .join(ContactInfo, ContactInfo.user_id == User.id)\
+            .join(ContactInfo, (ContactInfo.parent_id == User.id) & (ContactInfo.parent_type == 'user'))\
             .outerjoin(BookingExtraService, BookingExtraService.booking_id == Booking.id)\
             .outerjoin(ExtraServiceMenu, ExtraServiceMenu.id == BookingExtraService.menu_item_id)\
             .filter(
@@ -3331,7 +3332,11 @@ def get_slot_bookings(vendor_id):
         for booking in bookings_query:
             # Get user details
             user = User.query.filter_by(id=booking.user_id).first()
-            contact_info = ContactInfo.query.filter_by(user_id=user.id).first() if user else None
+            # ✅ FIXED: Changed user_id to parent_id and added parent_type filter
+            contact_info = ContactInfo.query.filter_by(
+                parent_id=user.id,
+                parent_type='user'
+            ).first() if user else None
             
             # Get meal selections
             meals = []
