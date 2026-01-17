@@ -1682,9 +1682,15 @@ def new_booking(vendor_id):
 
         # Find or create user
         user = (
-            db.session.query(User).filter(User.id == user_id).first()
+            db.session.query(User)
+            .join(ContactInfo)
+            .filter(and_(User.id == user_id, ContactInfo.parent_type == 'user'))
+            .first()
             if user_id
-            else db.session.query(User).join(ContactInfo).filter(ContactInfo.email == email).first()
+            else db.session.query(User)
+            .join(ContactInfo)
+            .filter(and_(ContactInfo.email == email, ContactInfo.parent_type == 'user'))
+            .first()
         )
 
         if not user:
@@ -1694,6 +1700,7 @@ def new_booking(vendor_id):
                 name=name,
                 game_username=name.lower().replace(" ", "_") + str(random.randint(1000, 9999)),
                 parent_type="user"
+
             )
             contact_info = ContactInfo(
                 phone=phone,
