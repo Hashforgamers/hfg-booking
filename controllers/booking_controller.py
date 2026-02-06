@@ -2955,7 +2955,7 @@ def reject_pay_at_cafe_booking():
 @booking_blueprint.route('/booking/<int:booking_id>/add-meals', methods=['POST', 'OPTIONS'])
 def add_meals_to_booking(booking_id):
     """
-    Add additional meals to an existing booking
+    Add additional meals to an existing booking and update total amount
     """
     # Handle CORS preflight request
     if request.method == 'OPTIONS':
@@ -2985,6 +2985,7 @@ def add_meals_to_booking(booking_id):
             return jsonify({"success": False, "message": "Game not found"}), 404
         
         vendor_id = available_game.vendor_id
+        vendor = db.session.query(Vendor).filter_by(id=vendor_id).first()
         current_app.logger.info(f"Adding meals to booking {booking_id} for vendor {vendor_id}")
         
         # Validate and process meals
@@ -2998,7 +2999,7 @@ def add_meals_to_booking(booking_id):
             if not menu_item_id or quantity <= 0:
                 return jsonify({"success": False, "message": "Invalid meal data provided"}), 400
             
-            # ✅ FIX: Use correct relationship names from your models
+            # Validate menu item
             menu_item = db.session.query(ExtraServiceMenu).join(
                 ExtraServiceCategory
             ).filter(
@@ -3038,10 +3039,31 @@ def add_meals_to_booking(booking_id):
             db.session.add(booking_extra_service)
             current_app.logger.info(f"Created extra service for booking {booking_id}: {meal_detail['menu_item'].name}")
         
-        # Create additional transaction for the meals cost
-        user = db.session.query(User).filter_by(id=booking.user_id).first()
+        # ✅ UPDATE: Find and update the original booking transaction amount
+        # Look for the main booking transaction (direct, slot, or any non-additional type)
+        main_transaction = db.session.query(Transaction).filter(
+            Transaction.booking_id == booking_id,
+            Transaction.booking_type.in_(['direct', 'slot'])  # Main booking types
+        ).first()
         
-        # Use current date as fallback for booking date
+        # If no 'direct' or 'slot', try to find any primary transaction
+        if not main_transaction:
+            main_transaction = db.session.query(Transaction).filter(
+                Transaction.booking_id == booking_id,
+                Transaction.booking_type.notin_(['additional_meals', 'extra', 'extracontroller'])
+            ).order_by(Transaction.id.asc()).first()
+        
+        if main_transaction:
+            # Update the transaction amount to include meals
+            old_amount = main_transaction.amount
+            main_transaction.original_amount += total_meals_cost
+            main_transaction.amount += total_meals_cost
+            current_app.logger.info(f"✅ Updated booking transaction #{main_transaction.id}: ₹{old_amount} → ₹{main_transaction.amount}")
+        else:
+            current_app.logger.warning(f"⚠️ No main transaction found for booking {booking_id}, creating new transaction")
+        
+        # Create additional transaction record for tracking meals separately
+        user = db.session.query(User).filter_by(id=booking.user_id).first()
         booking_date = datetime.utcnow().date()
         
         additional_transaction = Transaction(
@@ -3061,15 +3083,74 @@ def add_meals_to_booking(booking_id):
         )
         db.session.add(additional_transaction)
         
+        # Commit database changes first
         db.session.commit()
+        current_app.logger.info(f"✅ Database changes committed for booking {booking_id}")
+        
+        # ✅ NEW: Send email notification with meal details using dedicated function
+        try:
+            if user:
+                contact_info = db.session.query(ContactInfo).filter_by(
+                    parent_id=user.id, 
+                    parent_type='user'
+                ).first()
+                
+                slot = db.session.query(Slot).filter_by(id=booking.slot_id).first()
+                
+                if contact_info and contact_info.email:
+                    # Prepare meal details for email
+                    email_meal_details = []
+                    for detail in meal_details:
+                        email_meal_details.append({
+                            'name': detail['menu_item'].name,
+                            'quantity': detail['quantity'],
+                            'unit_price': float(detail['unit_price']),
+                            'total_price': float(detail['total_price'])
+                        })
+                    
+                    # Calculate updated total
+                    updated_total = float(main_transaction.amount) if main_transaction else float(total_meals_cost)
+                    
+                    # Format slot time
+                    if slot and slot.start_time and slot.end_time:
+                        slot_time = f"{slot.start_time.strftime('%I:%M %p')} - {slot.end_time.strftime('%I:%M %p')}"
+                    else:
+                        slot_time = "N/A"
+                    
+                    # ✅ Use the dedicated meals_added_mail function
+                    from services.mailservice import meals_added_mail
+                    
+                    meals_added_mail(
+                        gamer_name=user.name,
+                        gamer_email=contact_info.email,
+                        cafe_name=vendor.cafename if vendor else "Gaming Cafe",
+                        booking_id=booking.id,
+                        slot_time=slot_time,
+                        added_meals=email_meal_details,
+                        meals_total=float(total_meals_cost),
+                        updated_booking_total=updated_total,
+                        booking_date=booking.created_at.strftime('%Y-%m-%d') if booking.created_at else datetime.utcnow().strftime('%Y-%m-%d')
+                    )
+                    
+                    current_app.logger.info(f"✅ Meals added email sent successfully to {contact_info.email}")
+                else:
+                    current_app.logger.warning(f"⚠️ No email address found for user {user.id}")
+        except Exception as email_error:
+            # Don't fail the request if email fails - log and continue
+            current_app.logger.error(f"❌ Failed to send email notification: {str(email_error)}")
+            import traceback
+            current_app.logger.error(f"Email error traceback: {traceback.format_exc()}")
         
         current_app.logger.info(f"✅ Successfully added {len(meal_details)} meals to booking {booking_id}, total cost: ₹{total_meals_cost}")
         
+        # Return success response with all details
         return jsonify({
             "success": True,
             "message": "Meals added successfully",
             "booking_id": booking_id,
             "total_meals_cost": float(total_meals_cost),
+            "updated_booking_amount": float(main_transaction.amount) if main_transaction else None,
+            "previous_booking_amount": float(main_transaction.amount - total_meals_cost) if main_transaction else None,
             "added_meals": [
                 {
                     "name": detail['menu_item'].name,
@@ -3079,19 +3160,22 @@ def add_meals_to_booking(booking_id):
                     "total_price": float(detail['total_price'])
                 }
                 for detail in meal_details
-            ]
+            ],
+            "email_sent": contact_info.email if (user and contact_info and contact_info.email) else None
         }), 200
         
     except Exception as e:
         db.session.rollback()
-        current_app.logger.error(f"❌ Failed to add meals to booking {booking_id}: {str(e)}")
+        current_app.logger.error(f'❌ Failed to add meals to booking {booking_id}: {str(e)}')
         import traceback
-        current_app.logger.error(f"❌ Traceback: {traceback.format_exc()}")
+        current_app.logger.error(f'Traceback: {traceback.format_exc()}')
         return jsonify({
             "success": False,
-            "message": "Failed to add meals", 
+            "message": "Failed to add meals",
             "error": str(e)
         }), 500
+
+
 
 @booking_blueprint.route('/kiosk/next-slot/vendor/<int:vendor_id>', methods=['POST'])
 def kiosk_book_next_slot(vendor_id):
