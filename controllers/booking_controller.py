@@ -3123,7 +3123,7 @@ def add_meals_to_booking(booking_id):
                     meals_added_mail(
                         gamer_name=user.name,
                         gamer_email=contact_info.email,
-                        cafe_name=vendor.cafename if vendor else "Gaming Cafe",
+                        cafe_name=vendor.cafe_name if vendor else "Gaming Cafe",
                         booking_id=booking.id,
                         slot_time=slot_time,
                         added_meals=email_meal_details,
