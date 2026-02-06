@@ -3125,7 +3125,7 @@ def add_meals_to_booking(booking_id):
                         slot_time = "N/A"
                     
                     # ✅ Use the dedicated meals_added_mail function
-                    from services.mailservice import meals_added_mail
+                    from services.mail_service import meals_added_mail
                     
                     meals_added_mail(
                         gamer_name=user.name,
