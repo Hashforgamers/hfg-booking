@@ -24,7 +24,8 @@ socketio = SocketIO(
         "https://dashboard.hashforgamers.co.in",
         "https://amritb.github.io",   # ✅ added here
         "https://hfg-booking-hmnx.onrender.com",
-        "https://hfg-booking.onrender.com"
+        "https://hfg-booking.onrender.com",
+        "https://dashboard.hashforgamers.com"
     ],
     logger=True,
     engineio_logger=True
