@@ -28,6 +28,8 @@ class AvailableGame(db.Model):
 
     # Relationship with Booking (one-to-many)
     bookings = relationship('Booking', back_populates='game', cascade="all, delete-orphan")
+    
+    consoles = relationship('Console', secondary='available_game_console', back_populates='available_games')
 
     def to_dict_for_booking(self):
         return {
