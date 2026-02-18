@@ -2,7 +2,7 @@
 from sqlalchemy import Column, Integer, String, Numeric, Date, Time, Boolean, DateTime, ForeignKey, CheckConstraint
 from sqlalchemy.orm import relationship
 from datetime import datetime, date, time as dt_time
-from app.extension.extensions import db
+from db.extensions import db
 import pytz
 
 
