@@ -25,6 +25,7 @@ from models.bookingExtraService  import BookingExtraService
 from models.extraServiceCategory import ExtraServiceCategory
 from models.extraServiceMenu import ExtraServiceMenu
 from models.passModels import UserPass
+from models.consolePricingOffer import ConsolePricingOffer
 from datetime import datetime, timedelta, timezone
 import pytz
 from flask import current_app, jsonify
@@ -58,6 +59,26 @@ import uuid
 from utils.common import generate_fid, generate_access_code, get_razorpay_keys
 
 booking_blueprint = Blueprint('bookings', __name__)
+
+
+
+def get_effective_price(vendor_id: int, available_game) -> float:
+    """
+    Returns offered_price if an active pricing offer exists right now,
+    otherwise returns the default single_slot_price.
+    """
+    active_offers = ConsolePricingOffer.query.filter_by(
+        vendor_id=vendor_id,
+        available_game_id=available_game.id,
+        is_active=True
+    ).all()
+
+    current_offer = next((o for o in active_offers if o.is_currently_active()), None)
+
+    if current_offer:
+        return float(current_offer.offered_price)
+    return float(available_game.single_slot_price)
+
 
 @booking_blueprint.route('/create_order', methods=['POST'])
 def create_order():
@@ -790,7 +811,7 @@ def confirm_booking():
                     pass_type_name = user_hour_pass.cafe_pass.name
                     
                     # Slot is free with pass
-                    slot_price = available_game.single_slot_price
+                    slot_price = get_effective_price(vendor.id, available_game)
                     discount_amount = slot_price
                     amount_payable = 0  # Free slot
                     
@@ -817,13 +838,13 @@ def confirm_booking():
                     return jsonify({"message": "Invalid or expired date-based pass"}), 400
                 pass_used_id = active_pass.id
                 pass_type_name = active_pass.cafe_pass.pass_type.name if active_pass.cafe_pass.pass_type else None
-                slot_price = available_game.single_slot_price
+                slot_price = get_effective_price(vendor.id, available_game)
                 discount_amount = slot_price
                 amount_payable = 0
 
             # NO PASS - REGULAR PAYMENT
             else:
-                slot_price = available_game.single_slot_price
+                slot_price = get_effective_price(vendor.id, available_game)
                 discount_amount = 0
                 amount_payable = slot_price
 
@@ -1135,7 +1156,8 @@ def direct_booking():
             )
 
         db.session.commit()  # ✅ Commit only after all bookings succeed
-
+        
+        _price = get_effective_price(available_game.vendor_id, available_game)
         # ✅ Store individual transaction details for each booking
         for booking in bookings:
             transaction = Transaction(
@@ -1145,9 +1167,9 @@ def direct_booking():
                 booked_date=datetime.strptime(booked_date, "%Y-%m-%d").date(),
                 booking_time=datetime.utcnow().time(),
                 user_name=user_name,
-                original_amount=available_game.single_slot_price,
+                original_amount=_price,
+                amount=_price,
                 discounted_amount=0,
-                amount=available_game.single_slot_price,  # Assuming the amount is per slot
                 mode_of_payment=payment_method,
                 booking_type="direct",
                 settlement_status="pending" if payment_status != "paid" else "completed"
@@ -1782,7 +1804,7 @@ def new_booking(vendor_id):
         meals_cost_per_slot = total_meals_cost / len(bookings) if bookings and total_meals_cost > 0 else 0.0
 
         for booking in bookings:
-            base_slot_price = available_game.single_slot_price
+            base_slot_price = get_effective_price(vendor_id, available_game)
             slot_meal_cost = meals_cost_per_slot
             
             original_amount = base_slot_price + slot_meal_cost
@@ -1859,7 +1881,8 @@ def new_booking(vendor_id):
             })
 
         # Calculate total amount paid
-        total_base_cost = available_game.single_slot_price * len(bookings)
+        effective_price = get_effective_price(vendor_id, available_game)
+        total_base_cost = effective_price * len(bookings)
         total_paid = total_base_cost + total_meals_cost + extra_controller_fare - waive_off_total
 
         # Send booking confirmation email
@@ -2791,15 +2814,16 @@ def accept_pay_at_cafe_booking():
         db.session.flush()
         booking.access_code_id = access_code_entry.id
         
+        _price = get_effective_price(vendor_id, available_game)
         # Create transaction record for the confirmed booking
         transaction = Transaction(
             booking_id=booking.id,
             vendor_id=vendor_id,
             user_id=booking.user_id,
             user_name=user.name if user else "Unknown",
-            original_amount=available_game.single_slot_price,
+            original_amount=_price,
+            amount=_price,
             discounted_amount=0,
-            amount=available_game.single_slot_price,
             mode_of_payment="pay_at_cafe",
             booking_date=datetime.utcnow().date(),
             booked_date=booking.created_at.date() if booking.created_at else datetime.utcnow().date(),
@@ -2841,7 +2865,7 @@ def accept_pay_at_cafe_booking():
                     "booking_id": booking.id,
                     "slot_time": f"{slot_obj.start_time} - {slot_obj.end_time}" if slot_obj else "N/A"
                 }],
-                price_paid=available_game.single_slot_price
+                price_paid=get_effective_price(vendor_id, available_game)
             )
         
         # Commit all changes
@@ -3263,12 +3287,15 @@ def kiosk_book_next_slot(vendor_id):
         username = user.name if user and user.name else "Unknown"
 
         # --- 5) Get single slot price (for frontend) ---
-        price_row = db.session.execute(text("""
-            SELECT single_slot_price
-            FROM available_games
-            WHERE id = :gid
-        """), {"gid": game_id}).fetchone()
-        single_price = int(price_row.single_slot_price) if price_row and price_row.single_slot_price else None
+        #price_row = db.session.execute(text("""
+        #   SELECT single_slot_price
+        #     FROM available_games
+        #    WHERE id = :gid
+        #"""), {"gid": game_id}).fetchone()
+        #single_price = int(price_row.single_slot_price) if price_row and price_row.single_slot_price else None
+        
+        available_game_obj = AvailableGame.query.filter_by(id=game_id).first()
+        single_price = int(get_effective_price(vendor_id, available_game_obj)) if available_game_obj else None
 
         # --- 6) Insert into vendor dashboard ---
         db.session.execute(text(f"""

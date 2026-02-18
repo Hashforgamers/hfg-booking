@@ -16,6 +16,8 @@ class Vendor(db.Model):
     transactions = relationship('Transaction', back_populates='vendor', cascade="all, delete-orphan")
 
     extra_service_categories = relationship('ExtraServiceCategory', back_populates='vendor', cascade='all, delete-orphan')
+    
+    consoles = relationship('Console', back_populates='vendor', cascade="all, delete-orphan")
 
     def to_dict_for_booking(self):
         return {
