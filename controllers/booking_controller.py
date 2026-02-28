@@ -35,7 +35,7 @@ IST = pytz.timezone("Asia/Kolkata")
 
 from sqlalchemy.sql import text
 from sqlalchemy.orm import joinedload
-from sqlalchemy import and_
+from sqlalchemy import and_, or_
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy import func, distinct
 from services.mail_service import booking_mail, reject_booking_mail, extra_booking_time_mail
@@ -50,6 +50,7 @@ import hmac
 import hashlib
 import razorpay
 from decimal import Decimal
+from concurrent.futures import ThreadPoolExecutor
 from services.security import auth_required_self
 
 from utils.realtime import build_booking_event_payload
@@ -60,6 +61,7 @@ import uuid
 from utils.common import generate_fid, generate_access_code, get_razorpay_keys
 
 booking_blueprint = Blueprint('bookings', __name__)
+_ASYNC_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="booking-bg")
 
 
 
@@ -68,17 +70,59 @@ def get_effective_price(vendor_id: int, available_game) -> float:
     Returns offered_price if an active pricing offer exists right now,
     otherwise returns the default single_slot_price.
     """
-    active_offers = ConsolePricingOffer.query.filter_by(
-        vendor_id=vendor_id,
-        available_game_id=available_game.id,
-        is_active=True
-    ).all()
+    now_ist = datetime.now(IST)
+    current_date = now_ist.date()
+    current_time = now_ist.time().replace(tzinfo=None)
 
-    current_offer = next((o for o in active_offers if o.is_currently_active()), None)
-
-    if current_offer:
+    current_offer = (
+        ConsolePricingOffer.query
+        .filter(
+            ConsolePricingOffer.vendor_id == vendor_id,
+            ConsolePricingOffer.available_game_id == available_game.id,
+            ConsolePricingOffer.is_active == True,
+            ConsolePricingOffer.start_date <= current_date,
+            ConsolePricingOffer.end_date >= current_date,
+            or_(
+                and_(
+                    ConsolePricingOffer.start_date == ConsolePricingOffer.end_date,
+                    ConsolePricingOffer.start_time <= current_time,
+                    ConsolePricingOffer.end_time >= current_time
+                ),
+                and_(
+                    ConsolePricingOffer.start_date == current_date,
+                    ConsolePricingOffer.end_date > current_date,
+                    ConsolePricingOffer.start_time <= current_time
+                ),
+                and_(
+                    ConsolePricingOffer.start_date < current_date,
+                    ConsolePricingOffer.end_date == current_date,
+                    ConsolePricingOffer.end_time >= current_time
+                ),
+                and_(
+                    ConsolePricingOffer.start_date < current_date,
+                    ConsolePricingOffer.end_date > current_date
+                )
+            )
+        )
+        .order_by(ConsolePricingOffer.offered_price.asc())
+        .first()
+    )
+    if current_offer is not None:
         return float(current_offer.offered_price)
     return float(available_game.single_slot_price)
+
+
+def _send_booking_mail_async(app, mail_jobs):
+    def _runner():
+        with app.app_context():
+            for kwargs in mail_jobs:
+                try:
+                    booking_mail(**kwargs)
+                except Exception as exc:
+                    current_app.logger.exception("booking_mail failed: %s", exc)
+
+    if mail_jobs:
+        _ASYNC_EXECUTOR.submit(_runner)
 
 
 @booking_blueprint.route('/create_order', methods=['POST'])
@@ -719,6 +763,18 @@ def confirm_booking():
         except ValueError:
             return jsonify({"message": "Invalid book_date format"}), 400
 
+        if isinstance(booking_ids, int):
+            booking_ids = [booking_ids]
+        elif not isinstance(booking_ids, list):
+            return jsonify({'message': 'booking_id must be a list or integer'}), 400
+        try:
+            booking_ids = [int(v) for v in booking_ids]
+        except (TypeError, ValueError):
+            return jsonify({'message': 'booking_id contains invalid values'}), 400
+        booking_ids = list(dict.fromkeys(booking_ids))
+        if len(booking_ids) > 20:
+            return jsonify({'message': 'Cannot confirm more than 20 bookings per request'}), 400
+
         # Setup Razorpay client
         RAZORPAY_KEY_ID = current_app.config.get("RAZORPAY_KEY_ID")
         RAZORPAY_KEY_SECRET = current_app.config.get("RAZORPAY_KEY_SECRET")
@@ -747,22 +803,107 @@ def confirm_booking():
         confirmed_ids = []
         pass_type_name = None
         pass_used_id = None
-        user_id = None
         hour_pass_used = None
+        amount_payable = 0
         total_hours_deducted = Decimal('0')
+        mail_jobs = []
+        voucher_used = False
+
+        booking_objects = (
+            Booking.query
+            .options(
+                joinedload(Booking.game),
+                joinedload(Booking.slot),
+            )
+            .filter(Booking.id.in_(booking_ids))
+            .all()
+        )
+        booking_map = {b.id: b for b in booking_objects}
+
+        user_ids = {b.user_id for b in booking_objects}
+        users = (
+            User.query
+            .options(joinedload(User.contact_info))
+            .filter(User.id.in_(user_ids))
+            .all()
+            if user_ids else []
+        )
+        user_map = {u.id: u for u in users}
+
+        vendor_ids = {b.game.vendor_id for b in booking_objects if b.game is not None}
+        vendors = Vendor.query.filter(Vendor.id.in_(vendor_ids)).all() if vendor_ids else []
+        vendor_map = {v.id: v for v in vendors}
+
+        game_ids = {b.game.id for b in booking_objects if b.game is not None}
+        now_ist = datetime.now(IST)
+        current_date = now_ist.date()
+        current_time = now_ist.time().replace(tzinfo=None)
+        offers = (
+            ConsolePricingOffer.query
+            .filter(
+                ConsolePricingOffer.is_active == True,
+                ConsolePricingOffer.available_game_id.in_(game_ids),
+                ConsolePricingOffer.vendor_id.in_(vendor_ids),
+                ConsolePricingOffer.start_date <= current_date,
+                ConsolePricingOffer.end_date >= current_date,
+                or_(
+                    and_(
+                        ConsolePricingOffer.start_date == ConsolePricingOffer.end_date,
+                        ConsolePricingOffer.start_time <= current_time,
+                        ConsolePricingOffer.end_time >= current_time
+                    ),
+                    and_(
+                        ConsolePricingOffer.start_date == current_date,
+                        ConsolePricingOffer.end_date > current_date,
+                        ConsolePricingOffer.start_time <= current_time
+                    ),
+                    and_(
+                        ConsolePricingOffer.start_date < current_date,
+                        ConsolePricingOffer.end_date == current_date,
+                        ConsolePricingOffer.end_time >= current_time
+                    ),
+                    and_(
+                        ConsolePricingOffer.start_date < current_date,
+                        ConsolePricingOffer.end_date > current_date
+                    )
+                )
+            )
+            .all()
+            if game_ids else []
+        )
+        effective_price_by_game = {}
+        for offer in offers:
+            key = offer.available_game_id
+            offered = float(offer.offered_price)
+            if key not in effective_price_by_game or offered < effective_price_by_game[key]:
+                effective_price_by_game[key] = offered
+
+        menu_ids = {extra.get('item_id') for extra in extra_services_list if extra.get('item_id') is not None}
+        menu_rows = (
+            ExtraServiceMenu.query
+            .filter(ExtraServiceMenu.id.in_(menu_ids), ExtraServiceMenu.is_active == True)
+            .all()
+            if menu_ids else []
+        )
+        menu_map = {m.id: m for m in menu_rows}
+
+        user_hash_coins = (
+            UserHashCoin.query.filter(UserHashCoin.user_id.in_(user_ids)).all()
+            if user_ids else []
+        )
+        hash_coin_map = {uhc.user_id: uhc for uhc in user_hash_coins}
+        active_pass_cache = {}
+        voucher_cache = {}
 
         for booking_id in booking_ids:
-            booking = Booking.query.filter_by(id=booking_id).first()
+            booking = booking_map.get(booking_id)
             if not booking or booking.status == 'confirmed':
                 continue
 
-            if user_id is None:
-                user_id = booking.user_id
-
-            available_game = AvailableGame.query.filter_by(id=booking.game_id).first()
-            vendor = Vendor.query.filter_by(id=available_game.vendor_id).first() if available_game else None
-            slot_obj = Slot.query.filter_by(id=booking.slot_id).first()
-            user = User.query.filter_by(id=booking.user_id).first()
+            available_game = booking.game
+            slot_obj = booking.slot
+            user = user_map.get(booking.user_id)
+            vendor = vendor_map.get(available_game.vendor_id) if available_game else None
 
             if not all([available_game, vendor, slot_obj, user]):
                 current_app.logger.warning(f"Booking {booking_id} missing related data")
@@ -812,7 +953,7 @@ def confirm_booking():
                     pass_type_name = user_hour_pass.cafe_pass.name
                     
                     # Slot is free with pass
-                    slot_price = get_effective_price(vendor.id, available_game)
+                    slot_price = effective_price_by_game.get(available_game.id, float(available_game.single_slot_price))
                     discount_amount = slot_price
                     amount_payable = 0  # Free slot
                     
@@ -829,30 +970,33 @@ def confirm_booking():
 
             # EXISTING DATE-BASED PASS LOGIC
             elif use_pass:
-                active_pass = UserPass.query.filter_by(
-                    id=user_pass_id,
-                    user_id=user.id,
-                    is_active=True,
-                    pass_mode='date_based'  # Ensure date-based
-                ).first()
+                pass_cache_key = (user.id, user_pass_id)
+                if pass_cache_key not in active_pass_cache:
+                    active_pass_cache[pass_cache_key] = UserPass.query.filter_by(
+                        id=user_pass_id,
+                        user_id=user.id,
+                        is_active=True,
+                        pass_mode='date_based'
+                    ).first()
+                active_pass = active_pass_cache[pass_cache_key]
                 if not active_pass or active_pass.valid_to < book_date:
                     return jsonify({"message": "Invalid or expired date-based pass"}), 400
                 pass_used_id = active_pass.id
                 pass_type_name = active_pass.cafe_pass.pass_type.name if active_pass.cafe_pass.pass_type else None
-                slot_price = get_effective_price(vendor.id, available_game)
+                slot_price = effective_price_by_game.get(available_game.id, float(available_game.single_slot_price))
                 discount_amount = slot_price
                 amount_payable = 0
 
             # NO PASS - REGULAR PAYMENT
             else:
-                slot_price = get_effective_price(vendor.id, available_game)
+                slot_price = effective_price_by_game.get(available_game.id, float(available_game.single_slot_price))
                 discount_amount = 0
                 amount_payable = slot_price
 
             # Calculate extras total
             extras_total = 0
             for extra in extra_services_list:
-                menu_obj = ExtraServiceMenu.query.filter_by(id=extra.get('item_id'), is_active=True).first()
+                menu_obj = menu_map.get(extra.get('item_id'))
                 if not menu_obj:
                     continue
                 extras_total += menu_obj.price * extra.get('quantity', 1)
@@ -862,8 +1006,14 @@ def confirm_booking():
 
             # Apply voucher discount (only on remaining amount)
             voucher = None
-            if voucher_code and amount_payable > 0:
-                voucher = Voucher.query.filter_by(code=voucher_code, user_id=user.id, is_active=True).first()
+            if voucher_code and amount_payable > 0 and not voucher_used:
+                if user.id not in voucher_cache:
+                    voucher_cache[user.id] = Voucher.query.filter_by(
+                        code=voucher_code,
+                        user_id=user.id,
+                        is_active=True
+                    ).first()
+                voucher = voucher_cache[user.id]
                 if voucher:
                     voucher_discount = int(amount_payable * voucher.discount_percentage / 100)
                     discount_amount += voucher_discount
@@ -915,7 +1065,7 @@ def confirm_booking():
             # Save extras
             BookingExtraService.query.filter_by(booking_id=booking.id).delete()
             for extra in extra_services_list:
-                menu_obj = ExtraServiceMenu.query.filter_by(id=extra.get('item_id'), is_active=True).first()
+                menu_obj = menu_map.get(extra.get('item_id'))
                 if not menu_obj:
                     continue
 
@@ -935,6 +1085,7 @@ def confirm_booking():
             # Mark voucher as used
             if voucher:
                 voucher.is_active = False
+                voucher_used = True
                 db.session.add(VoucherRedemptionLog(
                     user_id=user.id,
                     voucher_id=voucher.id,
@@ -943,15 +1094,51 @@ def confirm_booking():
 
             # Reward Hash Coins (skip if hour pass used to avoid double reward)
             if not use_hour_pass:
-                user_hash_coin = UserHashCoin.query.filter_by(user_id=user.id).first()
+                user_hash_coin = hash_coin_map.get(user.id)
                 if not user_hash_coin:
                     user_hash_coin = UserHashCoin(user_id=user.id, hash_coins=0)
                     db.session.add(user_hash_coin)
+                    hash_coin_map[user.id] = user_hash_coin
                 user_hash_coin.hash_coins += 1000
 
-            # Vendor analytics
-            BookingService.insert_into_vendor_dashboard_table(transaction.id, -1)
-            BookingService.insert_into_vendor_promo_table(transaction.id, -1)
+            # Vendor analytics (batched in same DB transaction; no per-booking commit)
+            dashboard_table = f"VENDOR_{vendor.id}_DASHBOARD"
+            promo_table = f"VENDOR_{vendor.id}_PROMO_DETAIL"
+            book_status = "extra" if booking.status == "extra" else "upcoming"
+            try:
+                db.session.execute(text(f"""
+                    INSERT INTO {dashboard_table}
+                    (username, user_id, start_time, end_time, date, book_id, game_id, game_name, console_id, book_status)
+                    VALUES (:username, :user_id, :start_time, :end_time, :date, :book_id, :game_id, :game_name, :console_id, :book_status)
+                """), {
+                    "username": user.name,
+                    "user_id": user.id,
+                    "start_time": slot_obj.start_time,
+                    "end_time": slot_obj.end_time,
+                    "date": book_date,
+                    "book_id": booking.id,
+                    "game_id": booking.game_id,
+                    "game_name": available_game.game_name,
+                    "console_id": -1,
+                    "book_status": book_status
+                })
+                db.session.execute(text(f"""
+                    INSERT INTO {promo_table}
+                    (booking_id, transaction_id, promo_code, discount_applied, actual_price)
+                    VALUES (:booking_id, :transaction_id, :promo_code, :discount_applied, :actual_price)
+                """), {
+                    "booking_id": booking.id,
+                    "transaction_id": transaction.id,
+                    "promo_code": "NOPROMO",
+                    "discount_applied": "0",
+                    "actual_price": amount_payable if amount_payable else 0.0
+                })
+            except SQLAlchemyError as analytics_exc:
+                current_app.logger.warning(
+                    "Non-blocking analytics insert failed for booking_id=%s: %s",
+                    booking.id,
+                    analytics_exc
+                )
 
             # Emit WebSocket event
             try:
@@ -977,24 +1164,26 @@ def confirm_booking():
             except Exception as e:
                 current_app.logger.exception(f"WebSocket emit failed: {e}")
 
-            # Send confirmation email
-            booking_mail(
-                gamer_name=user.name,
-                gamer_phone=user.contact_info.phone,
-                gamer_email=user.contact_info.email,
-                cafe_name=vendor.cafe_name,
-                booking_date=datetime.utcnow().strftime("%Y-%m-%d"),
-                booked_for_date=str(book_date),
-                booking_details=[{
-                    "booking_id": booking.id,
-                    "slot_time": f"{slot_obj.start_time} - {slot_obj.end_time}"
-                }],
-                price_paid=amount_payable
-            )
+            # Send confirmation email asynchronously after commit
+            if user.contact_info:
+                mail_jobs.append({
+                    "gamer_name": user.name,
+                    "gamer_phone": user.contact_info.phone,
+                    "gamer_email": user.contact_info.email,
+                    "cafe_name": vendor.cafe_name,
+                    "booking_date": datetime.utcnow().strftime("%Y-%m-%d"),
+                    "booked_for_date": str(book_date),
+                    "booking_details": [{
+                        "booking_id": booking.id,
+                        "slot_time": f"{slot_obj.start_time} - {slot_obj.end_time}"
+                    }],
+                    "price_paid": amount_payable
+                })
 
             confirmed_ids.append(booking.id)
 
         db.session.commit()
+        _send_booking_mail_async(current_app._get_current_object(), mail_jobs)
         
         response = {
             'message': 'Bookings confirmed successfully',
