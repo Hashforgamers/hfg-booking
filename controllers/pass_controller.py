@@ -8,14 +8,39 @@ from models.transaction import Transaction
 from decimal import Decimal
 from datetime import datetime, timedelta, time as time_type
 from sqlalchemy import or_
+from sqlalchemy.orm import joinedload
 import razorpay
 import pytz
+import time
+from threading import Lock
 
 
 IST = pytz.timezone("Asia/Kolkata")
 
 
 pass_blueprint = Blueprint('pass', __name__)
+_AVAILABLE_PASSES_CACHE = {}
+_AVAILABLE_PASSES_TTL_SECONDS = 30
+_AVAILABLE_PASSES_CACHE_MAX_ITEMS = 1000
+_AVAILABLE_PASSES_CACHE_LOCK = Lock()
+
+
+def _passes_cache_get(vendor_id, now_ts):
+    with _AVAILABLE_PASSES_CACHE_LOCK:
+        item = _AVAILABLE_PASSES_CACHE.get(vendor_id)
+        if not item:
+            return None
+        if (now_ts - item["ts"]) >= _AVAILABLE_PASSES_TTL_SECONDS:
+            _AVAILABLE_PASSES_CACHE.pop(vendor_id, None)
+            return None
+        return item["payload"]
+
+
+def _passes_cache_set(vendor_id, payload, now_ts):
+    with _AVAILABLE_PASSES_CACHE_LOCK:
+        if len(_AVAILABLE_PASSES_CACHE) >= _AVAILABLE_PASSES_CACHE_MAX_ITEMS:
+            _AVAILABLE_PASSES_CACHE.clear()
+        _AVAILABLE_PASSES_CACHE[vendor_id] = {"ts": now_ts, "payload": payload}
 
 
 @pass_blueprint.route('/pass/validate', methods=['POST'])
@@ -476,18 +501,31 @@ def get_available_passes_for_purchase(vendor_id):
     Used by user app to show passes for sale.
     """
     try:
+        now = time.time()
+        cached_payload = _passes_cache_get(vendor_id, now)
+        if cached_payload is not None:
+            return jsonify(cached_payload), 200
+
         # Get vendor-specific AND global passes
-        passes = CafePass.query.filter(
-            CafePass.is_active == True,
-            or_(
-                CafePass.vendor_id == vendor_id,
-                CafePass.vendor_id.is_(None)  # Global passes
+        passes = (
+            CafePass.query
+            .options(joinedload(CafePass.pass_type))
+            .filter(
+                CafePass.is_active == True,
+                or_(
+                    CafePass.vendor_id == vendor_id,
+                    CafePass.vendor_id.is_(None)  # Global passes
+                )
             )
-        ).order_by(CafePass.pass_mode, CafePass.price).all()
+            .order_by(CafePass.pass_mode, CafePass.price)
+            .all()
+        )
         
-        return jsonify({
+        payload = {
             'passes': [p.to_dict() for p in passes]
-        }), 200
+        }
+        _passes_cache_set(vendor_id, payload, now)
+        return jsonify(payload), 200
         
     except Exception as e:
         current_app.logger.error(f"Get available passes error: {str(e)}")

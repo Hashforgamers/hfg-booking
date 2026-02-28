@@ -4,8 +4,33 @@ from models.availableGame import AvailableGame
 from models.openingDays import OpeningDay
 from datetime import datetime
 from flask_cors import cross_origin
+import time
+from threading import Lock
+
 
 game_blueprint = Blueprint('game', __name__)
+_GAMES_BY_VENDOR_CACHE = {}
+_GAMES_BY_VENDOR_TTL_SECONDS = 30
+_GAMES_BY_VENDOR_CACHE_MAX_ITEMS = 1000
+_GAMES_BY_VENDOR_CACHE_LOCK = Lock()
+
+
+def _games_cache_get(cache_key, now_ts):
+    with _GAMES_BY_VENDOR_CACHE_LOCK:
+        item = _GAMES_BY_VENDOR_CACHE.get(cache_key)
+        if not item:
+            return None
+        if (now_ts - item["ts"]) >= _GAMES_BY_VENDOR_TTL_SECONDS:
+            _GAMES_BY_VENDOR_CACHE.pop(cache_key, None)
+            return None
+        return item["payload"]
+
+
+def _games_cache_set(cache_key, payload, now_ts):
+    with _GAMES_BY_VENDOR_CACHE_LOCK:
+        if len(_GAMES_BY_VENDOR_CACHE) >= _GAMES_BY_VENDOR_CACHE_MAX_ITEMS:
+            _GAMES_BY_VENDOR_CACHE.clear()
+        _GAMES_BY_VENDOR_CACHE[cache_key] = {"ts": now_ts, "payload": payload}
 
 # Get all available games
 @game_blueprint.route('/games', methods=['GET'])
@@ -21,49 +46,71 @@ def get_all_games():
 
 @game_blueprint.route('/games/vendor/<int:vendor_id>', methods=['GET'])
 def get_games_by_vendor_id(vendor_id):
-    # Get today's day of the week (e.g., 'mon', 'tues', 'wed', etc.)
-    today = datetime.now().strftime('%a').lower()  # e.g., 'mon', 'tues', 'wed'
+    now = time.time()
+    cache_key = f"{vendor_id}:{datetime.now().date().isoformat()}"
+    cached_payload = _games_cache_get(cache_key, now)
+    if cached_payload is not None:
+        return jsonify(cached_payload), 200
 
-    # Query opening days for the vendor (filter by vendor_id and is_open=True)
-    opening_days = OpeningDay.query.filter_by(vendor_id=vendor_id, is_open=True).all()
+    today = datetime.now().strftime('%a').lower()
+    day_aliases = {today}
+    if today == "tue":
+        day_aliases.add("tues")
+    if today == "thu":
+        day_aliases.add("thurs")
 
-    # Extract the days the vendor is open
-    open_days = [opening_day.day.lower() for opening_day in opening_days]
+    opening_days = (
+        OpeningDay.query
+        .with_entities(OpeningDay.day)
+        .filter_by(vendor_id=vendor_id, is_open=True)
+        .all()
+    )
+    open_days = {row.day.lower() for row in opening_days}
 
-    # If the shop is not open today, return a message
-    if today not in open_days:
-        return jsonify({
+    if open_days and not (day_aliases & open_days):
+        payload = {
             "message": "Shop is closed today, no games available.",
             "shop_open": False,
             "game_count": 0
-        }), 200
+        }
+        _games_cache_set(cache_key, payload, now)
+        return jsonify(payload), 200
 
-    # Query games by vendor_id
-    games = AvailableGame.query.filter_by(vendor_id=vendor_id).all()
+    games = (
+        AvailableGame.query
+        .with_entities(
+            AvailableGame.id,
+            AvailableGame.game_name,
+            AvailableGame.total_slot,
+            AvailableGame.single_slot_price
+        )
+        .filter_by(vendor_id=vendor_id)
+        .all()
+    )
 
-    # If no games found, return an appropriate message
     if not games:
-        return jsonify({
+        payload = {
             "message": "No games found for this vendor",
             "shop_open": True,
             "game_count": 0
-        }), 200
+        }
+        _games_cache_set(cache_key, payload, now)
+        return jsonify(payload), 200
 
-    # Convert opening days to a list of day strings (e.g., 'mon', 'tues', etc.)
-    open_days_list = [opening_day.day for opening_day in opening_days]
-
-    # Return the game details along with the vendor's open days in JSON format
-    return jsonify({
+    open_days_list = [row.day for row in opening_days]
+    payload = {
         "games": [{
             "id": game.id,
             "game_name": game.game_name,
             "total_slots": game.total_slot,
             "single_slot_price": game.single_slot_price,
-            "opening_days": open_days_list  # Include the list of open days for the vendor
+            "opening_days": open_days_list
         } for game in games],
         "shop_open": True,
         "game_count": len(games)
-    })
+    }
+    _games_cache_set(cache_key, payload, now)
+    return jsonify(payload), 200
 
 # Create a new booking for a game
 @game_blueprint.route('/bookings', methods=['POST'])
