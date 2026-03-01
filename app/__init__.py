@@ -21,11 +21,12 @@ socketio = SocketIO(
     cors_allowed_origins=[
         "http://localhost:3000",
         "https://dev-dashboard.hashforgamers.co.in",
+        "https://dashboard.hashforgamers.com"
         "https://dashboard.hashforgamers.co.in",
         "https://amritb.github.io",   # ✅ added here
         "https://hfg-booking-hmnx.onrender.com",
         "https://hfg-booking.onrender.com",
-        "https://dashboard.hashforgamers.com"
+        
     ],
     logger=True,
     engineio_logger=True
