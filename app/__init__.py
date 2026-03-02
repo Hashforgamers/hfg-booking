@@ -15,50 +15,50 @@ from rq_scheduler import Scheduler
 import logging
 import os
 
-# Initialize socketio once
+# ✅ Single source of truth — used by BOTH Flask-CORS and SocketIO
+ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "https://dev-dashboard.hashforgamers.co.in",
+    "https://dashboard.hashforgamers.co.in",
+    "https://dashboard.hashforgamers.com",        # ✅ was missing from CORS
+    "https://amritb.github.io",
+    "https://hfg-booking-hmnx.onrender.com",
+    "https://hfg-booking.onrender.com",
+]
+
+# ✅ SocketIO uses the shared list — no typo risk
 socketio = SocketIO(
     async_mode="eventlet",
-    cors_allowed_origins=[
-        "http://localhost:3000",
-        "https://dev-dashboard.hashforgamers.co.in",
-        "https://dashboard.hashforgamers.com",
-        "https://dashboard.hashforgamers.co.in",
-        "https://amritb.github.io",   # ✅ added here
-        "https://hfg-booking-hmnx.onrender.com",
-        "https://hfg-booking.onrender.com",
-        
-    ],
+    cors_allowed_origins=ALLOWED_ORIGINS,
     logger=True,
     engineio_logger=True
 )
+
 
 def create_app():
     app = Flask(__name__)
     app.config.from_object(Config)
 
-    # Extensions
     db.init_app(app)
     migrate.init_app(app, db)
     mail.init_app(app)
+
+    # ✅ ONLY use `resources` — never mix top-level `origins` with `resources`
     CORS(
         app,
-        origins=[
-            "http://localhost:3000",
-            "https://dev-dashboard.hashforgamers.co.in",
-            "https://dashboard.hashforgamers.co.in",
-        ],
-        resources={r"/api/*": {"origins": "*"}},
-        allow_headers=["Content-Type", "Authorization"],
-        methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+        resources={r"/api/*": {
+            "origins": ALLOWED_ORIGINS,
+            "allow_headers": ["Content-Type", "Authorization"],
+            "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+            "supports_credentials": False
+        }}
     )
 
-    # Blueprints
     app.register_blueprint(booking_blueprint, url_prefix="/api")
     app.register_blueprint(slot_blueprint, url_prefix="/api")
     app.register_blueprint(game_blueprint, url_prefix="/api")
     app.register_blueprint(pass_blueprint, url_prefix='/api')
 
-    # Logging
     debug_mode = os.getenv("DEBUG_MODE", "false").lower() == "true"
     log_level = logging.DEBUG if debug_mode else logging.WARNING
     logging.basicConfig(
@@ -66,17 +66,15 @@ def create_app():
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
 
-    # Redis + RQ
     redis_conn = Redis.from_url(app.config["REDIS_URL"])
     queue = Queue("booking_tasks", connection=redis_conn)
     scheduler = Scheduler(queue=queue, connection=redis_conn)
     app.extensions["scheduler"] = scheduler
 
-    # SocketIO with Redis message queue
     socketio.init_app(app, message_queue=app.config["REDIS_URL"])
     register_socketio_events(socketio)
 
-    return app  # ✅ only return Flask app
+    return app
 
-# Expose app for Gunicorn
+
 app = create_app()
