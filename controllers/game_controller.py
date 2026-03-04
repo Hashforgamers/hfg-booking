@@ -147,7 +147,7 @@ def cancel_booking(booking_id):
 
 
 @game_blueprint.route('/getAllConsole/vendor/<int:vendor_id>', methods=['GET'])
-@cross_origin(origins=["http://localhost:3000", "https://dev-dashboard.hashforgamers.co.in", "https://dashboard.hashforgamers.co.in"])
+@cross_origin(origins="*")
 def get_all_console_by_vendor_id(vendor_id):
 
     # Query games by vendor_id
