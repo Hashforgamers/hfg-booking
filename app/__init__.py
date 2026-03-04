@@ -15,23 +15,10 @@ from rq_scheduler import Scheduler
 import logging
 import os
 
-# ✅ Single source of truth — used by BOTH Flask-CORS and SocketIO
-ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-    "https://dev-dashboard.hashforgamers.co.in",
-    "https://dashboard.hashforgamers.co.in",
-    "https://dashboard.hashforgamers.com",
-    "https://hashforgamers.com",
-    "https://www.hashforgamers.com",
-    "https://amritb.github.io",
-    "https://hfg-booking-hmnx.onrender.com",
-    "https://hfg-booking.onrender.com",
-]
-
-# ✅ SocketIO uses the shared list — no typo risk
+# Allow all origins for SocketIO
 socketio = SocketIO(
     async_mode="eventlet",
-    cors_allowed_origins=ALLOWED_ORIGINS,
+    cors_allowed_origins="*",
     logger=True,
     engineio_logger=True
 )
@@ -45,11 +32,11 @@ def create_app():
     migrate.init_app(app, db)
     mail.init_app(app)
 
-    # ✅ ONLY use `resources` — never mix top-level `origins` with `resources`
+    # Allow all origins for API routes
     CORS(
         app,
         resources={r"/api/*": {
-            "origins": ALLOWED_ORIGINS,
+            "origins": "*",
             "allow_headers": ["Content-Type", "Authorization"],
             "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
             "supports_credentials": False
