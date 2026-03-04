@@ -29,7 +29,21 @@ ALLOWED_ORIGINS = [
 # ✅ SocketIO uses the shared list — no typo risk
 socketio = SocketIO(
     async_mode="eventlet",
+<<<<<<< HEAD
     cors_allowed_origins=ALLOWED_ORIGINS,
+=======
+    cors_allowed_origins=[
+        "http://localhost:3000",
+        "https://dev-dashboard.hashforgamers.co.in",
+        "https://dashboard.hashforgamers.co.in",
+        "https://hashforgamers.com",
+        "https://www.hashforgamers.com",
+        "https://amritb.github.io",   # ✅ added here
+        "https://hfg-booking-hmnx.onrender.com",
+        "https://hfg-booking.onrender.com",
+        "https://dashboard.hashforgamers.com"
+    ],
+>>>>>>> 6925f2d (applied CORS)
     logger=True,
     engineio_logger=True
 )
@@ -46,12 +60,26 @@ def create_app():
     # ✅ ONLY use `resources` — never mix top-level `origins` with `resources`
     CORS(
         app,
+<<<<<<< HEAD
         resources={r"/api/*": {
             "origins": ALLOWED_ORIGINS,
             "allow_headers": ["Content-Type", "Authorization"],
             "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
             "supports_credentials": False
         }}
+=======
+        origins=[
+            "http://localhost:3000",
+            "https://dev-dashboard.hashforgamers.co.in",
+            "https://dashboard.hashforgamers.co.in",
+            "https://dashboard.hashforgamers.com",
+            "https://hashforgamers.com",
+            "https://www.hashforgamers.com",
+        ],
+        resources={r"/api/*": {"origins": "*"}},
+        allow_headers=["Content-Type", "Authorization"],
+        methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+>>>>>>> 6925f2d (applied CORS)
     )
 
     app.register_blueprint(booking_blueprint, url_prefix="/api")
