@@ -26,6 +26,8 @@ from models.extraServiceCategory import ExtraServiceCategory
 from models.extraServiceMenu import ExtraServiceMenu
 from models.passModels import UserPass
 from models.consolePricingOffer import ConsolePricingOffer
+from models.controllerPricingRule import ControllerPricingRule
+from models.controllerPricingTier import ControllerPricingTier  # noqa: F401 (mapper registration)
 from datetime import datetime, timedelta, timezone
 import pytz
 from flask import current_app, jsonify
@@ -110,6 +112,42 @@ def get_effective_price(vendor_id: int, available_game) -> float:
     if current_offer is not None:
         return float(current_offer.offered_price)
     return float(available_game.single_slot_price)
+
+
+def calculate_extra_controller_fare(vendor_id: int, available_game_id: int, quantity: int):
+    """
+    Calculate controller fare using tiered pricing rules.
+    If no rule exists, returns None and caller may fallback to legacy fare.
+    """
+    if quantity <= 0:
+        return 0.0
+
+    rule = ControllerPricingRule.query.filter_by(
+        vendor_id=vendor_id,
+        available_game_id=available_game_id,
+        is_active=True
+    ).first()
+
+    if not rule:
+        return None
+
+    base_price = float(rule.base_price or 0)
+    active_tiers = sorted(
+        [tier for tier in rule.tiers if tier.is_active],
+        key=lambda t: t.quantity
+    )
+
+    # Minimum-cost composition: base controller price + any active bundle tiers.
+    dp = [float("inf")] * (quantity + 1)
+    dp[0] = 0.0
+
+    for q in range(1, quantity + 1):
+        dp[q] = min(dp[q], dp[q - 1] + base_price)
+        for tier in active_tiers:
+            if tier.quantity <= q:
+                dp[q] = min(dp[q], dp[q - tier.quantity] + float(tier.total_price))
+
+    return float(dp[quantity] if dp[quantity] != float("inf") else quantity * base_price)
 
 
 def _send_booking_mail_async(app, mail_jobs):
@@ -1711,6 +1749,10 @@ def new_booking(vendor_id):
         user_id = data.get("userId")
         waive_off_total = float(data.get("waiveOffAmount", 0.0))
         extra_controller_fare = float(data.get("extraControllerFare", 0.0))
+        try:
+            extra_controller_qty = int(data.get("extraControllerQty", 0) or 0)
+        except (TypeError, ValueError):
+            return jsonify({"message": "extraControllerQty must be a valid integer"}), 400
         selected_meals = data.get("selectedMeals", [])
         
         # ✅ NEW: Get booking mode from frontend
@@ -1844,6 +1886,24 @@ def new_booking(vendor_id):
         if not available_game:
             current_app.logger.error(f"❌ No games found for vendor {vendor_id}")
             return jsonify({"message": "Game not found for this vendor"}), 404
+
+        if extra_controller_qty < 0:
+            return jsonify({"message": "extraControllerQty cannot be negative"}), 400
+
+        if extra_controller_qty > 0:
+            computed_controller_fare = calculate_extra_controller_fare(
+                vendor_id=vendor_id,
+                available_game_id=available_game.id,
+                quantity=extra_controller_qty
+            )
+
+            if computed_controller_fare is not None:
+                extra_controller_fare = computed_controller_fare
+            elif extra_controller_fare <= 0:
+                return jsonify({
+                    "message": "Controller pricing is not configured for this console type. "
+                               "Configure it in dashboard or send extraControllerFare as fallback."
+                }), 400
 
         # ✅ LOG the final selected game with booking mode
         current_app.logger.info(
@@ -2130,6 +2190,7 @@ def new_booking(vendor_id):
             "total_base_cost": total_base_cost,
             "total_meals_cost": total_meals_cost,
             "extra_controller_fare": extra_controller_fare,
+            "extra_controller_qty": extra_controller_qty,
             "waive_off_amount": waive_off_total,
             "final_amount": total_paid,
             "selected_meals": [
