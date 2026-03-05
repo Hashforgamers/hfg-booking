@@ -3956,6 +3956,7 @@ def settle_pending_booking_transactions(booking_id):
     try:
         body = request.get_json(silent=True) or {}
         mode = str(body.get("mode_of_payment") or "").strip().lower()
+        waive_off_amount = float(body.get("waive_off_amount") or 0.0)
         if not mode:
             return jsonify({"success": False, "message": "mode_of_payment is required"}), 400
 
@@ -3982,6 +3983,47 @@ def settle_pending_booking_transactions(booking_id):
             .all()
         )
 
+        pending_total = 0.0
+        for tx in pending_rows:
+            line_total = float(tx.total_with_tax or 0) if float(tx.total_with_tax or 0) > 0 else float(tx.amount or 0)
+            pending_total += max(line_total, 0.0)
+
+        applied_waive_off = min(max(waive_off_amount, 0.0), pending_total)
+
+        # Keep discount auditable via a dedicated negative transaction.
+        if applied_waive_off > 0:
+            discount_tx = Transaction(
+                booking_id=booking_id,
+                vendor_id=(pending_rows[0].vendor_id if pending_rows else None),
+                user_id=booking.user_id,
+                booked_date=datetime.utcnow().date(),
+                booking_date=datetime.utcnow().date(),
+                booking_time=datetime.utcnow().time(),
+                user_name=(pending_rows[0].user_name if pending_rows else "Unknown User"),
+                original_amount=applied_waive_off,
+                discounted_amount=applied_waive_off,
+                amount=-applied_waive_off,
+                mode_of_payment=mode,
+                payment_use_case=normalize_payment_use_case(mode, actor["source_channel"]),
+                booking_type="settlement_waive_off",
+                settlement_status="completed",
+                source_channel=actor["source_channel"],
+                initiated_by_staff_id=actor["staff_id"],
+                initiated_by_staff_name=actor["staff_name"],
+                initiated_by_staff_role=actor["staff_role"],
+                base_amount=0.0,
+                meals_amount=0.0,
+                controller_amount=0.0,
+                waive_off_amount=applied_waive_off,
+                taxable_amount=0.0,
+                gst_rate=0.0,
+                cgst_amount=0.0,
+                sgst_amount=0.0,
+                igst_amount=0.0,
+                total_with_tax=-applied_waive_off
+            )
+            db.session.add(discount_tx)
+
         settled_amount = 0.0
         settled_ids = []
         for tx in pending_rows:
@@ -4004,7 +4046,8 @@ def settle_pending_booking_transactions(booking_id):
             "booking_id": booking_id,
             "settled_transaction_ids": settled_ids,
             "settled_count": len(settled_ids),
-            "settled_amount": round(settled_amount, 2),
+            "settled_amount": round(max(settled_amount - applied_waive_off, 0.0), 2),
+            "applied_waive_off": round(applied_waive_off, 2),
             "payment_status": {
                 "label": "Extra Payment Required" if summary["amount_due"] > 0 else "Settled",
                 "amount_paid": summary["amount_paid"],
