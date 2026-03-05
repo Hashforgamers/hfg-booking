@@ -18,8 +18,27 @@ class Transaction(db.Model):
     original_amount = Column(Float, nullable=False)
     discounted_amount = Column(Float, nullable=False, default=0)
     mode_of_payment = Column(String(50), default='online', nullable=False)
+    payment_use_case = Column(String(100), nullable=True)  # wallet/pass/pay_at_cafe/gateway/cash/upi/card
     booking_type = Column(String(100), default='booking', nullable=False)  
     settlement_status = Column(String(50), default='pending', nullable=False)
+    source_channel = Column(String(20), default='app', nullable=False)  # app/dashboard
+    initiated_by_staff_id = Column(String(100), nullable=True)
+    initiated_by_staff_name = Column(String(255), nullable=True)
+    initiated_by_staff_role = Column(String(50), nullable=True)
+
+    # Component-level transparency
+    base_amount = Column(Float, nullable=False, default=0)
+    meals_amount = Column(Float, nullable=False, default=0)
+    controller_amount = Column(Float, nullable=False, default=0)
+    waive_off_amount = Column(Float, nullable=False, default=0)
+
+    # GST audit fields
+    taxable_amount = Column(Float, nullable=False, default=0)
+    gst_rate = Column(Float, nullable=False, default=0)
+    cgst_amount = Column(Float, nullable=False, default=0)
+    sgst_amount = Column(Float, nullable=False, default=0)
+    igst_amount = Column(Float, nullable=False, default=0)
+    total_with_tax = Column(Float, nullable=False, default=0)
 
     # Optional: generic reference ID to link to related entities (e.g., pass purchase)
     reference_id = Column(String(100), nullable=True)

@@ -2,9 +2,9 @@ import os
 from services.config_load import load_key_from_file
 
 class Config:
-    SECRET_KEY = os.getenv("SECRET_KEY", "dev")
-    JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "dev")
-    DEBUG = True
+    SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change-me")
+    JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "dev-jwt-secret-change-me")
+    DEBUG = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
     SQLALCHEMY_DATABASE_URI = os.getenv(
         "DATABASE_URI",
@@ -16,10 +16,12 @@ class Config:
 
     SQLALCHEMY_ENGINE_OPTIONS = {
         "pool_pre_ping": True,
-        "pool_recycle": 1800,
-        "pool_size": 5,
-        "max_overflow": 10,
+        "pool_recycle": int(os.getenv("DB_POOL_RECYCLE_SEC", "1800")),
+        "pool_size": int(os.getenv("DB_POOL_SIZE", "10")),
+        "max_overflow": int(os.getenv("DB_MAX_OVERFLOW", "20")),
+        "pool_timeout": int(os.getenv("DB_POOL_TIMEOUT_SEC", "30")),
     }
+    SQLALCHEMY_ECHO = os.getenv("SQLALCHEMY_ECHO", "false").lower() == "true"
 
     MAIL_SERVER = os.getenv("MAIL_SERVER", "smtp.hashforgamers.co.in")
     MAIL_PORT = int(os.getenv("MAIL_PORT", 587))
