@@ -152,7 +152,7 @@ def calculate_extra_controller_fare(vendor_id: int, available_game_id: int, quan
 
 def is_controller_pricing_supported(console_name: str) -> bool:
     value = str(console_name or "").strip().lower()
-    return value in {"ps5", "xbox"}
+    return ("ps" in value) or ("xbox" in value)
 
 
 def _send_booking_mail_async(app, mail_jobs):
