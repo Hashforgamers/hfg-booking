@@ -125,6 +125,18 @@ CREATE TABLE IF NOT EXISTS monthly_credit_accounts (
 CREATE INDEX IF NOT EXISTS ix_monthly_credit_accounts_vendor_id ON monthly_credit_accounts(vendor_id);
 CREATE INDEX IF NOT EXISTS ix_monthly_credit_accounts_user_id ON monthly_credit_accounts(user_id);
 
+ALTER TABLE monthly_credit_accounts ADD COLUMN IF NOT EXISTS customer_name VARCHAR(255);
+ALTER TABLE monthly_credit_accounts ADD COLUMN IF NOT EXISTS whatsapp_number VARCHAR(20);
+ALTER TABLE monthly_credit_accounts ADD COLUMN IF NOT EXISTS phone_number VARCHAR(20);
+ALTER TABLE monthly_credit_accounts ADD COLUMN IF NOT EXISTS email VARCHAR(255);
+ALTER TABLE monthly_credit_accounts ADD COLUMN IF NOT EXISTS address_line1 VARCHAR(255);
+ALTER TABLE monthly_credit_accounts ADD COLUMN IF NOT EXISTS address_line2 VARCHAR(255);
+ALTER TABLE monthly_credit_accounts ADD COLUMN IF NOT EXISTS city VARCHAR(100);
+ALTER TABLE monthly_credit_accounts ADD COLUMN IF NOT EXISTS state VARCHAR(100);
+ALTER TABLE monthly_credit_accounts ADD COLUMN IF NOT EXISTS pincode VARCHAR(20);
+ALTER TABLE monthly_credit_accounts ADD COLUMN IF NOT EXISTS id_proof_type VARCHAR(50);
+ALTER TABLE monthly_credit_accounts ADD COLUMN IF NOT EXISTS id_proof_number VARCHAR(100);
+
 CREATE TABLE IF NOT EXISTS monthly_credit_ledgers (
     id SERIAL PRIMARY KEY,
     account_id INTEGER NOT NULL REFERENCES monthly_credit_accounts(id) ON DELETE CASCADE,

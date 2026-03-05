@@ -19,6 +19,19 @@ class MonthlyCreditAccount(db.Model):
     is_active = Column(Boolean, nullable=False, default=True)
     notes = Column(String(255), nullable=True)
 
+    # Recovery/KYC metadata for trusted monthly-credit users
+    customer_name = Column(String(255), nullable=True)
+    whatsapp_number = Column(String(20), nullable=True)
+    phone_number = Column(String(20), nullable=True)
+    email = Column(String(255), nullable=True)
+    address_line1 = Column(String(255), nullable=True)
+    address_line2 = Column(String(255), nullable=True)
+    city = Column(String(100), nullable=True)
+    state = Column(String(100), nullable=True)
+    pincode = Column(String(20), nullable=True)
+    id_proof_type = Column(String(50), nullable=True)
+    id_proof_number = Column(String(100), nullable=True)
+
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 

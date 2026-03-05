@@ -2919,23 +2919,123 @@ def get_all_booking(vendor_id, date):
         current_app.logger.error(f"Failed to fetch bookings: {str(e)}")
         return jsonify({"message": "Failed to fetch bookings", "error": str(e)}), 500
 
-@booking_blueprint.route('/vendor/<string:vendor_id>/users', methods=['GET'])
+@booking_blueprint.route('/vendor/<string:vendor_id>/users', methods=['GET', 'POST'])
 def get_user_details(vendor_id):
     try:
-        table_name = f"VENDOR_{vendor_id}_DASHBOARD"
+        if request.method == 'POST':
+            body = request.get_json(silent=True) or {}
 
-        # Step 1: Get all unique user_ids from the vendor dashboard table
-        user_id_query = text(f"""
-            SELECT DISTINCT user_id FROM {table_name}
-        """)
-        result = db.session.execute(user_id_query)
-        user_ids = [row[0] for row in result]
+            name = str(body.get("name") or "").strip()
+            phone = str(body.get("phone") or "").strip()
+            email = str(body.get("email") or "").strip().lower()
+            whatsapp = str(body.get("whatsapp_number") or "").strip()
+            address = str(body.get("address") or "").strip()
+
+            if not name:
+                return jsonify({"success": False, "message": "name is required"}), 400
+            if not phone and not email:
+                return jsonify({"success": False, "message": "phone or email is required"}), 400
+
+            # Deduplicate by phone/email before creating a new user.
+            existing_contact = None
+            if phone:
+                existing_contact = ContactInfo.query.filter_by(parent_type="user", phone=phone).first()
+            if not existing_contact and email:
+                existing_contact = ContactInfo.query.filter_by(parent_type="user", email=email).first()
+
+            if existing_contact:
+                existing_user = User.query.filter_by(id=existing_contact.parent_id).first()
+                if existing_user:
+                    return jsonify({
+                        "success": True,
+                        "created": False,
+                        "user": {
+                            "id": existing_user.id,
+                            "name": existing_user.name,
+                            "email": existing_contact.email,
+                            "phone": existing_contact.phone,
+                        }
+                    }), 200
+
+            slug = "".join(ch for ch in name.lower() if ch.isalnum() or ch == " ").strip().replace(" ", "_")
+            if not slug:
+                slug = "gamer"
+            game_username = f"{slug}{random.randint(1000, 9999)}"
+            while User.query.filter_by(game_username=game_username).first():
+                game_username = f"{slug}{random.randint(1000, 9999)}"
+
+            if not email:
+                safe_phone = "".join(ch for ch in phone if ch.isdigit())[-10:] or str(random.randint(1000000000, 9999999999))
+                email = f"noemail_{safe_phone}@hash.local"
+            if not phone:
+                phone = "0000000000"
+
+            user = User(
+                fid=generate_fid(),
+                avatar_path="Not defined",
+                name=name,
+                game_username=game_username,
+                parent_type="user",
+                platform="dashboard",
+            )
+            db.session.add(user)
+            db.session.flush()
+
+            contact_info = ContactInfo(
+                email=email,
+                phone=phone,
+                parent_id=user.id,
+                parent_type="user"
+            )
+            user.contact_info = contact_info
+            db.session.add(contact_info)
+
+            # Optional metadata passthrough for upcoming recovery workflows.
+            if whatsapp and not body.get("phone"):
+                contact_info.phone = whatsapp
+
+            db.session.commit()
+            return jsonify({
+                "success": True,
+                "created": True,
+                "user": {
+                    "id": user.id,
+                    "name": user.name,
+                    "email": contact_info.email,
+                    "phone": contact_info.phone,
+                    "address": address or None,
+                    "whatsapp_number": whatsapp or None,
+                }
+            }), 201
+
+        table_name = f"VENDOR_{vendor_id}_DASHBOARD"
+        vendor_id_int = int(vendor_id)
+        user_ids = set()
+
+        # Step 1: Get user_ids from vendor bookings table (if it exists)
+        try:
+            user_id_query = text(f"SELECT DISTINCT user_id FROM {table_name}")
+            result = db.session.execute(user_id_query)
+            user_ids.update([row[0] for row in result if row[0]])
+        except Exception:
+            # Dashboard table might not exist for new vendors yet.
+            db.session.rollback()
+
+        # Step 2: Include users from monthly credit accounts so newly onboarded
+        # credit customers appear in selector even before first booking.
+        credit_user_ids = (
+            db.session.query(MonthlyCreditAccount.user_id)
+            .filter(MonthlyCreditAccount.vendor_id == vendor_id_int)
+            .distinct()
+            .all()
+        )
+        user_ids.update([row[0] for row in credit_user_ids if row[0]])
 
         if not user_ids:
-            return jsonify({"message": "No users found for this vendor."}), 404
+            return jsonify([]), 200
 
-        # Step 2: Fetch User and ContactInfo
-        users = User.query.filter(User.id.in_(user_ids)).all()
+        # Step 3: Fetch User and ContactInfo
+        users = User.query.filter(User.id.in_(list(user_ids))).all()
 
         user_list = []
         for user in users:
@@ -2956,6 +3056,7 @@ def get_user_details(vendor_id):
         return jsonify(user_list), 200
 
     except Exception as e:
+        db.session.rollback()
         current_app.logger.error(f"Error fetching user details: {e}")
         return jsonify({"error": str(e)}), 500
 
@@ -4194,6 +4295,17 @@ def monthly_credit_accounts(vendor_id):
                         "grace_days": r.grace_days,
                         "is_active": r.is_active,
                         "notes": r.notes,
+                        "customer_name": r.customer_name,
+                        "whatsapp_number": r.whatsapp_number,
+                        "phone_number": r.phone_number,
+                        "email": r.email,
+                        "address_line1": r.address_line1,
+                        "address_line2": r.address_line2,
+                        "city": r.city,
+                        "state": r.state,
+                        "pincode": r.pincode,
+                        "id_proof_type": r.id_proof_type,
+                        "id_proof_number": r.id_proof_number,
                     } for r in rows
                 ]
             }), 200
@@ -4210,6 +4322,17 @@ def monthly_credit_accounts(vendor_id):
         account.grace_days = int(body.get("grace_days", account.grace_days or 5))
         account.is_active = bool(body.get("is_active", True))
         account.notes = body.get("notes", account.notes)
+        account.customer_name = body.get("customer_name", account.customer_name)
+        account.whatsapp_number = body.get("whatsapp_number", account.whatsapp_number)
+        account.phone_number = body.get("phone_number", account.phone_number)
+        account.email = body.get("email", account.email)
+        account.address_line1 = body.get("address_line1", account.address_line1)
+        account.address_line2 = body.get("address_line2", account.address_line2)
+        account.city = body.get("city", account.city)
+        account.state = body.get("state", account.state)
+        account.pincode = body.get("pincode", account.pincode)
+        account.id_proof_type = body.get("id_proof_type", account.id_proof_type)
+        account.id_proof_number = body.get("id_proof_number", account.id_proof_number)
 
         db.session.commit()
         return jsonify({"success": True, "account_id": account.id}), 200
@@ -4233,6 +4356,17 @@ def monthly_credit_statement(vendor_id, user_id):
                 "outstanding_amount": float(account.outstanding_amount or 0),
                 "billing_cycle_day": account.billing_cycle_day,
                 "grace_days": account.grace_days,
+                "customer_name": account.customer_name,
+                "whatsapp_number": account.whatsapp_number,
+                "phone_number": account.phone_number,
+                "email": account.email,
+                "address_line1": account.address_line1,
+                "address_line2": account.address_line2,
+                "city": account.city,
+                "state": account.state,
+                "pincode": account.pincode,
+                "id_proof_type": account.id_proof_type,
+                "id_proof_number": account.id_proof_number,
             },
             "entries": [
                 {
@@ -4243,7 +4377,10 @@ def monthly_credit_statement(vendor_id, user_id):
                     "booked_date": r.booked_date.isoformat() if r.booked_date else None,
                     "due_date": r.due_date.isoformat() if r.due_date else None,
                     "created_at": r.created_at.isoformat() if r.created_at else None,
-                    "transaction_id": r.transaction_id
+                    "transaction_id": r.transaction_id,
+                    "source_channel": r.source_channel,
+                    "staff_id": r.staff_id,
+                    "staff_name": r.staff_name,
                 } for r in rows
             ]
         }), 200
