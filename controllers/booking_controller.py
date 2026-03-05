@@ -299,6 +299,64 @@ def calculate_gst_breakdown(vendor_id: int, amount: float):
     }
 
 
+def compute_booking_financial_summary(booking_id: int):
+    txns = (
+        Transaction.query
+        .filter(Transaction.booking_id == booking_id)
+        .order_by(Transaction.id.asc())
+        .all()
+    )
+    if not txns:
+        return {
+            "booking_id": booking_id,
+            "total_charged": 0.0,
+            "amount_paid": 0.0,
+            "amount_due": 0.0,
+            "line_items": [],
+        }
+
+    def _line_total(tx):
+        twt = float(tx.total_with_tax or 0)
+        return twt if twt > 0 else float(tx.amount or 0)
+
+    total_charged = sum(_line_total(tx) for tx in txns)
+    amount_paid = sum(
+        _line_total(tx)
+        for tx in txns
+        if str(tx.settlement_status or "").lower() in {"completed", "done", "settled", "paid"}
+    )
+
+    return {
+        "booking_id": booking_id,
+        "total_charged": round(total_charged, 2),
+        "amount_paid": round(amount_paid, 2),
+        "amount_due": round(max(total_charged - amount_paid, 0.0), 2),
+        "line_items": [
+            {
+                "transaction_id": tx.id,
+                "booking_type": tx.booking_type,
+                "payment_use_case": tx.payment_use_case,
+                "mode_of_payment": tx.mode_of_payment,
+                "settlement_status": tx.settlement_status,
+                "line_total": round(_line_total(tx), 2),
+                "components": {
+                    "base_amount": float(tx.base_amount or 0),
+                    "meals_amount": float(tx.meals_amount or 0),
+                    "controller_amount": float(tx.controller_amount or 0),
+                    "waive_off_amount": float(tx.waive_off_amount or 0),
+                    "taxable_amount": float(tx.taxable_amount or 0),
+                    "gst_rate": float(tx.gst_rate or 0),
+                    "cgst_amount": float(tx.cgst_amount or 0),
+                    "sgst_amount": float(tx.sgst_amount or 0),
+                    "igst_amount": float(tx.igst_amount or 0),
+                    "total_with_tax": float(tx.total_with_tax or 0),
+                },
+                "created_at": tx.created_at.isoformat() if tx.created_at else None,
+            } for tx in txns
+        ],
+    }
+
+
 def compute_credit_due_date(booked_date, billing_cycle_day: int):
     if not booked_date:
         return None
@@ -2767,70 +2825,89 @@ def extra_booking():
     Records extra booking (time extended) played by the user in a gaming cafe, with waive-off functionality.
     """
     try:
-        data = request.json
+        data = request.get_json(silent=True) or {}
 
         required_fields = ["consoleNumber", "consoleType", "date", "slotId", "userId", "username", "amount", "gameId", "modeOfPayment", "vendorId"]
         if not all(data.get(field) is not None for field in required_fields):
             return jsonify({"message": "Missing required fields"}), 400
 
-        # Extract values
         console_number = data["consoleNumber"]
         console_type = data["consoleType"]
         booked_date = datetime.strptime(data["date"], "%Y-%m-%d").date()
-        slot_id = data["slotId"]
-        user_id = data["userId"]
+        slot_id = int(data["slotId"])
+        user_id = int(data["userId"])
         username = data["username"]
         amount = float(data["amount"])
-        game_id = data["gameId"]
-        mode_of_payment = data["modeOfPayment"]
-        vendor_id = data["vendorId"]
-        waive_off_amount = float(data.get("waiveOffAmount", 0.0))  # Optional waive-off amount
+        game_id = int(data["gameId"])
+        mode_of_payment = str(data["modeOfPayment"]).strip().lower()
+        vendor_id = int(data["vendorId"])
+        waive_off_amount = float(data.get("waiveOffAmount", 0.0))
+        reference_id = data.get("reference_id")
 
-        # Optional: verify user and slot exist
+        actor = resolve_transaction_actor(request)
+        payment_use_case = normalize_payment_use_case(mode_of_payment, actor["source_channel"])
+        settlement_status = resolve_settlement_status(payment_use_case)
+
         user = db.session.query(User).filter_by(id=user_id).first()
         slot = db.session.query(Slot).filter_by(id=slot_id).first()
-
         if not user or not slot:
             return jsonify({"message": "User or slot not found"}), 404
 
-        # Create a record in Booking table for extra booking (status='extra')
-        extra_booking = Booking(
-            slot_id=slot_id,
-            game_id=game_id,
-            user_id=user_id,
-            status="extra"
+        # Attach extra charge to current booking when possible for transparent settlement.
+        primary_booking = (
+            Booking.query
+            .filter_by(slot_id=slot_id, game_id=game_id, user_id=user_id)
+            .filter(Booking.status.in_(["confirmed", "checked_in", "completed", "extra", "pending_verified", "pending_acceptance"]))
+            .order_by(Booking.id.desc())
+            .first()
         )
-        db.session.add(extra_booking)
-        db.session.flush()
+        if not primary_booking:
+            primary_booking = Booking(slot_id=slot_id, game_id=game_id, user_id=user_id, status="extra")
+            db.session.add(primary_booking)
+            db.session.flush()
 
-        # Calculate final amount after waive-off
         original_amount = amount
         discounted_amount = waive_off_amount
         final_amount = max(original_amount - discounted_amount, 0.0)
+        gst = calculate_gst_breakdown(vendor_id, final_amount)
 
-        # Create a transaction for extra booking
         transaction = Transaction(
-            booking_id=extra_booking.id,
+            booking_id=primary_booking.id,
             vendor_id=vendor_id,
             user_id=user_id,
             booked_date=booked_date,
+            booking_date=datetime.utcnow().date(),
             booking_time=datetime.utcnow().time(),
             user_name=username,
             original_amount=original_amount,
             discounted_amount=discounted_amount,
             amount=final_amount,
             mode_of_payment=mode_of_payment,
+            payment_use_case=payment_use_case,
             booking_type="extra",
-            settlement_status="completed" if mode_of_payment == "paid" else "NA"
+            settlement_status=settlement_status,
+            source_channel=actor["source_channel"],
+            initiated_by_staff_id=actor["staff_id"],
+            initiated_by_staff_name=actor["staff_name"],
+            initiated_by_staff_role=actor["staff_role"],
+            base_amount=final_amount,
+            meals_amount=0.0,
+            controller_amount=0.0,
+            waive_off_amount=discounted_amount,
+            taxable_amount=gst["taxable_amount"],
+            gst_rate=gst["gst_rate"],
+            cgst_amount=gst["cgst_amount"],
+            sgst_amount=gst["sgst_amount"],
+            igst_amount=gst["igst_amount"],
+            total_with_tax=gst["total_with_tax"],
+            reference_id=reference_id,
         )
         db.session.add(transaction)
         db.session.commit()
 
-        # Optional: Push to dashboard/promo tables
         BookingService.insert_into_vendor_dashboard_table(transaction.id, console_number)
         BookingService.insert_into_vendor_promo_table(transaction.id, console_number)
 
-        # Fallback if user or email not found
         gamer_email = user.contact_info.email if user and user.contact_info else "no-reply@example.com"
 
         if not slot or not slot.start_time or not slot.end_time:
@@ -2850,10 +2927,20 @@ def extra_booking():
             mode_of_payment=mode_of_payment
         )
 
+        summary = compute_booking_financial_summary(primary_booking.id)
+
         return jsonify({
             "message": "Extra booking recorded successfully",
-            "booking_id": extra_booking.id,
-            "transaction_id": transaction.id
+            "booking_id": primary_booking.id,
+            "transaction_id": transaction.id,
+            "payment_status": {
+                "label": "Extra Payment Required" if summary["amount_due"] > 0 else "Settled",
+                "amount_paid": summary["amount_paid"],
+                "amount_due": summary["amount_due"],
+                "total_charged": summary["total_charged"],
+            },
+            "session_notice": f"The session for {username} on {console_type} #{console_number} has exceeded the allotted time.",
+            "financial_summary": summary
         }), 201
 
     except Exception as e:
@@ -3614,7 +3701,7 @@ def add_meals_to_booking(booking_id):
     
     try:
         current_app.logger.info(f"Adding meals to booking {booking_id}")
-        data = request.json
+        data = request.get_json(silent=True) or {}
         
         # Get meals from request
         meals = data.get("meals", [])
@@ -3686,32 +3773,15 @@ def add_meals_to_booking(booking_id):
             db.session.add(booking_extra_service)
             current_app.logger.info(f"Created extra service for booking {booking_id}: {meal_detail['menu_item'].name}")
         
-        # ✅ UPDATE: Find and update the original booking transaction amount
-        # Look for the main booking transaction (direct, slot, or any non-additional type)
-        main_transaction = db.session.query(Transaction).filter(
-            Transaction.booking_id == booking_id,
-            Transaction.booking_type.in_(['direct', 'slot'])  # Main booking types
-        ).first()
-        
-        # If no 'direct' or 'slot', try to find any primary transaction
-        if not main_transaction:
-            main_transaction = db.session.query(Transaction).filter(
-                Transaction.booking_id == booking_id,
-                Transaction.booking_type.notin_(['additional_meals', 'extra', 'extracontroller'])
-            ).order_by(Transaction.id.asc()).first()
-        
-        if main_transaction:
-            # Update the transaction amount to include meals
-            old_amount = main_transaction.amount
-            main_transaction.original_amount += total_meals_cost
-            main_transaction.amount += total_meals_cost
-            current_app.logger.info(f"✅ Updated booking transaction #{main_transaction.id}: ₹{old_amount} → ₹{main_transaction.amount}")
-        else:
-            current_app.logger.warning(f"⚠️ No main transaction found for booking {booking_id}, creating new transaction")
-        
-        # Create additional transaction record for tracking meals separately
+        actor = resolve_transaction_actor(request)
+        requested_mode = str(data.get("mode_of_payment") or "pending").strip().lower()
+        payment_use_case = normalize_payment_use_case(requested_mode, actor["source_channel"])
+        settlement_status = resolve_settlement_status(payment_use_case)
+
+        # Create additional transaction record for meal increment only.
         user = db.session.query(User).filter_by(id=booking.user_id).first()
         booking_date = datetime.utcnow().date()
+        gst = calculate_gst_breakdown(vendor_id, total_meals_cost)
         
         additional_transaction = Transaction(
             booking_id=booking_id,
@@ -3724,9 +3794,24 @@ def add_meals_to_booking(booking_id):
             original_amount=total_meals_cost,
             discounted_amount=0,
             amount=total_meals_cost,
-            mode_of_payment="pending",
+            mode_of_payment=requested_mode,
+            payment_use_case=payment_use_case,
             booking_type="additional_meals",
-            settlement_status="NA"
+            settlement_status=settlement_status,
+            source_channel=actor["source_channel"],
+            initiated_by_staff_id=actor["staff_id"],
+            initiated_by_staff_name=actor["staff_name"],
+            initiated_by_staff_role=actor["staff_role"],
+            base_amount=0.0,
+            meals_amount=total_meals_cost,
+            controller_amount=0.0,
+            waive_off_amount=0.0,
+            taxable_amount=gst["taxable_amount"],
+            gst_rate=gst["gst_rate"],
+            cgst_amount=gst["cgst_amount"],
+            sgst_amount=gst["sgst_amount"],
+            igst_amount=gst["igst_amount"],
+            total_with_tax=gst["total_with_tax"],
         )
         db.session.add(additional_transaction)
         
@@ -3734,6 +3819,7 @@ def add_meals_to_booking(booking_id):
         db.session.commit()
         current_app.logger.info(f"✅ Database changes committed for booking {booking_id}")
         
+        email_sent_to = None
         # ✅ NEW: Send email notification with meal details using dedicated function
         try:
             if user:
@@ -3755,8 +3841,8 @@ def add_meals_to_booking(booking_id):
                             'total_price': float(detail['total_price'])
                         })
                     
-                    # Calculate updated total
-                    updated_total = float(main_transaction.amount) if main_transaction else float(total_meals_cost)
+                    summary_for_email = compute_booking_financial_summary(booking_id)
+                    updated_total = float(summary_for_email["total_charged"])
                     
                     # Format slot time
                     if slot and slot.start_time and slot.end_time:
@@ -3780,6 +3866,7 @@ def add_meals_to_booking(booking_id):
                     )
                     
                     current_app.logger.info(f"✅ Meals added email sent successfully to {contact_info.email}")
+                    email_sent_to = contact_info.email
                 else:
                     current_app.logger.warning(f"⚠️ No email address found for user {user.id}")
         except Exception as email_error:
@@ -3789,6 +3876,7 @@ def add_meals_to_booking(booking_id):
             current_app.logger.error(f"Email error traceback: {traceback.format_exc()}")
         
         current_app.logger.info(f"✅ Successfully added {len(meal_details)} meals to booking {booking_id}, total cost: ₹{total_meals_cost}")
+        summary = compute_booking_financial_summary(booking_id)
         
         # Return success response with all details
         return jsonify({
@@ -3796,8 +3884,12 @@ def add_meals_to_booking(booking_id):
             "message": "Meals added successfully",
             "booking_id": booking_id,
             "total_meals_cost": float(total_meals_cost),
-            "updated_booking_amount": float(main_transaction.amount) if main_transaction else None,
-            "previous_booking_amount": float(main_transaction.amount - total_meals_cost) if main_transaction else None,
+            "payment_status": {
+                "label": "Extra Payment Required" if summary["amount_due"] > 0 else "Settled",
+                "amount_paid": summary["amount_paid"],
+                "amount_due": summary["amount_due"],
+                "total_charged": summary["total_charged"],
+            },
             "added_meals": [
                 {
                     "name": detail['menu_item'].name,
@@ -3808,7 +3900,8 @@ def add_meals_to_booking(booking_id):
                 }
                 for detail in meal_details
             ],
-            "email_sent": contact_info.email if (user and contact_info and contact_info.email) else None
+            "email_sent": email_sent_to,
+            "financial_summary": summary
         }), 200
         
     except Exception as e:
@@ -3821,6 +3914,29 @@ def add_meals_to_booking(booking_id):
             "message": "Failed to add meals",
             "error": str(e)
         }), 500
+
+
+@booking_blueprint.route('/booking/<int:booking_id>/payment-summary', methods=['GET'])
+def booking_payment_summary(booking_id):
+    try:
+        booking = Booking.query.filter_by(id=booking_id).first()
+        if not booking:
+            return jsonify({"success": False, "message": "Booking not found"}), 404
+
+        summary = compute_booking_financial_summary(booking_id)
+        return jsonify({
+            "success": True,
+            "payment_status": {
+                "label": "Extra Payment Required" if summary["amount_due"] > 0 else "Settled",
+                "amount_paid": summary["amount_paid"],
+                "amount_due": summary["amount_due"],
+                "total_charged": summary["total_charged"],
+            },
+            "financial_summary": summary
+        }), 200
+    except Exception as e:
+        current_app.logger.error(f"Failed to build booking payment summary for {booking_id}: {str(e)}")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 
