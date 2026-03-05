@@ -3774,9 +3774,17 @@ def add_meals_to_booking(booking_id):
             current_app.logger.info(f"Created extra service for booking {booking_id}: {meal_detail['menu_item'].name}")
         
         actor = resolve_transaction_actor(request)
+        # Default behavior for in-session meal additions:
+        # keep transaction pending and settle at end of session from Extra Payment overlay.
+        settle_on_release = bool(data.get("settle_on_release", True))
         requested_mode = str(data.get("mode_of_payment") or "pending").strip().lower()
-        payment_use_case = normalize_payment_use_case(requested_mode, actor["source_channel"])
-        settlement_status = resolve_settlement_status(payment_use_case)
+        mode_for_transaction = "pending" if settle_on_release else requested_mode
+        payment_use_case = (
+            "pay_at_cafe"
+            if settle_on_release
+            else normalize_payment_use_case(mode_for_transaction, actor["source_channel"])
+        )
+        settlement_status = "pending" if settle_on_release else resolve_settlement_status(payment_use_case)
 
         # Create additional transaction record for meal increment only.
         user = db.session.query(User).filter_by(id=booking.user_id).first()
@@ -3794,7 +3802,7 @@ def add_meals_to_booking(booking_id):
             original_amount=total_meals_cost,
             discounted_amount=0,
             amount=total_meals_cost,
-            mode_of_payment=requested_mode,
+            mode_of_payment=mode_for_transaction,
             payment_use_case=payment_use_case,
             booking_type="additional_meals",
             settlement_status=settlement_status,
@@ -3936,6 +3944,78 @@ def booking_payment_summary(booking_id):
         }), 200
     except Exception as e:
         current_app.logger.error(f"Failed to build booking payment summary for {booking_id}: {str(e)}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@booking_blueprint.route('/booking/<int:booking_id>/settle-pending', methods=['POST'])
+def settle_pending_booking_transactions(booking_id):
+    """
+    Settle pending end-of-session charges for a booking.
+    By default settles only extra and additional_meals transactions.
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        mode = str(body.get("mode_of_payment") or "").strip().lower()
+        if not mode:
+            return jsonify({"success": False, "message": "mode_of_payment is required"}), 400
+
+        booking = Booking.query.filter_by(id=booking_id).first()
+        if not booking:
+            return jsonify({"success": False, "message": "Booking not found"}), 404
+
+        include_types = body.get("booking_types") or ["extra", "additional_meals"]
+        include_types = [str(x).strip().lower() for x in include_types if str(x).strip()]
+        if not include_types:
+            include_types = ["extra", "additional_meals"]
+
+        actor = resolve_transaction_actor(request)
+        payment_use_case = normalize_payment_use_case(mode, actor["source_channel"])
+
+        pending_rows = (
+            Transaction.query
+            .filter(Transaction.booking_id == booking_id)
+            .filter(func.lower(Transaction.booking_type).in_(include_types))
+            .filter(or_(
+                Transaction.settlement_status.is_(None),
+                func.lower(Transaction.settlement_status).in_(["pending", "unpaid", "due"])
+            ))
+            .all()
+        )
+
+        settled_amount = 0.0
+        settled_ids = []
+        for tx in pending_rows:
+            line_total = float(tx.total_with_tax or 0) if float(tx.total_with_tax or 0) > 0 else float(tx.amount or 0)
+            settled_amount += line_total
+            tx.mode_of_payment = mode
+            tx.payment_use_case = payment_use_case
+            tx.settlement_status = "completed"
+            tx.source_channel = actor["source_channel"]
+            tx.initiated_by_staff_id = actor["staff_id"]
+            tx.initiated_by_staff_name = actor["staff_name"]
+            tx.initiated_by_staff_role = actor["staff_role"]
+            settled_ids.append(tx.id)
+
+        db.session.commit()
+
+        summary = compute_booking_financial_summary(booking_id)
+        return jsonify({
+            "success": True,
+            "booking_id": booking_id,
+            "settled_transaction_ids": settled_ids,
+            "settled_count": len(settled_ids),
+            "settled_amount": round(settled_amount, 2),
+            "payment_status": {
+                "label": "Extra Payment Required" if summary["amount_due"] > 0 else "Settled",
+                "amount_paid": summary["amount_paid"],
+                "amount_due": summary["amount_due"],
+                "total_charged": summary["total_charged"],
+            },
+            "financial_summary": summary
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"Failed to settle pending charges for booking {booking_id}: {str(e)}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 
