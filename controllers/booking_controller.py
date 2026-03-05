@@ -150,6 +150,11 @@ def calculate_extra_controller_fare(vendor_id: int, available_game_id: int, quan
     return float(dp[quantity] if dp[quantity] != float("inf") else quantity * base_price)
 
 
+def is_controller_pricing_supported(console_name: str) -> bool:
+    value = str(console_name or "").strip().lower()
+    return value in {"ps5", "xbox"}
+
+
 def _send_booking_mail_async(app, mail_jobs):
     def _runner():
         with app.app_context():
@@ -1890,7 +1895,11 @@ def new_booking(vendor_id):
         if extra_controller_qty < 0:
             return jsonify({"message": "extraControllerQty cannot be negative"}), 400
 
-        if extra_controller_qty > 0:
+        if not is_controller_pricing_supported(available_game.game_name):
+            # PC/VR and other unsupported console types should never carry controller surcharge.
+            extra_controller_qty = 0
+            extra_controller_fare = 0.0
+        elif extra_controller_qty > 0:
             computed_controller_fare = calculate_extra_controller_fare(
                 vendor_id=vendor_id,
                 available_game_id=available_game.id,
