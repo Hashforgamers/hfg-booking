@@ -28,6 +28,9 @@ from models.passModels import UserPass
 from models.consolePricingOffer import ConsolePricingOffer
 from models.controllerPricingRule import ControllerPricingRule
 from models.controllerPricingTier import ControllerPricingTier  # noqa: F401 (mapper registration)
+from models.vendorTaxProfile import VendorTaxProfile
+from models.timeWallet import TimeWalletAccount, TimeWalletLedger
+from models.monthlyCredit import MonthlyCreditAccount, MonthlyCreditLedger
 from datetime import datetime, timedelta, timezone
 import pytz
 from flask import current_app, jsonify
@@ -153,6 +156,159 @@ def calculate_extra_controller_fare(vendor_id: int, available_game_id: int, quan
 def is_controller_pricing_supported(console_name: str) -> bool:
     value = str(console_name or "").strip().lower()
     return ("ps" in value) or ("xbox" in value)
+
+
+def _safe_decode_jwt_claims(token: str):
+    """
+    Decode JWT payload without signature verification for telemetry/audit tagging.
+    Never use this for auth decisions.
+    """
+    try:
+        parts = (token or "").split(".")
+        if len(parts) < 2:
+            return {}
+        payload = parts[1]
+        payload += "=" * (-len(payload) % 4)  # add base64 padding
+        decoded = base64.urlsafe_b64decode(payload.encode("utf-8")).decode("utf-8")
+        data = json.loads(decoded)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def resolve_transaction_actor(request_obj):
+    """
+    Resolve source + staff attribution for transaction audit logs.
+    """
+    source_header = (request_obj.headers.get("X-Client-Source") or "").strip().lower()
+    source_channel = source_header if source_header in {"app", "dashboard"} else "app"
+
+    actor = {
+        "source_channel": source_channel,
+        "staff_id": None,
+        "staff_name": None,
+        "staff_role": None,
+    }
+
+    auth_header = request_obj.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header.split(" ", 1)[1].strip()
+        claims = _safe_decode_jwt_claims(token)
+
+        staff_claim = claims.get("staff")
+        if isinstance(staff_claim, dict):
+            actor["staff_id"] = str(staff_claim.get("id") or staff_claim.get("staff_id") or "")
+            actor["staff_name"] = staff_claim.get("name")
+            actor["staff_role"] = staff_claim.get("role")
+            actor["source_channel"] = "dashboard"
+
+    return actor
+
+
+def normalize_payment_use_case(payment_type: str, source_channel: str) -> str:
+    pt = str(payment_type or "").strip().lower()
+    if pt == "cash":
+        return "pay_at_cafe" if source_channel == "app" else "cash"
+    if pt == "upi":
+        return "upi"
+    if pt in {"card", "cards", "credit", "credit_card", "debit", "debit_card"}:
+        return "card"
+    if pt in {"pass", "date_pass", "hour_pass"}:
+        return "pass"
+    if pt in {"wallet", "hash_wallet"}:
+        return "hash_wallet"
+    if pt in {"gateway", "payment_gateway", "paid", "online"}:
+        return "payment_gateway"
+    if pt in {"monthly_credit", "credit", "month_end"}:
+        return "monthly_credit"
+    return pt or "unknown"
+
+
+def resolve_settlement_status(payment_use_case: str) -> str:
+    if payment_use_case == "pay_at_cafe":
+        return "pending"
+    if payment_use_case == "monthly_credit":
+        return "pending"
+    if payment_use_case in {"cash", "upi", "card", "payment_gateway", "hash_wallet", "pass"}:
+        return "completed"
+    return "pending"
+
+
+def calculate_slot_minutes(slot_obj: Slot) -> int:
+    if not slot_obj or not slot_obj.start_time or not slot_obj.end_time:
+        return 0
+    start_dt = datetime.combine(datetime.utcnow().date(), slot_obj.start_time)
+    end_dt = datetime.combine(datetime.utcnow().date(), slot_obj.end_time)
+    mins = int((end_dt - start_dt).total_seconds() / 60)
+    return max(mins, 0)
+
+
+def calculate_gst_breakdown(vendor_id: int, amount: float):
+    amount = float(amount or 0)
+    zero = {
+        "taxable_amount": amount,
+        "gst_rate": 0.0,
+        "cgst_amount": 0.0,
+        "sgst_amount": 0.0,
+        "igst_amount": 0.0,
+        "total_with_tax": amount,
+    }
+    if amount <= 0:
+        zero["taxable_amount"] = 0.0
+        zero["total_with_tax"] = 0.0
+        return zero
+
+    profile = VendorTaxProfile.query.filter_by(vendor_id=vendor_id).first()
+    if not profile or not profile.gst_registered or not profile.gst_enabled:
+        return zero
+
+    rate = float(profile.gst_rate or 0)
+    if rate <= 0:
+        return zero
+
+    if profile.tax_inclusive:
+        taxable = round(amount / (1 + rate / 100.0), 2)
+        gst_total = round(amount - taxable, 2)
+        total = round(amount, 2)
+    else:
+        taxable = round(amount, 2)
+        gst_total = round(taxable * rate / 100.0, 2)
+        total = round(taxable + gst_total, 2)
+
+    is_intrastate = bool(
+        profile.state_code
+        and profile.place_of_supply_state_code
+        and str(profile.state_code) == str(profile.place_of_supply_state_code)
+    )
+    if is_intrastate:
+        cgst = round(gst_total / 2.0, 2)
+        sgst = round(gst_total - cgst, 2)
+        igst = 0.0
+    else:
+        cgst = 0.0
+        sgst = 0.0
+        igst = gst_total
+
+    return {
+        "taxable_amount": taxable,
+        "gst_rate": rate,
+        "cgst_amount": cgst,
+        "sgst_amount": sgst,
+        "igst_amount": igst,
+        "total_with_tax": total,
+    }
+
+
+def compute_credit_due_date(booked_date, billing_cycle_day: int):
+    if not booked_date:
+        return None
+    day = max(1, min(int(billing_cycle_day or 1), 28))
+    year = booked_date.year
+    month = booked_date.month
+    due_month = month + 1 if booked_date.day > day else month
+    due_year = year + (1 if due_month > 12 else 0)
+    due_month = 1 if due_month > 12 else due_month
+    return datetime(due_year, due_month, day).date()
 
 
 def _send_booking_mail_async(app, mail_jobs):
@@ -397,7 +553,8 @@ def release_slot():
             except Exception as e:
                 errors.append({"index": index, "error": f"Failed to release slot: {str(e)}"})
 
-        db.session.commit()
+        # Keep booking + transaction writes in one DB transaction for consistency.
+        db.session.flush()
 
         response = {"message": f"Processed {success_count} bookings."}
         if errors:
@@ -2068,6 +2225,21 @@ def new_booking(vendor_id):
         transactions = []
         waive_off_per_slot = waive_off_total / len(bookings) if bookings else 0.0
         meals_cost_per_slot = total_meals_cost / len(bookings) if bookings and total_meals_cost > 0 else 0.0
+        actor = resolve_transaction_actor(request)
+        payment_use_case = normalize_payment_use_case(payment_type, actor["source_channel"])
+        settlement_status = resolve_settlement_status(payment_use_case)
+        credit_account = None
+        if payment_use_case == "monthly_credit":
+            credit_account = MonthlyCreditAccount.query.filter_by(
+                vendor_id=vendor_id,
+                user_id=user.id,
+                is_active=True
+            ).first()
+            if not credit_account:
+                return jsonify({
+                    "success": False,
+                    "message": "Monthly credit account not configured for this customer."
+                }), 400
 
         for booking in bookings:
             base_slot_price = get_effective_price(vendor_id, available_game)
@@ -2076,6 +2248,7 @@ def new_booking(vendor_id):
             original_amount = base_slot_price + slot_meal_cost
             discounted_amount = waive_off_per_slot
             final_amount = max(original_amount - discounted_amount, 0.0)
+            gst = calculate_gst_breakdown(vendor_id, final_amount)
 
             transaction = Transaction(
                 booking_id=booking.id,
@@ -2089,14 +2262,52 @@ def new_booking(vendor_id):
                 discounted_amount=discounted_amount,
                 amount=final_amount,
                 mode_of_payment=payment_type,
+                payment_use_case=payment_use_case,
                 booking_type=booking_type,
-                settlement_status="NA" if payment_type != "paid" else "completed"
+                settlement_status=settlement_status,
+                source_channel=actor["source_channel"],
+                initiated_by_staff_id=actor["staff_id"],
+                initiated_by_staff_name=actor["staff_name"],
+                initiated_by_staff_role=actor["staff_role"],
+                base_amount=base_slot_price,
+                meals_amount=slot_meal_cost,
+                controller_amount=0.0,
+                waive_off_amount=discounted_amount,
+                taxable_amount=gst["taxable_amount"],
+                gst_rate=gst["gst_rate"],
+                cgst_amount=gst["cgst_amount"],
+                sgst_amount=gst["sgst_amount"],
+                igst_amount=gst["igst_amount"],
+                total_with_tax=gst["total_with_tax"]
             )
             db.session.add(transaction)
+            db.session.flush()
             transactions.append(transaction)
+
+            if credit_account and final_amount > 0:
+                due_date = compute_credit_due_date(
+                    datetime.strptime(booked_date, "%Y-%m-%d").date(),
+                    credit_account.billing_cycle_day
+                )
+                db.session.add(
+                    MonthlyCreditLedger(
+                        account_id=credit_account.id,
+                        transaction_id=transaction.id,
+                        entry_type="charge",
+                        amount=final_amount,
+                        description=f"Booking charge #{booking.id}",
+                        booked_date=datetime.strptime(booked_date, "%Y-%m-%d").date(),
+                        due_date=due_date,
+                        source_channel=actor["source_channel"],
+                        staff_id=actor["staff_id"],
+                        staff_name=actor["staff_name"],
+                    )
+                )
+                credit_account.outstanding_amount = float(credit_account.outstanding_amount or 0) + final_amount
 
         # Handle extra controller fare
         if extra_controller_fare > 0:
+            gst = calculate_gst_breakdown(vendor_id, extra_controller_fare)
             controller_transaction = Transaction(
                 booking_id=bookings[0].id,
                 vendor_id=vendor_id,
@@ -2109,11 +2320,48 @@ def new_booking(vendor_id):
                 discounted_amount=0,
                 amount=extra_controller_fare,
                 mode_of_payment=payment_type,
+                payment_use_case=payment_use_case,
                 booking_type="extra_controller",
-                settlement_status="NA" if payment_type != "paid" else "completed"
+                settlement_status=settlement_status,
+                source_channel=actor["source_channel"],
+                initiated_by_staff_id=actor["staff_id"],
+                initiated_by_staff_name=actor["staff_name"],
+                initiated_by_staff_role=actor["staff_role"],
+                base_amount=0.0,
+                meals_amount=0.0,
+                controller_amount=extra_controller_fare,
+                waive_off_amount=0.0,
+                taxable_amount=gst["taxable_amount"],
+                gst_rate=gst["gst_rate"],
+                cgst_amount=gst["cgst_amount"],
+                sgst_amount=gst["sgst_amount"],
+                igst_amount=gst["igst_amount"],
+                total_with_tax=gst["total_with_tax"]
             )
             db.session.add(controller_transaction)
+            db.session.flush()
             transactions.append(controller_transaction)
+
+            if credit_account:
+                due_date = compute_credit_due_date(
+                    datetime.strptime(booked_date, "%Y-%m-%d").date(),
+                    credit_account.billing_cycle_day
+                )
+                db.session.add(
+                    MonthlyCreditLedger(
+                        account_id=credit_account.id,
+                        transaction_id=controller_transaction.id,
+                        entry_type="charge",
+                        amount=extra_controller_fare,
+                        description=f"Extra controller charge #{bookings[0].id}",
+                        booked_date=datetime.strptime(booked_date, "%Y-%m-%d").date(),
+                        due_date=due_date,
+                        source_channel=actor["source_channel"],
+                        staff_id=actor["staff_id"],
+                        staff_name=actor["staff_name"],
+                    )
+                )
+                credit_account.outstanding_amount = float(credit_account.outstanding_amount or 0) + extra_controller_fare
 
         # Handle rapid booking console availability
         if is_rapid_booking:
@@ -2202,6 +2450,13 @@ def new_booking(vendor_id):
             "extra_controller_qty": extra_controller_qty,
             "waive_off_amount": waive_off_total,
             "final_amount": total_paid,
+            "source_channel": actor["source_channel"],
+            "staff": {
+                "id": actor["staff_id"],
+                "name": actor["staff_name"],
+                "role": actor["staff_role"]
+            },
+            "payment_use_case": payment_use_case,
             "selected_meals": [
                 {
                     "name": detail['menu_item'].name,
@@ -3760,3 +4015,320 @@ def get_slot_bookings(vendor_id):
             'message': 'Failed to fetch bookings',
             'error': str(e)
         }), 500
+
+
+@booking_blueprint.route('/vendor/<int:vendor_id>/tax-profile', methods=['GET', 'PUT'])
+def vendor_tax_profile(vendor_id):
+    try:
+        profile = VendorTaxProfile.query.filter_by(vendor_id=vendor_id).first()
+
+        if request.method == 'GET':
+            if not profile:
+                return jsonify({
+                    "success": True,
+                    "profile": {
+                        "vendor_id": vendor_id,
+                        "gst_registered": False,
+                        "gst_enabled": False,
+                        "gst_rate": 18.0,
+                        "tax_inclusive": False,
+                    }
+                }), 200
+            return jsonify({"success": True, "profile": profile.to_dict()}), 200
+
+        body = request.get_json(silent=True) or {}
+        if not profile:
+            profile = VendorTaxProfile(vendor_id=vendor_id)
+            db.session.add(profile)
+
+        profile.gst_registered = bool(body.get("gst_registered", profile.gst_registered))
+        profile.gstin = body.get("gstin", profile.gstin)
+        profile.legal_name = body.get("legal_name", profile.legal_name)
+        profile.state_code = body.get("state_code", profile.state_code)
+        profile.place_of_supply_state_code = body.get("place_of_supply_state_code", profile.place_of_supply_state_code)
+        profile.gst_enabled = bool(body.get("gst_enabled", profile.gst_enabled))
+        profile.gst_rate = float(body.get("gst_rate", profile.gst_rate or 18.0))
+        profile.tax_inclusive = bool(body.get("tax_inclusive", profile.tax_inclusive))
+
+        db.session.commit()
+        return jsonify({"success": True, "profile": profile.to_dict()}), 200
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.exception("Tax profile update failed: %s", e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@booking_blueprint.route('/vendor/<int:vendor_id>/time-wallet/<int:user_id>', methods=['GET'])
+def get_time_wallet(vendor_id, user_id):
+    try:
+        account = TimeWalletAccount.query.filter_by(vendor_id=vendor_id, user_id=user_id).first()
+        if not account:
+            return jsonify({
+                "success": True,
+                "wallet": {
+                    "vendor_id": vendor_id,
+                    "user_id": user_id,
+                    "balance_minutes": 0,
+                    "balance_amount": 0,
+                },
+                "ledger": []
+            }), 200
+
+        rows = TimeWalletLedger.query.filter_by(account_id=account.id).order_by(TimeWalletLedger.created_at.desc()).limit(100).all()
+        return jsonify({
+            "success": True,
+            "wallet": {
+                "vendor_id": vendor_id,
+                "user_id": user_id,
+                "balance_minutes": int(account.balance_minutes or 0),
+                "balance_amount": float(account.balance_amount or 0),
+                "expires_at": account.expires_at.isoformat() if account.expires_at else None
+            },
+            "ledger": [
+                {
+                    "id": r.id,
+                    "entry_type": r.entry_type,
+                    "minutes": r.minutes,
+                    "amount": float(r.amount or 0),
+                    "description": r.description,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                    "booking_id": r.booking_id,
+                    "transaction_id": r.transaction_id
+                } for r in rows
+            ]
+        }), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@booking_blueprint.route('/vendor/<int:vendor_id>/time-wallet/credit-unused', methods=['POST'])
+def credit_unused_slots_to_wallet(vendor_id):
+    """
+    Credit unused booked slots to user's time wallet.
+    Body: { "user_id": 1, "booking_ids": [11,12], "description": "Early checkout" }
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        user_id = int(body.get("user_id"))
+        booking_ids = body.get("booking_ids") or []
+        description = body.get("description", "Unused slot carry-forward")
+
+        if not booking_ids:
+            return jsonify({"success": False, "message": "booking_ids required"}), 400
+
+        account = TimeWalletAccount.query.filter_by(vendor_id=vendor_id, user_id=user_id).first()
+        if not account:
+            account = TimeWalletAccount(vendor_id=vendor_id, user_id=user_id, balance_minutes=0, balance_amount=0.0)
+            db.session.add(account)
+            db.session.flush()
+
+        actor = resolve_transaction_actor(request)
+        credited_minutes = 0
+        credited_amount = 0.0
+
+        for booking_id in booking_ids:
+            booking = Booking.query.filter_by(id=booking_id, user_id=user_id).first()
+            if not booking or not booking.slot_id:
+                continue
+
+            game = AvailableGame.query.filter_by(id=booking.game_id, vendor_id=vendor_id).first()
+            if not game:
+                continue
+
+            slot = Slot.query.filter_by(id=booking.slot_id).first()
+            slot_minutes = calculate_slot_minutes(slot)
+            if slot_minutes <= 0:
+                continue
+
+            slot_amount = float(get_effective_price(vendor_id, game))
+            account.balance_minutes = int(account.balance_minutes or 0) + slot_minutes
+            account.balance_amount = float(account.balance_amount or 0) + slot_amount
+            credited_minutes += slot_minutes
+            credited_amount += slot_amount
+
+            booking.status = "wallet_credited"
+
+            db.session.add(
+                TimeWalletLedger(
+                    account_id=account.id,
+                    booking_id=booking.id,
+                    entry_type="credit",
+                    minutes=slot_minutes,
+                    amount=slot_amount,
+                    description=description,
+                    source_channel=actor["source_channel"],
+                    staff_id=actor["staff_id"],
+                    staff_name=actor["staff_name"],
+                )
+            )
+
+        db.session.commit()
+        return jsonify({
+            "success": True,
+            "credited_minutes": credited_minutes,
+            "credited_amount": round(credited_amount, 2),
+            "wallet_balance_minutes": int(account.balance_minutes or 0),
+            "wallet_balance_amount": float(account.balance_amount or 0),
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.exception("Failed to credit time wallet: %s", e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@booking_blueprint.route('/vendor/<int:vendor_id>/monthly-credit/accounts', methods=['GET', 'PUT'])
+def monthly_credit_accounts(vendor_id):
+    try:
+        if request.method == 'GET':
+            rows = MonthlyCreditAccount.query.filter_by(vendor_id=vendor_id).all()
+            return jsonify({
+                "success": True,
+                "accounts": [
+                    {
+                        "id": r.id,
+                        "vendor_id": r.vendor_id,
+                        "user_id": r.user_id,
+                        "credit_limit": float(r.credit_limit or 0),
+                        "outstanding_amount": float(r.outstanding_amount or 0),
+                        "billing_cycle_day": r.billing_cycle_day,
+                        "grace_days": r.grace_days,
+                        "is_active": r.is_active,
+                        "notes": r.notes,
+                    } for r in rows
+                ]
+            }), 200
+
+        body = request.get_json(silent=True) or {}
+        user_id = int(body.get("user_id"))
+        account = MonthlyCreditAccount.query.filter_by(vendor_id=vendor_id, user_id=user_id).first()
+        if not account:
+            account = MonthlyCreditAccount(vendor_id=vendor_id, user_id=user_id)
+            db.session.add(account)
+
+        account.credit_limit = float(body.get("credit_limit", account.credit_limit or 0))
+        account.billing_cycle_day = int(body.get("billing_cycle_day", account.billing_cycle_day or 1))
+        account.grace_days = int(body.get("grace_days", account.grace_days or 5))
+        account.is_active = bool(body.get("is_active", True))
+        account.notes = body.get("notes", account.notes)
+
+        db.session.commit()
+        return jsonify({"success": True, "account_id": account.id}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@booking_blueprint.route('/vendor/<int:vendor_id>/monthly-credit/statement/<int:user_id>', methods=['GET'])
+def monthly_credit_statement(vendor_id, user_id):
+    try:
+        account = MonthlyCreditAccount.query.filter_by(vendor_id=vendor_id, user_id=user_id).first()
+        if not account:
+            return jsonify({"success": False, "message": "No monthly credit account"}), 404
+
+        rows = MonthlyCreditLedger.query.filter_by(account_id=account.id).order_by(MonthlyCreditLedger.created_at.desc()).limit(500).all()
+        return jsonify({
+            "success": True,
+            "account": {
+                "credit_limit": float(account.credit_limit or 0),
+                "outstanding_amount": float(account.outstanding_amount or 0),
+                "billing_cycle_day": account.billing_cycle_day,
+                "grace_days": account.grace_days,
+            },
+            "entries": [
+                {
+                    "id": r.id,
+                    "entry_type": r.entry_type,
+                    "amount": float(r.amount or 0),
+                    "description": r.description,
+                    "booked_date": r.booked_date.isoformat() if r.booked_date else None,
+                    "due_date": r.due_date.isoformat() if r.due_date else None,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                    "transaction_id": r.transaction_id
+                } for r in rows
+            ]
+        }), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@booking_blueprint.route('/vendor/<int:vendor_id>/monthly-credit/settle', methods=['POST'])
+def settle_monthly_credit(vendor_id):
+    """
+    Settle monthly credit outstanding at month-end.
+    Body: { "user_id": 1, "amount": 5000, "mode_of_payment": "UPI" }
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        user_id = int(body.get("user_id"))
+        amount = float(body.get("amount", 0))
+        mode = str(body.get("mode_of_payment", "UPI"))
+        if amount <= 0:
+            return jsonify({"success": False, "message": "amount must be > 0"}), 400
+
+        account = MonthlyCreditAccount.query.filter_by(vendor_id=vendor_id, user_id=user_id, is_active=True).first()
+        if not account:
+            return jsonify({"success": False, "message": "Monthly credit account not found"}), 404
+
+        user = User.query.filter_by(id=user_id).first()
+        actor = resolve_transaction_actor(request)
+
+        transaction = Transaction(
+            booking_id=None,
+            vendor_id=vendor_id,
+            user_id=user_id,
+            booked_date=datetime.utcnow().date(),
+            booking_date=datetime.utcnow().date(),
+            booking_time=datetime.utcnow().time(),
+            user_name=user.name if user else "Unknown",
+            original_amount=amount,
+            discounted_amount=0.0,
+            amount=amount,
+            mode_of_payment=mode,
+            payment_use_case=normalize_payment_use_case(mode, actor["source_channel"]),
+            booking_type="monthly_credit_settlement",
+            settlement_status="completed",
+            source_channel=actor["source_channel"],
+            initiated_by_staff_id=actor["staff_id"],
+            initiated_by_staff_name=actor["staff_name"],
+            initiated_by_staff_role=actor["staff_role"],
+            base_amount=0.0,
+            meals_amount=0.0,
+            controller_amount=0.0,
+            waive_off_amount=0.0,
+            taxable_amount=0.0,
+            gst_rate=0.0,
+            cgst_amount=0.0,
+            sgst_amount=0.0,
+            igst_amount=0.0,
+            total_with_tax=amount
+        )
+        db.session.add(transaction)
+        db.session.flush()
+
+        db.session.add(
+            MonthlyCreditLedger(
+                account_id=account.id,
+                transaction_id=transaction.id,
+                entry_type="payment",
+                amount=amount,
+                description="Month-end settlement",
+                booked_date=datetime.utcnow().date(),
+                due_date=None,
+                source_channel=actor["source_channel"],
+                staff_id=actor["staff_id"],
+                staff_name=actor["staff_name"],
+            )
+        )
+
+        account.outstanding_amount = max(0.0, float(account.outstanding_amount or 0) - amount)
+        db.session.commit()
+
+        return jsonify({
+            "success": True,
+            "transaction_id": transaction.id,
+            "remaining_outstanding": float(account.outstanding_amount or 0),
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.exception("Monthly settlement failed: %s", e)
+        return jsonify({"success": False, "error": str(e)}), 500
