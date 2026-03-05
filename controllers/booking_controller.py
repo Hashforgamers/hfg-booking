@@ -4349,6 +4349,16 @@ def monthly_credit_statement(vendor_id, user_id):
             return jsonify({"success": False, "message": "No monthly credit account"}), 404
 
         rows = MonthlyCreditLedger.query.filter_by(account_id=account.id).order_by(MonthlyCreditLedger.created_at.desc()).limit(500).all()
+        transaction_ids = [r.transaction_id for r in rows if r.transaction_id]
+        tx_map = {}
+        if transaction_ids:
+            tx_rows = (
+                Transaction.query
+                .filter(Transaction.id.in_(transaction_ids))
+                .all()
+            )
+            tx_map = {t.id: t for t in tx_rows}
+
         return jsonify({
             "success": True,
             "account": {
@@ -4381,6 +4391,9 @@ def monthly_credit_statement(vendor_id, user_id):
                     "source_channel": r.source_channel,
                     "staff_id": r.staff_id,
                     "staff_name": r.staff_name,
+                    "mode_of_payment": tx_map.get(r.transaction_id).mode_of_payment if r.transaction_id in tx_map else None,
+                    "payment_use_case": tx_map.get(r.transaction_id).payment_use_case if r.transaction_id in tx_map else None,
+                    "booking_type": tx_map.get(r.transaction_id).booking_type if r.transaction_id in tx_map else None,
                 } for r in rows
             ]
         }), 200
