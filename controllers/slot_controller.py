@@ -2,13 +2,18 @@ from flask import Blueprint, jsonify, current_app, request
 from models.slot import Slot
 from flask_socketio import emit
 from db.extensions import db
-from sqlalchemy.sql import text 
+from sqlalchemy.sql import text, bindparam
 from datetime import datetime
 from models.availableGame import AvailableGame
 from pytz import timezone
+import time
+import threading
 
 
 slot_blueprint = Blueprint('slots', __name__)
+SLOTS_BATCH_CACHE_TTL_SEC = 5
+_slots_batch_cache = {}
+_slots_batch_cache_lock = threading.Lock()
 
 @slot_blueprint.route('/slots', methods=['GET'])
 def get_slots():
@@ -75,24 +80,54 @@ def get_slots_batch(vendorId):
     Fetch slots for multiple games and dates in ONE optimized query.
     Request body: { "game_ids": [1, 2, 3], "dates": ["20260105", "20260106", "20260107"] }
     """
+    started_at = time.perf_counter()
     try:
-        data = request.json
-        game_ids = data.get('game_ids', [])
-        dates = data.get('dates', [])
+        data = request.get_json(silent=True) or {}
+        game_ids = data.get('game_ids') or []
+        dates = data.get('dates') or []
         
         if not game_ids or not dates:
             return jsonify({"error": "game_ids and dates are required"}), 400
+
+        if not isinstance(game_ids, list) or not isinstance(dates, list):
+            return jsonify({"error": "game_ids and dates must be arrays"}), 400
+
+        if len(game_ids) > 32 or len(dates) > 31:
+            return jsonify({"error": "Too many game_ids or dates requested"}), 400
+
+        normalized_game_ids = []
+        for game_id in game_ids:
+            try:
+                normalized_game_ids.append(int(game_id))
+            except (TypeError, ValueError):
+                return jsonify({"error": f"Invalid game_id: {game_id}"}), 400
+
+        game_ids = sorted(set(normalized_game_ids))
         
         # Validate and format dates
         formatted_dates = []
+        normalized_dates = []
         for date in dates:
             if len(date) != 8 or not date.isdigit():
                 return jsonify({"error": f"Invalid date format: {date}. Use YYYYMMDD."}), 400
+            normalized_dates.append(date)
             formatted_dates.append(f"{date[:4]}-{date[4:6]}-{date[6:8]}")
+
+        normalized_dates = sorted(set(normalized_dates))
+        formatted_dates = [f"{d[:4]}-{d[4:6]}-{d[6:8]}" for d in normalized_dates]
+
+        cache_key = f"vendor:{vendorId}|games:{','.join(map(str, game_ids))}|dates:{','.join(normalized_dates)}"
+        now_ts = time.time()
+        with _slots_batch_cache_lock:
+            cached_entry = _slots_batch_cache.get(cache_key)
+        if cached_entry and cached_entry["expires_at"] > now_ts:
+            response = jsonify(cached_entry["payload"])
+            response.headers["X-Cache"] = "HIT"
+            response.headers["X-Response-Time-ms"] = f"{(time.perf_counter() - started_at) * 1000:.2f}"
+            return response, 200
         
         table_name = f"VENDOR_{vendorId}_SLOT"
         
-        # 🔥 SINGLE OPTIMIZED QUERY - Fetch everything at once
         sql_query = text(f"""
             SELECT 
                 vs.slot_id,
@@ -107,29 +142,30 @@ def get_slots_batch(vendorId):
             FROM {table_name} vs
             INNER JOIN slots s ON s.id = vs.slot_id
             INNER JOIN available_games ag ON ag.id = s.gaming_type_id
-            WHERE vs.date IN :dates 
+            WHERE vs.date IN :dates
               AND s.gaming_type_id IN :game_ids
               AND ag.vendor_id = :vendorId
             ORDER BY vs.date, s.start_time ASC
-        """)
+        """).bindparams(
+            bindparam("dates", expanding=True),
+            bindparam("game_ids", expanding=True),
+        )
         
         result = db.session.execute(
             sql_query, 
             {
-                "dates": tuple(formatted_dates), 
-                "game_ids": tuple(game_ids),
+                "dates": formatted_dates,
+                "game_ids": game_ids,
                 "vendorId": vendorId
             }
         ).fetchall()
         
-        # 🔥 Group results by date
         slots_by_date = {}
-        for date in dates:
+        for date in normalized_dates:
             slots_by_date[date] = []
         
         for row in result:
-            # Convert date back to YYYYMMDD format
-            date_obj = row[1]  # This is the date from database
+            date_obj = row[1]
             date_key = date_obj.strftime("%Y%m%d")
             
             slots_by_date[date_key].append({
@@ -141,8 +177,17 @@ def get_slots_batch(vendorId):
                 "single_slot_price": row[7],
                 "console_id": row[8]
             })
-        
-        return jsonify(slots_by_date), 200
+
+        with _slots_batch_cache_lock:
+            _slots_batch_cache[cache_key] = {
+                "payload": slots_by_date,
+                "expires_at": time.time() + SLOTS_BATCH_CACHE_TTL_SEC,
+            }
+
+        response = jsonify(slots_by_date)
+        response.headers["X-Cache"] = "MISS"
+        response.headers["X-Response-Time-ms"] = f"{(time.perf_counter() - started_at) * 1000:.2f}"
+        return response, 200
         
     except Exception as e:
         current_app.logger.error(f"Batch slots error: {str(e)}")

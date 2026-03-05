@@ -19,8 +19,8 @@ import os
 socketio = SocketIO(
     async_mode="eventlet",
     cors_allowed_origins="*",
-    logger=True,
-    engineio_logger=True
+    logger=os.getenv("SOCKETIO_LOGGER", "false").lower() == "true",
+    engineio_logger=os.getenv("ENGINEIO_LOGGER", "false").lower() == "true"
 )
 
 
