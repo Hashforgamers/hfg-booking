@@ -72,20 +72,26 @@ def get_slots_on_game_id(vendorId, gameId, date):
         """)
         result = db.session.execute(sql_query, {"date": formatted_date, "gameId": gameId}).fetchall()
 
+        slot_ids = [int(row[0]) for row in result]
+        slot_rows = []
+        if slot_ids:
+            slot_rows = (
+                Slot.query
+                .filter(Slot.id.in_(slot_ids), Slot.gaming_type_id == gameId)
+                .order_by(Slot.start_time.asc())
+                .all()
+            )
         vendor_slot_map = {int(row[0]): {"is_available": bool(row[1]), "available_slot": int(row[2] or 0)} for row in result}
 
-        base_slots = Slot.query.filter(Slot.gaming_type_id == gameId).order_by(Slot.start_time.asc()).all()
         slots = []
-        for slot in base_slots:
+        for slot in slot_rows:
             vendor_entry = vendor_slot_map.get(int(slot.id))
             if vendor_entry:
                 raw_available = int(vendor_entry.get("available_slot") or 0)
                 slot_is_available = bool(vendor_entry.get("is_available"))
                 resolved_available = raw_available if raw_available > 0 else (1 if slot_is_available else 0)
             else:
-                # Missing vendor rows should not hard-block booking if consoles exist.
-                resolved_available = int(mapped_console_count or 0)
-                slot_is_available = resolved_available > 0
+                continue
 
             slots.append({
                 "slot_id": int(slot.id),
@@ -155,96 +161,61 @@ def get_slots_batch(vendorId):
         
         table_name = f"VENDOR_{vendorId}_SLOT"
         
-        base_slots_query = text("""
-            SELECT
-                s.id AS slot_id,
-                s.start_time,
-                s.end_time,
-                s.gaming_type_id AS game_id,
-                ag.single_slot_price,
-                COALESCE(gc.console_count, 0) AS mapped_console_count
-            FROM slots s
-            INNER JOIN available_games ag
-                ON ag.id = s.gaming_type_id
-               AND ag.vendor_id = :vendorId
-            LEFT JOIN (
-                SELECT
-                    agc.available_game_id AS game_id,
-                    COUNT(DISTINCT c.id) AS console_count
-                FROM available_game_console agc
-                INNER JOIN consoles c ON c.id = agc.console_id
-                WHERE c.vendor_id = :vendorId
-                GROUP BY agc.available_game_id
-            ) gc ON gc.game_id = ag.id
-            WHERE s.gaming_type_id IN :game_ids
-            ORDER BY s.start_time ASC
-        """).bindparams(bindparam("game_ids", expanding=True))
-
-        base_rows = db.session.execute(
-            base_slots_query,
-            {"vendorId": vendorId, "game_ids": game_ids},
-        ).fetchall()
-
-        if not base_rows:
-            response = jsonify({key: [] for key in normalized_dates})
-            response.headers["X-Cache"] = "MISS"
-            response.headers["X-Response-Time-ms"] = f"{(time.perf_counter() - started_at) * 1000:.2f}"
-            return response, 200
-
-        slot_ids = sorted({int(row.slot_id) for row in base_rows})
-
-        vendor_rows_query = text(f"""
-            SELECT
+        sql_query = text(f"""
+            SELECT 
                 vs.slot_id,
                 vs.date,
                 vs.is_available,
-                vs.available_slot
+                vs.available_slot,
+                s.start_time,
+                s.end_time,
+                s.gaming_type_id,
+                ag.single_slot_price,
+                ag.id as game_id
             FROM {table_name} vs
+            INNER JOIN slots s ON s.id = vs.slot_id
+            INNER JOIN available_games ag ON ag.id = s.gaming_type_id
+            INNER JOIN available_game_console agc ON agc.available_game_id = ag.id
+            INNER JOIN consoles c ON c.id = agc.console_id AND c.vendor_id = :vendorId
             WHERE vs.date IN :dates
-              AND vs.slot_id IN :slot_ids
+              AND s.gaming_type_id IN :game_ids
+              AND ag.vendor_id = :vendorId
+            GROUP BY vs.slot_id, vs.date, vs.is_available, vs.available_slot, s.start_time, s.end_time, s.gaming_type_id, ag.single_slot_price, ag.id
+            ORDER BY vs.date, s.start_time ASC
         """).bindparams(
             bindparam("dates", expanding=True),
-            bindparam("slot_ids", expanding=True),
+            bindparam("game_ids", expanding=True),
         )
-
-        vendor_rows = db.session.execute(
-            vendor_rows_query,
-            {"dates": formatted_dates, "slot_ids": slot_ids},
-        ).fetchall()
-
-        vendor_slot_map = {}
-        for row in vendor_rows:
-            date_key = row.date.strftime("%Y-%m-%d")
-            vendor_slot_map[(date_key, int(row.slot_id))] = {
-                "is_available": bool(row.is_available),
-                "available_slot": int(row.available_slot or 0),
+        
+        result = db.session.execute(
+            sql_query, 
+            {
+                "dates": formatted_dates,
+                "game_ids": game_ids,
+                "vendorId": vendorId
             }
+        ).fetchall()
         
         slots_by_date = {}
         for date in normalized_dates:
             slots_by_date[date] = []
         
-        for normalized_date in normalized_dates:
-            date_key = f"{normalized_date[:4]}-{normalized_date[4:6]}-{normalized_date[6:8]}"
-            for row in base_rows:
-                vendor_entry = vendor_slot_map.get((date_key, int(row.slot_id)))
-                if vendor_entry:
-                    raw_available = int(vendor_entry.get("available_slot") or 0)
-                    slot_is_available = bool(vendor_entry.get("is_available"))
-                    resolved_available = raw_available if raw_available > 0 else (1 if slot_is_available else 0)
-                else:
-                    resolved_available = int(row.mapped_console_count or 0)
-                    slot_is_available = resolved_available > 0
-
-                slots_by_date[normalized_date].append({
-                    "slot_id": int(row.slot_id),
-                    "start_time": row.start_time.strftime("%H:%M:%S") if hasattr(row.start_time, 'strftime') else str(row.start_time),
-                    "end_time": row.end_time.strftime("%H:%M:%S") if hasattr(row.end_time, 'strftime') else str(row.end_time),
-                    "is_available": bool(slot_is_available),
-                    "available_slot": int(resolved_available),
-                    "single_slot_price": row.single_slot_price,
-                    "console_id": int(row.game_id),
-                })
+        for row in result:
+            date_obj = row[1]
+            date_key = date_obj.strftime("%Y%m%d")
+            raw_available = int(row[3] or 0)
+            slot_is_available = bool(row[2])
+            resolved_available = raw_available if raw_available > 0 else (1 if slot_is_available else 0)
+            
+            slots_by_date[date_key].append({
+                "slot_id": int(row[0]),
+                "start_time": row[4].strftime("%H:%M:%S") if hasattr(row[4], 'strftime') else str(row[4]),
+                "end_time": row[5].strftime("%H:%M:%S") if hasattr(row[5], 'strftime') else str(row[5]),
+                "is_available": slot_is_available,
+                "available_slot": resolved_available,
+                "single_slot_price": row[7],
+                "console_id": int(row[8])
+            })
 
         with _slots_batch_cache_lock:
             _slots_batch_cache[cache_key] = {
