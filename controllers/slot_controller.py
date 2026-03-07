@@ -3,8 +3,11 @@ from models.slot import Slot
 from flask_socketio import emit
 from db.extensions import db
 from sqlalchemy.sql import text, bindparam
+from sqlalchemy import func
 from datetime import datetime
 from models.availableGame import AvailableGame
+from models.availableGame import available_game_console
+from models.console import Console
 from pytz import timezone
 import time
 import threading
@@ -38,10 +41,23 @@ def get_slots_on_game_id(vendorId, gameId, date):
         formatted_date = f"{date[:4]}-{date[4:6]}-{date[6:8]}"
         table_name = f"VENDOR_{vendorId}_SLOT"
 
-        # Step 1: Get price from AvailableGame
+        # Step 1: Get price from AvailableGame and ensure real console mapping exists.
         available_game = AvailableGame.query.filter_by(id=gameId, vendor_id=vendorId).first()
         if not available_game:
             return jsonify({"error": "Game not found for this vendor."}), 404
+        mapped_console_count = (
+            db.session.query(func.count(func.distinct(Console.id)))
+            .select_from(available_game_console)
+            .join(Console, Console.id == available_game_console.c.console_id)
+            .filter(
+                available_game_console.c.available_game_id == gameId,
+                Console.vendor_id == vendorId,
+            )
+            .scalar()
+            or 0
+        )
+        if mapped_console_count <= 0:
+            return jsonify({"slots": []}), 200
 
         single_slot_price = available_game.single_slot_price
 
@@ -142,9 +158,12 @@ def get_slots_batch(vendorId):
             FROM {table_name} vs
             INNER JOIN slots s ON s.id = vs.slot_id
             INNER JOIN available_games ag ON ag.id = s.gaming_type_id
+            INNER JOIN available_game_console agc ON agc.available_game_id = ag.id
+            INNER JOIN consoles c ON c.id = agc.console_id AND c.vendor_id = :vendorId
             WHERE vs.date IN :dates
               AND s.gaming_type_id IN :game_ids
               AND ag.vendor_id = :vendorId
+            GROUP BY vs.slot_id, vs.date, vs.is_available, vs.available_slot, s.start_time, s.end_time, s.gaming_type_id, ag.single_slot_price, ag.id
             ORDER BY vs.date, s.start_time ASC
         """).bindparams(
             bindparam("dates", expanding=True),

@@ -1,11 +1,15 @@
 from flask import Blueprint, jsonify, request
 from services.booking_service import BookingService
 from models.availableGame import AvailableGame
+from models.availableGame import available_game_console
+from models.console import Console
+from db.extensions import db
 from models.openingDays import OpeningDay
 from datetime import datetime
 from flask_cors import cross_origin
 import time
 from threading import Lock
+from sqlalchemy import func
 
 
 game_blueprint = Blueprint('game', __name__)
@@ -149,9 +153,27 @@ def cancel_booking(booking_id):
 @game_blueprint.route('/getAllConsole/vendor/<int:vendor_id>', methods=['GET'])
 @cross_origin(origins="*")
 def get_all_console_by_vendor_id(vendor_id):
-
-    # Query games by vendor_id
-    games = AvailableGame.query.filter_by(vendor_id=vendor_id).all()
+    # Return only console types that are actually mapped to vendor consoles.
+    games = (
+        db.session.query(
+            AvailableGame.id,
+            AvailableGame.game_name,
+            AvailableGame.single_slot_price,
+            func.count(func.distinct(Console.id)).label("console_count"),
+        )
+        .join(
+            available_game_console,
+            available_game_console.c.available_game_id == AvailableGame.id,
+        )
+        .join(Console, Console.id == available_game_console.c.console_id)
+        .filter(
+            AvailableGame.vendor_id == vendor_id,
+            Console.vendor_id == vendor_id,
+        )
+        .group_by(AvailableGame.id, AvailableGame.game_name, AvailableGame.single_slot_price)
+        .having(func.count(func.distinct(Console.id)) > 0)
+        .all()
+    )
 
     # If no games found, return an appropriate message
     if not games:
@@ -164,8 +186,10 @@ def get_all_console_by_vendor_id(vendor_id):
     # Return the game details along with the vendor's open days in JSON format
     return jsonify({
         "games": [{
-            "id": game.id,
-            "console_name": game.game_name,
-            "console_price":game.single_slot_price
-        } for game in games],
+            "id": row.id,
+            "console_name": row.game_name,
+            "console_price": row.single_slot_price,
+            "console_count": int(row.console_count or 0),
+            "is_active": True,
+        } for row in games],
     })
