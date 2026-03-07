@@ -18,6 +18,45 @@ SLOTS_BATCH_CACHE_TTL_SEC = 5
 _slots_batch_cache = {}
 _slots_batch_cache_lock = threading.Lock()
 
+
+def _slot_duration_minutes(start_time, end_time):
+    """Return positive duration in minutes for HH:MM:SS times, handling overnight edge."""
+    if not start_time or not end_time:
+        return 0
+    sh, sm = start_time.hour, start_time.minute
+    eh, em = end_time.hour, end_time.minute
+    start_min = sh * 60 + sm
+    end_min = eh * 60 + em
+    if end_min <= start_min:
+        end_min += 24 * 60
+    return int(end_min - start_min)
+
+
+def _load_vendor_day_duration_map(vendor_id):
+    rows = db.session.execute(
+        text("""
+            SELECT day, slot_duration
+            FROM vendor_day_slot_config
+            WHERE vendor_id = :vendor_id
+        """),
+        {"vendor_id": vendor_id},
+    ).fetchall()
+    duration_map = {}
+    for row in rows:
+        key = str(row.day or "").strip().lower()[:3]
+        try:
+            duration = int(row.slot_duration or 0)
+        except (TypeError, ValueError):
+            continue
+        if key and duration > 0:
+            duration_map[key] = duration
+    return duration_map
+
+
+def _weekday_key_from_yyyymmdd(yyyymmdd):
+    dt_obj = datetime.strptime(yyyymmdd, "%Y%m%d")
+    return ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][dt_obj.weekday()]
+
 @slot_blueprint.route('/slots', methods=['GET'])
 def get_slots():
     try:
@@ -83,8 +122,15 @@ def get_slots_on_game_id(vendorId, gameId, date):
             )
         vendor_slot_map = {int(row[0]): {"is_available": bool(row[1]), "available_slot": int(row[2] or 0)} for row in result}
 
+        day_duration_map = _load_vendor_day_duration_map(vendorId)
+        weekday_key = _weekday_key_from_yyyymmdd(date)
+        expected_duration = day_duration_map.get(weekday_key)
+
         slots = []
         for slot in slot_rows:
+            slot_duration = _slot_duration_minutes(slot.start_time, slot.end_time)
+            if expected_duration and slot_duration != expected_duration:
+                continue
             vendor_entry = vendor_slot_map.get(int(slot.id))
             if vendor_entry:
                 raw_available = int(vendor_entry.get("available_slot") or 0)
@@ -196,6 +242,8 @@ def get_slots_batch(vendorId):
             }
         ).fetchall()
         
+        day_duration_map = _load_vendor_day_duration_map(vendorId)
+
         slots_by_date = {}
         for date in normalized_dates:
             slots_by_date[date] = []
@@ -203,6 +251,11 @@ def get_slots_batch(vendorId):
         for row in result:
             date_obj = row[1]
             date_key = date_obj.strftime("%Y%m%d")
+            weekday_key = _weekday_key_from_yyyymmdd(date_key)
+            expected_duration = day_duration_map.get(weekday_key)
+            actual_duration = _slot_duration_minutes(row[4], row[5])
+            if expected_duration and actual_duration != expected_duration:
+                continue
             raw_available = int(row[3] or 0)
             slot_is_available = bool(row[2])
             resolved_available = raw_available if raw_available > 0 else (1 if slot_is_available else 0)
