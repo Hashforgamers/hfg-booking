@@ -91,6 +91,39 @@ def _generate_blocks(anchor_day, start_time, end_time, slot_duration):
     return blocks
 
 
+def _expected_blocks_for_date(vendor_id, formatted_date):
+    dt_obj = datetime.strptime(formatted_date, "%Y-%m-%d").date()
+    day_key = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][dt_obj.weekday()]
+    cfg_rows = db.session.execute(
+        text(
+            """
+            SELECT opening_time, closing_time, slot_duration
+            FROM vendor_day_slot_config
+            WHERE vendor_id = :vendor_id
+              AND lower(substr(day, 1, 3)) = :day_key
+            """
+        ),
+        {"vendor_id": vendor_id, "day_key": day_key},
+    ).fetchall()
+    if not cfg_rows:
+        return set()
+
+    blocks = []
+    for cfg in cfg_rows:
+        try:
+            duration = int(cfg.slot_duration or 0)
+        except (TypeError, ValueError):
+            continue
+        if duration <= 0:
+            continue
+        open_t = _parse_time_flexible(cfg.opening_time)
+        close_t = _parse_time_flexible(cfg.closing_time)
+        if not open_t or not close_t:
+            continue
+        blocks.extend(_generate_blocks(dt_obj, open_t, close_t, duration))
+    return set(blocks)
+
+
 def _ensure_slots_for_date(vendor_id, game_id, formatted_date):
     """
     Self-heal missing slots for a specific vendor/game/date based on vendor_day_slot_config.
@@ -320,6 +353,7 @@ def get_slots_on_game_id(vendorId, gameId, date):
         day_duration_map = _load_vendor_day_duration_map(vendorId)
         total_slots_for_game = int(available_game.total_slot or 0)
         booking_counts = _load_booking_counts(vendorId, [int(gameId)], [formatted_date])
+        expected_blocks = _expected_blocks_for_date(vendorId, formatted_date)
         weekday_key = _weekday_key_from_yyyymmdd(date)
         expected_duration = day_duration_map.get(weekday_key)
 
@@ -327,6 +361,8 @@ def get_slots_on_game_id(vendorId, gameId, date):
         for slot in slot_rows:
             slot_duration = _slot_duration_minutes(slot.start_time, slot.end_time)
             if expected_duration and slot_duration != expected_duration:
+                continue
+            if expected_blocks and (slot.start_time, slot.end_time) not in expected_blocks:
                 continue
             vendor_entry = vendor_slot_map.get(int(slot.id))
             if vendor_entry:
@@ -448,6 +484,14 @@ def get_slots_batch(vendorId):
         ).fetchall()
         
         day_duration_map = _load_vendor_day_duration_map(vendorId)
+        total_slots_map = {
+            int(g.id): int(g.total_slot or 0)
+            for g in AvailableGame.query.filter(AvailableGame.id.in_(game_ids)).all()
+        }
+        booking_counts = _load_booking_counts(vendorId, game_ids, formatted_dates)
+        expected_blocks_by_date = {
+            d: _expected_blocks_for_date(vendorId, d) for d in formatted_dates
+        }
 
         slots_by_date = {}
         for date in normalized_dates:
@@ -462,6 +506,9 @@ def get_slots_batch(vendorId):
             expected_duration = day_duration_map.get(weekday_key)
             actual_duration = _slot_duration_minutes(row[4], row[5])
             if expected_duration and actual_duration != expected_duration:
+                continue
+            expected_blocks = expected_blocks_by_date.get(date_obj.strftime("%Y-%m-%d")) or set()
+            if expected_blocks and (row[4], row[5]) not in expected_blocks:
                 continue
             raw_available = int(row[3] or 0)
             game_id = int(row[8])
