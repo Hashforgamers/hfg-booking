@@ -8,6 +8,8 @@ from datetime import datetime
 from models.availableGame import AvailableGame
 from models.availableGame import available_game_console
 from models.console import Console
+from models.booking import Booking
+from models.transaction import Transaction
 from pytz import timezone
 import time
 import threading
@@ -56,6 +58,65 @@ def _load_vendor_day_duration_map(vendor_id):
 def _weekday_key_from_yyyymmdd(yyyymmdd):
     dt_obj = datetime.strptime(yyyymmdd, "%Y%m%d")
     return ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][dt_obj.weekday()]
+
+
+def _prefer_slot_candidate(current, candidate):
+    """
+    Choose the better slot row when duplicate logical slots exist for same time.
+    Preference:
+    1) Higher available_slot
+    2) is_available = True
+    3) Keep existing as stable tie-break
+    """
+    if current is None:
+        return candidate
+
+    curr_avail = int(current.get("available_slot") or 0)
+    cand_avail = int(candidate.get("available_slot") or 0)
+    if cand_avail > curr_avail:
+        return candidate
+    if cand_avail < curr_avail:
+        return current
+
+    curr_open = bool(current.get("is_available"))
+    cand_open = bool(candidate.get("is_available"))
+    if cand_open and not curr_open:
+        return candidate
+    return current
+
+
+def _load_booking_counts(vendor_id, game_ids, formatted_dates):
+    """
+    Return map {(slot_id, YYYY-MM-DD): count_of_active_bookings}
+    for selected vendor/game/date window.
+    """
+    if not game_ids or not formatted_dates:
+        return {}
+
+    rows = (
+        db.session.query(
+            Booking.slot_id,
+            Transaction.booked_date,
+            func.count(Booking.id).label("cnt"),
+        )
+        .join(Transaction, Transaction.booking_id == Booking.id)
+        .filter(
+            Booking.game_id.in_(game_ids),
+            Transaction.vendor_id == vendor_id,
+            Transaction.booked_date.in_(formatted_dates),
+            Booking.slot_id.isnot(None),
+            func.lower(func.coalesce(Booking.status, "")).notin_(["cancelled", "rejected"]),
+        )
+        .group_by(Booking.slot_id, Transaction.booked_date)
+        .all()
+    )
+
+    out = {}
+    for row in rows:
+        if not row.slot_id or not row.booked_date:
+            continue
+        out[(int(row.slot_id), row.booked_date.strftime("%Y-%m-%d"))] = int(row.cnt or 0)
+    return out
 
 @slot_blueprint.route('/slots', methods=['GET'])
 def get_slots():
@@ -123,10 +184,17 @@ def get_slots_on_game_id(vendorId, gameId, date):
         vendor_slot_map = {int(row[0]): {"is_available": bool(row[1]), "available_slot": int(row[2] or 0)} for row in result}
 
         day_duration_map = _load_vendor_day_duration_map(vendorId)
+        total_slots_map = {
+            int(g.id): int(g.total_slot or 0)
+            for g in AvailableGame.query.filter(AvailableGame.id.in_(game_ids)).all()
+        }
+        booking_counts = _load_booking_counts(vendorId, game_ids, formatted_dates)
+        total_slots_for_game = int(available_game.total_slot or 0)
+        booking_counts = _load_booking_counts(vendorId, [int(gameId)], [formatted_date])
         weekday_key = _weekday_key_from_yyyymmdd(date)
         expected_duration = day_duration_map.get(weekday_key)
 
-        slots = []
+        slots_by_key = {}
         for slot in slot_rows:
             slot_duration = _slot_duration_minutes(slot.start_time, slot.end_time)
             if expected_duration and slot_duration != expected_duration:
@@ -134,20 +202,25 @@ def get_slots_on_game_id(vendorId, gameId, date):
             vendor_entry = vendor_slot_map.get(int(slot.id))
             if vendor_entry:
                 raw_available = int(vendor_entry.get("available_slot") or 0)
-                slot_is_available = bool(vendor_entry.get("is_available"))
-                resolved_available = raw_available if raw_available > 0 else (1 if slot_is_available else 0)
+                booked_count = int(booking_counts.get((int(slot.id), formatted_date), 0))
+                computed_available = max(total_slots_for_game - booked_count, 0)
+                resolved_available = max(raw_available, computed_available)
+                slot_is_available = resolved_available > 0
             else:
                 continue
 
-            slots.append({
+            candidate = {
                 "slot_id": int(slot.id),
                 "start_time": slot.start_time.strftime("%H:%M:%S"),
                 "end_time": slot.end_time.strftime("%H:%M:%S"),
                 "is_available": bool(slot_is_available),
                 "available_slot": int(resolved_available),
                 "single_slot_price": single_slot_price
-            })
+            }
+            dedupe_key = (candidate["start_time"],)
+            slots_by_key[dedupe_key] = _prefer_slot_candidate(slots_by_key.get(dedupe_key), candidate)
 
+        slots = sorted(slots_by_key.values(), key=lambda s: s["start_time"])
         return jsonify({"slots": slots}), 200
 
     except Exception as e:
@@ -247,6 +320,8 @@ def get_slots_batch(vendorId):
         slots_by_date = {}
         for date in normalized_dates:
             slots_by_date[date] = []
+
+        merged_slots_by_date = {date: {} for date in normalized_dates}
         
         for row in result:
             date_obj = row[1]
@@ -257,18 +332,32 @@ def get_slots_batch(vendorId):
             if expected_duration and actual_duration != expected_duration:
                 continue
             raw_available = int(row[3] or 0)
-            slot_is_available = bool(row[2])
-            resolved_available = raw_available if raw_available > 0 else (1 if slot_is_available else 0)
+            game_id = int(row[8])
+            booked_count = int(booking_counts.get((int(row[0]), date_obj.strftime("%Y-%m-%d")), 0))
+            computed_available = max(int(total_slots_map.get(game_id, 0)) - booked_count, 0)
+            resolved_available = max(raw_available, computed_available)
+            slot_is_available = resolved_available > 0
             
-            slots_by_date[date_key].append({
+            candidate = {
                 "slot_id": int(row[0]),
                 "start_time": row[4].strftime("%H:%M:%S") if hasattr(row[4], 'strftime') else str(row[4]),
                 "end_time": row[5].strftime("%H:%M:%S") if hasattr(row[5], 'strftime') else str(row[5]),
                 "is_available": slot_is_available,
                 "available_slot": resolved_available,
                 "single_slot_price": row[7],
-                "console_id": int(row[8])
-            })
+                "console_id": game_id
+            }
+            dedupe_key = (candidate["start_time"], int(candidate["console_id"]))
+            merged_slots_by_date[date_key][dedupe_key] = _prefer_slot_candidate(
+                merged_slots_by_date[date_key].get(dedupe_key),
+                candidate,
+            )
+
+        for date_key in normalized_dates:
+            slots_by_date[date_key] = sorted(
+                merged_slots_by_date[date_key].values(),
+                key=lambda s: (s["start_time"], int(s["console_id"])),
+            )
 
         with _slots_batch_cache_lock:
             _slots_batch_cache[cache_key] = {
