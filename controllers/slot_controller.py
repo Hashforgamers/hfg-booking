@@ -316,11 +316,6 @@ def get_slots_on_game_id(vendorId, gameId, date):
         vendor_slot_map = {int(row[0]): {"is_available": bool(row[1]), "available_slot": int(row[2] or 0)} for row in result}
 
         day_duration_map = _load_vendor_day_duration_map(vendorId)
-        total_slots_map = {
-            int(g.id): int(g.total_slot or 0)
-            for g in AvailableGame.query.filter(AvailableGame.id.in_(game_ids)).all()
-        }
-        booking_counts = _load_booking_counts(vendorId, game_ids, formatted_dates)
         total_slots_for_game = int(available_game.total_slot or 0)
         booking_counts = _load_booking_counts(vendorId, [int(gameId)], [formatted_date])
         weekday_key = _weekday_key_from_yyyymmdd(date)
