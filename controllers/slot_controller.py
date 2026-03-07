@@ -350,18 +350,12 @@ def get_slots_on_game_id(vendorId, gameId, date):
             )
         vendor_slot_map = {int(row[0]): {"is_available": bool(row[1]), "available_slot": int(row[2] or 0)} for row in result}
 
-        day_duration_map = _load_vendor_day_duration_map(vendorId)
         total_slots_for_game = int(available_game.total_slot or 0)
         booking_counts = _load_booking_counts(vendorId, [int(gameId)], [formatted_date])
         expected_blocks = _expected_blocks_for_date(vendorId, formatted_date)
-        weekday_key = _weekday_key_from_yyyymmdd(date)
-        expected_duration = day_duration_map.get(weekday_key)
 
         slots_by_key = {}
         for slot in slot_rows:
-            slot_duration = _slot_duration_minutes(slot.start_time, slot.end_time)
-            if expected_duration and slot_duration != expected_duration:
-                continue
             if expected_blocks and (slot.start_time, slot.end_time) not in expected_blocks:
                 continue
             vendor_entry = vendor_slot_map.get(int(slot.id))
@@ -483,7 +477,6 @@ def get_slots_batch(vendorId):
             }
         ).fetchall()
         
-        day_duration_map = _load_vendor_day_duration_map(vendorId)
         total_slots_map = {
             int(g.id): int(g.total_slot or 0)
             for g in AvailableGame.query.filter(AvailableGame.id.in_(game_ids)).all()
@@ -502,11 +495,6 @@ def get_slots_batch(vendorId):
         for row in result:
             date_obj = row[1]
             date_key = date_obj.strftime("%Y%m%d")
-            weekday_key = _weekday_key_from_yyyymmdd(date_key)
-            expected_duration = day_duration_map.get(weekday_key)
-            actual_duration = _slot_duration_minutes(row[4], row[5])
-            if expected_duration and actual_duration != expected_duration:
-                continue
             expected_blocks = expected_blocks_by_date.get(date_obj.strftime("%Y-%m-%d")) or set()
             if expected_blocks and (row[4], row[5]) not in expected_blocks:
                 continue
