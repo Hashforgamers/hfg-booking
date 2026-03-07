@@ -171,13 +171,13 @@ def _ensure_slots_for_date(vendor_id, game_id, formatted_date):
         text(
             f"""
             INSERT INTO {table_name} (vendor_id, date, slot_id, is_available, available_slot)
-            SELECT :vendor_id, :date_val::date, s_id.slot_id, TRUE, :available_slot
+            SELECT :vendor_id, CAST(:date_val AS date), s_id.slot_id, TRUE, :available_slot
             FROM (SELECT unnest(:slot_ids) AS slot_id) s_id
             WHERE NOT EXISTS (
                 SELECT 1
                 FROM {table_name} v
                 WHERE v.vendor_id = :vendor_id
-                  AND v.date = :date_val::date
+                  AND v.date = CAST(:date_val AS date)
                   AND v.slot_id = s_id.slot_id
             )
             """
