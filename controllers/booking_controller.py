@@ -234,6 +234,62 @@ def resolve_settlement_status(payment_use_case: str) -> str:
     return "pending"
 
 
+def _is_slot_live_now_ist(slot_date, start_time, end_time) -> bool:
+    if not slot_date or not start_time or not end_time:
+        return False
+    now_ist = datetime.now(IST).replace(tzinfo=None)
+    if slot_date != now_ist.date():
+        return False
+    start_dt = datetime.combine(slot_date, start_time)
+    end_dt = datetime.combine(slot_date, end_time)
+    if end_dt <= start_dt:
+        end_dt += timedelta(days=1)
+    return start_dt <= now_ist <= end_dt
+
+
+def _reserve_specific_console(vendor_id: int, game_id: int, console_id: int):
+    table_name = f"VENDOR_{vendor_id}_CONSOLE_AVAILABILITY"
+    row = db.session.execute(
+        text(f"""
+            UPDATE {table_name}
+            SET is_available = FALSE
+            WHERE vendor_id = :vendor_id
+              AND game_id = :game_id
+              AND console_id = :console_id
+              AND is_available = TRUE
+            RETURNING console_id
+        """),
+        {"vendor_id": vendor_id, "game_id": game_id, "console_id": console_id},
+    ).fetchone()
+    return int(row[0]) if row else None
+
+
+def _reserve_any_console(vendor_id: int, game_id: int):
+    table_name = f"VENDOR_{vendor_id}_CONSOLE_AVAILABILITY"
+    row = db.session.execute(
+        text(f"""
+            WITH candidate AS (
+                SELECT console_id
+                FROM {table_name}
+                WHERE vendor_id = :vendor_id
+                  AND game_id = :game_id
+                  AND is_available = TRUE
+                ORDER BY console_id
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE {table_name} c
+            SET is_available = FALSE
+            FROM candidate
+            WHERE c.vendor_id = :vendor_id
+              AND c.console_id = candidate.console_id
+            RETURNING c.console_id
+        """),
+        {"vendor_id": vendor_id, "game_id": game_id},
+    ).fetchone()
+    return int(row[0]) if row else None
+
+
 def calculate_slot_minutes(slot_obj: Slot) -> int:
     if not slot_obj or not slot_obj.start_time or not slot_obj.end_time:
         return 0
@@ -1989,8 +2045,6 @@ def new_booking(vendor_id):
             f"console={console_type}, slots={len(slot_ids) if slot_ids else 0}, payment={payment_type}"
         )
 
-        dashboard_status = None
-
         # Validate required fields
         if not all([name, phone, booked_date, slot_ids, payment_type]):
             return jsonify({"message": "Missing required fields"}), 400
@@ -2421,24 +2475,59 @@ def new_booking(vendor_id):
                 )
                 credit_account.outstanding_amount = float(credit_account.outstanding_amount or 0) + extra_controller_fare
 
-        # Handle rapid booking console availability
-        if is_rapid_booking:
-            dashboard_status = "current"
-            console_table = f"VENDOR_{vendor_id}_CONSOLE_AVAILABILITY"
-            db.session.execute(
-                text(f"""
-                    UPDATE {console_table}
-                    SET is_available = FALSE
-                    WHERE console_id = :console_id AND game_id = :game_id
-                """),
-                {"console_id": console_id, "game_id": available_game.id}
-            )
+        # Resolve runtime lifecycle and console assignment.
+        # If slot is live in IST, assign console now and start as current.
+        booked_for_date_obj = datetime.strptime(booked_date, "%Y-%m-%d").date()
+        slot_map = {
+            int(s.id): s
+            for s in Slot.query.filter(Slot.id.in_([b.slot_id for b in bookings])).all()
+        }
+        booking_runtime = {}
+        for booking in bookings:
+            slot_obj = slot_map.get(int(booking.slot_id))
+            runtime_status = "upcoming"
+            runtime_console_id = int(console_id) if console_id is not None else -1
+
+            if slot_obj and _is_slot_live_now_ist(booked_for_date_obj, slot_obj.start_time, slot_obj.end_time):
+                reserved_console_id = None
+                if is_rapid_booking and console_id is not None:
+                    reserved_console_id = _reserve_specific_console(
+                        vendor_id=vendor_id,
+                        game_id=available_game.id,
+                        console_id=int(console_id),
+                    )
+                if reserved_console_id is None:
+                    reserved_console_id = _reserve_any_console(
+                        vendor_id=vendor_id,
+                        game_id=available_game.id,
+                    )
+
+                if reserved_console_id is not None:
+                    runtime_status = "current"
+                    runtime_console_id = int(reserved_console_id)
+                    booking.status = "checked_in"
+                else:
+                    current_app.logger.warning(
+                        "No console available for live booking_id=%s vendor_id=%s game_id=%s",
+                        booking.id, vendor_id, available_game.id
+                    )
+
+            booking_runtime[int(booking.id)] = {
+                "dashboard_status": runtime_status,
+                "console_id": runtime_console_id,
+            }
 
         db.session.commit()
 
         # Dashboard and promo table entries
         for trans in transactions:
-            console_id_val = console_id if console_id is not None else -1
+            meta = booking_runtime.get(int(trans.booking_id))
+            if meta:
+                console_id_val = int(meta["console_id"])
+                dashboard_status = str(meta["dashboard_status"])
+            else:
+                console_id_val = int(console_id) if console_id is not None else -1
+                dashboard_status = "upcoming"
             BookingService.insert_into_vendor_dashboard_table(trans.id, console_id_val, dashboard_status)
             BookingService.insert_into_vendor_promo_table(trans.id, console_id_val)
 
