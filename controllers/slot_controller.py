@@ -3,8 +3,8 @@ from models.slot import Slot
 from flask_socketio import emit
 from db.extensions import db
 from sqlalchemy.sql import text, bindparam
-from sqlalchemy import func
-from datetime import datetime
+from sqlalchemy import func, tuple_
+from datetime import datetime, timedelta
 from models.availableGame import AvailableGame
 from models.availableGame import available_game_console
 from models.console import Console
@@ -58,6 +58,137 @@ def _load_vendor_day_duration_map(vendor_id):
 def _weekday_key_from_yyyymmdd(yyyymmdd):
     dt_obj = datetime.strptime(yyyymmdd, "%Y%m%d")
     return ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][dt_obj.weekday()]
+
+
+def _parse_time_flexible(value):
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    for fmt in ("%I:%M %p", "%H:%M", "%H:%M:%S"):
+        try:
+            return datetime.strptime(raw, fmt).time()
+        except ValueError:
+            continue
+    return None
+
+
+def _generate_blocks(anchor_day, start_time, end_time, slot_duration):
+    start_dt = datetime.combine(anchor_day, start_time)
+    end_dt = datetime.combine(anchor_day, end_time)
+    if end_dt <= start_dt:
+        end_dt += timedelta(days=1)
+
+    blocks = []
+    cur_dt = start_dt
+    while cur_dt < end_dt:
+        nxt_dt = cur_dt + timedelta(minutes=int(slot_duration))
+        if nxt_dt > end_dt:
+            break
+        block_start_t = cur_dt.time()
+        block_end_t = nxt_dt.time() if nxt_dt.date() == cur_dt.date() else (nxt_dt - timedelta(days=1)).time()
+        blocks.append((block_start_t, block_end_t))
+        cur_dt = nxt_dt
+    return blocks
+
+
+def _ensure_slots_for_date(vendor_id, game_id, formatted_date):
+    """
+    Self-heal missing slots for a specific vendor/game/date based on vendor_day_slot_config.
+    Keeps data consistent when historical cleanup removed some slot templates.
+    """
+    dt_obj = datetime.strptime(formatted_date, "%Y-%m-%d").date()
+    day_key = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][dt_obj.weekday()]
+
+    cfg = db.session.execute(
+        text(
+            """
+            SELECT day, opening_time, closing_time, slot_duration
+            FROM vendor_day_slot_config
+            WHERE vendor_id = :vendor_id
+              AND lower(substr(day, 1, 3)) = :day_key
+            LIMIT 1
+            """
+        ),
+        {"vendor_id": vendor_id, "day_key": day_key},
+    ).fetchone()
+    if not cfg:
+        return
+
+    try:
+        duration = int(cfg.slot_duration or 0)
+    except (TypeError, ValueError):
+        return
+    if duration <= 0:
+        return
+
+    open_t = _parse_time_flexible(cfg.opening_time)
+    close_t = _parse_time_flexible(cfg.closing_time)
+    if not open_t or not close_t:
+        return
+
+    blocks = _generate_blocks(dt_obj, open_t, close_t, duration)
+    if not blocks:
+        return
+
+    available_game = AvailableGame.query.filter_by(id=game_id, vendor_id=vendor_id).first()
+    total_slots = int(available_game.total_slot or 0) if available_game else 0
+
+    existing = (
+        Slot.query
+        .filter(
+            Slot.gaming_type_id == game_id,
+            tuple_(Slot.start_time, Slot.end_time).in_(blocks),
+        )
+        .all()
+    )
+    slot_id_map = {(s.start_time, s.end_time): int(s.id) for s in existing}
+
+    to_create = []
+    for st, et in blocks:
+        if (st, et) in slot_id_map:
+            continue
+        to_create.append(
+            Slot(
+                gaming_type_id=game_id,
+                start_time=st,
+                end_time=et,
+                available_slot=max(total_slots, 1),
+                is_available=True,
+            )
+        )
+    if to_create:
+        db.session.add_all(to_create)
+        db.session.flush()
+        for s in to_create:
+            slot_id_map[(s.start_time, s.end_time)] = int(s.id)
+
+    slot_ids = [slot_id_map[(st, et)] for st, et in blocks if (st, et) in slot_id_map]
+    if not slot_ids:
+        return
+
+    table_name = f"VENDOR_{vendor_id}_SLOT"
+    db.session.execute(
+        text(
+            f"""
+            INSERT INTO {table_name} (vendor_id, date, slot_id, is_available, available_slot)
+            SELECT :vendor_id, :date_val::date, s_id.slot_id, TRUE, :available_slot
+            FROM (SELECT unnest(:slot_ids) AS slot_id) s_id
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM {table_name} v
+                WHERE v.vendor_id = :vendor_id
+                  AND v.date = :date_val::date
+                  AND v.slot_id = s_id.slot_id
+            )
+            """
+        ),
+        {
+            "vendor_id": vendor_id,
+            "date_val": formatted_date,
+            "slot_ids": slot_ids,
+            "available_slot": max(total_slots, 1),
+        },
+    )
 
 
 def _prefer_slot_candidate(current, candidate):
@@ -140,6 +271,7 @@ def get_slots_on_game_id(vendorId, gameId, date):
 
         formatted_date = f"{date[:4]}-{date[4:6]}-{date[6:8]}"
         table_name = f"VENDOR_{vendorId}_SLOT"
+        _ensure_slots_for_date(vendorId, int(gameId), formatted_date)
 
         # Step 1: Get price from AvailableGame and ensure real console mapping exists.
         available_game = AvailableGame.query.filter_by(id=gameId, vendor_id=vendorId).first()
@@ -184,6 +316,11 @@ def get_slots_on_game_id(vendorId, gameId, date):
         vendor_slot_map = {int(row[0]): {"is_available": bool(row[1]), "available_slot": int(row[2] or 0)} for row in result}
 
         day_duration_map = _load_vendor_day_duration_map(vendorId)
+        total_slots_map = {
+            int(g.id): int(g.total_slot or 0)
+            for g in AvailableGame.query.filter(AvailableGame.id.in_(game_ids)).all()
+        }
+        booking_counts = _load_booking_counts(vendorId, game_ids, formatted_dates)
         total_slots_for_game = int(available_game.total_slot or 0)
         booking_counts = _load_booking_counts(vendorId, [int(gameId)], [formatted_date])
         weekday_key = _weekday_key_from_yyyymmdd(date)
@@ -262,6 +399,9 @@ def get_slots_batch(vendorId):
 
         normalized_dates = sorted(set(normalized_dates))
         formatted_dates = [f"{d[:4]}-{d[4:6]}-{d[6:8]}" for d in normalized_dates]
+        for gid in game_ids:
+            for date_val in formatted_dates:
+                _ensure_slots_for_date(vendorId, int(gid), date_val)
 
         cache_key = f"vendor:{vendorId}|games:{','.join(map(str, game_ids))}|dates:{','.join(normalized_dates)}"
         now_ts = time.time()
