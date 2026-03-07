@@ -99,34 +99,36 @@ def _ensure_slots_for_date(vendor_id, game_id, formatted_date):
     dt_obj = datetime.strptime(formatted_date, "%Y-%m-%d").date()
     day_key = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][dt_obj.weekday()]
 
-    cfg = db.session.execute(
+    cfg_rows = db.session.execute(
         text(
             """
             SELECT day, opening_time, closing_time, slot_duration
             FROM vendor_day_slot_config
             WHERE vendor_id = :vendor_id
               AND lower(substr(day, 1, 3)) = :day_key
-            LIMIT 1
             """
         ),
         {"vendor_id": vendor_id, "day_key": day_key},
-    ).fetchone()
-    if not cfg:
+    ).fetchall()
+    if not cfg_rows:
         return
 
-    try:
-        duration = int(cfg.slot_duration or 0)
-    except (TypeError, ValueError):
-        return
-    if duration <= 0:
-        return
+    blocks = []
+    for cfg in cfg_rows:
+        try:
+            duration = int(cfg.slot_duration or 0)
+        except (TypeError, ValueError):
+            continue
+        if duration <= 0:
+            continue
 
-    open_t = _parse_time_flexible(cfg.opening_time)
-    close_t = _parse_time_flexible(cfg.closing_time)
-    if not open_t or not close_t:
-        return
+        open_t = _parse_time_flexible(cfg.opening_time)
+        close_t = _parse_time_flexible(cfg.closing_time)
+        if not open_t or not close_t:
+            continue
+        blocks.extend(_generate_blocks(dt_obj, open_t, close_t, duration))
 
-    blocks = _generate_blocks(dt_obj, open_t, close_t, duration)
+    blocks = list(dict.fromkeys(blocks))
     if not blocks:
         return
 
