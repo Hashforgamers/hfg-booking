@@ -8,13 +8,14 @@ from models.openingDays import OpeningDay
 from datetime import datetime
 from flask_cors import cross_origin
 import time
+import os
 from threading import Lock
 from sqlalchemy import func
 
 
 game_blueprint = Blueprint('game', __name__)
 _GAMES_BY_VENDOR_CACHE = {}
-_GAMES_BY_VENDOR_TTL_SECONDS = 30
+_GAMES_BY_VENDOR_TTL_SECONDS = int(os.getenv("GAMES_BY_VENDOR_CACHE_TTL_SEC", "120"))
 _GAMES_BY_VENDOR_CACHE_MAX_ITEMS = 1000
 _GAMES_BY_VENDOR_CACHE_LOCK = Lock()
 
@@ -50,13 +51,18 @@ def get_all_games():
 
 @game_blueprint.route('/games/vendor/<int:vendor_id>', methods=['GET'])
 def get_games_by_vendor_id(vendor_id):
+    started_at = time.perf_counter()
     now = time.time()
-    cache_key = f"{vendor_id}:{datetime.now().date().isoformat()}"
+    today_dt = datetime.now()
+    cache_key = f"{vendor_id}:{today_dt.date().isoformat()}"
     cached_payload = _games_cache_get(cache_key, now)
     if cached_payload is not None:
-        return jsonify(cached_payload), 200
+        response = jsonify(cached_payload)
+        response.headers["X-Cache"] = "HIT"
+        response.headers["X-Response-Time-ms"] = f"{(time.perf_counter() - started_at) * 1000:.2f}"
+        return response, 200
 
-    today = datetime.now().strftime('%a').lower()
+    today = today_dt.strftime('%a').lower()
     day_aliases = {today}
     if today == "tue":
         day_aliases.add("tues")
@@ -78,7 +84,10 @@ def get_games_by_vendor_id(vendor_id):
             "game_count": 0
         }
         _games_cache_set(cache_key, payload, now)
-        return jsonify(payload), 200
+        response = jsonify(payload)
+        response.headers["X-Cache"] = "MISS"
+        response.headers["X-Response-Time-ms"] = f"{(time.perf_counter() - started_at) * 1000:.2f}"
+        return response, 200
 
     games = (
         AvailableGame.query
@@ -99,7 +108,10 @@ def get_games_by_vendor_id(vendor_id):
             "game_count": 0
         }
         _games_cache_set(cache_key, payload, now)
-        return jsonify(payload), 200
+        response = jsonify(payload)
+        response.headers["X-Cache"] = "MISS"
+        response.headers["X-Response-Time-ms"] = f"{(time.perf_counter() - started_at) * 1000:.2f}"
+        return response, 200
 
     open_days_list = [row.day for row in opening_days]
     payload = {
@@ -114,7 +126,10 @@ def get_games_by_vendor_id(vendor_id):
         "game_count": len(games)
     }
     _games_cache_set(cache_key, payload, now)
-    return jsonify(payload), 200
+    response = jsonify(payload)
+    response.headers["X-Cache"] = "MISS"
+    response.headers["X-Response-Time-ms"] = f"{(time.perf_counter() - started_at) * 1000:.2f}"
+    return response, 200
 
 # Create a new booking for a game
 @game_blueprint.route('/bookings', methods=['POST'])

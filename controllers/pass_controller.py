@@ -12,6 +12,7 @@ from sqlalchemy.orm import joinedload
 import razorpay
 import pytz
 import time
+import os
 from threading import Lock
 
 
@@ -20,7 +21,7 @@ IST = pytz.timezone("Asia/Kolkata")
 
 pass_blueprint = Blueprint('pass', __name__)
 _AVAILABLE_PASSES_CACHE = {}
-_AVAILABLE_PASSES_TTL_SECONDS = 30
+_AVAILABLE_PASSES_TTL_SECONDS = int(os.getenv("AVAILABLE_PASSES_CACHE_TTL_SEC", "120"))
 _AVAILABLE_PASSES_CACHE_MAX_ITEMS = 1000
 _AVAILABLE_PASSES_CACHE_LOCK = Lock()
 
@@ -501,10 +502,14 @@ def get_available_passes_for_purchase(vendor_id):
     Used by user app to show passes for sale.
     """
     try:
+        started_at = time.perf_counter()
         now = time.time()
         cached_payload = _passes_cache_get(vendor_id, now)
         if cached_payload is not None:
-            return jsonify(cached_payload), 200
+            response = jsonify(cached_payload)
+            response.headers["X-Cache"] = "HIT"
+            response.headers["X-Response-Time-ms"] = f"{(time.perf_counter() - started_at) * 1000:.2f}"
+            return response, 200
 
         # Get vendor-specific AND global passes
         passes = (
@@ -525,7 +530,10 @@ def get_available_passes_for_purchase(vendor_id):
             'passes': [p.to_dict() for p in passes]
         }
         _passes_cache_set(vendor_id, payload, now)
-        return jsonify(payload), 200
+        response = jsonify(payload)
+        response.headers["X-Cache"] = "MISS"
+        response.headers["X-Response-Time-ms"] = f"{(time.perf_counter() - started_at) * 1000:.2f}"
+        return response, 200
         
     except Exception as e:
         current_app.logger.error(f"Get available passes error: {str(e)}")
