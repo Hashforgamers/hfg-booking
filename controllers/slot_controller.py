@@ -6,8 +6,6 @@ from sqlalchemy.sql import text, bindparam
 from sqlalchemy import func, tuple_
 from datetime import datetime, timedelta
 from models.availableGame import AvailableGame
-from models.availableGame import available_game_console
-from models.console import Console
 from models.booking import Booking
 from models.transaction import Transaction
 from pytz import timezone
@@ -17,8 +15,13 @@ import threading
 
 slot_blueprint = Blueprint('slots', __name__)
 SLOTS_BATCH_CACHE_TTL_SEC = 5
+SLOTS_SINGLE_CACHE_TTL_SEC = 5
 _slots_batch_cache = {}
 _slots_batch_cache_lock = threading.Lock()
+_slots_single_cache = {}
+_slots_single_cache_lock = threading.Lock()
+_expected_blocks_cache = {}
+_expected_blocks_cache_lock = threading.Lock()
 
 
 def _slot_duration_minutes(start_time, end_time):
@@ -92,6 +95,13 @@ def _generate_blocks(anchor_day, start_time, end_time, slot_duration):
 
 
 def _expected_blocks_for_date(vendor_id, formatted_date):
+    cache_key = f"{vendor_id}:{formatted_date}"
+    now_ts = time.time()
+    with _expected_blocks_cache_lock:
+        cached = _expected_blocks_cache.get(cache_key)
+    if cached and cached["expires_at"] > now_ts:
+        return cached["payload"]
+
     dt_obj = datetime.strptime(formatted_date, "%Y-%m-%d").date()
     day_key = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][dt_obj.weekday()]
     cfg_rows = db.session.execute(
@@ -121,7 +131,13 @@ def _expected_blocks_for_date(vendor_id, formatted_date):
         if not open_t or not close_t:
             continue
         blocks.extend(_generate_blocks(dt_obj, open_t, close_t, duration))
-    return set(blocks)
+    payload = set(blocks)
+    with _expected_blocks_cache_lock:
+        _expected_blocks_cache[cache_key] = {
+            "payload": payload,
+            "expires_at": now_ts + 120,
+        }
+    return payload
 
 
 def _ensure_slots_for_date(vendor_id, game_id, formatted_date):
@@ -226,6 +242,32 @@ def _ensure_slots_for_date(vendor_id, game_id, formatted_date):
     )
 
 
+def _load_vendor_slot_rows(vendor_id, game_id, formatted_date):
+    table_name = f"VENDOR_{vendor_id}_SLOT"
+    sql_query = text(f"""
+        SELECT
+            vs.slot_id,
+            vs.is_available,
+            vs.available_slot,
+            s.start_time,
+            s.end_time
+        FROM {table_name} vs
+        INNER JOIN slots s ON s.id = vs.slot_id
+        INNER JOIN available_games ag ON ag.id = s.gaming_type_id
+        INNER JOIN available_game_console agc ON agc.available_game_id = ag.id
+        INNER JOIN consoles c ON c.id = agc.console_id AND c.vendor_id = :vendor_id
+        WHERE vs.date = :date
+          AND s.gaming_type_id = :game_id
+          AND ag.vendor_id = :vendor_id
+        GROUP BY vs.slot_id, vs.is_available, vs.available_slot, s.start_time, s.end_time
+        ORDER BY s.start_time ASC;
+    """)
+    return db.session.execute(
+        sql_query,
+        {"date": formatted_date, "game_id": game_id, "vendor_id": vendor_id},
+    ).fetchall()
+
+
 def _prefer_slot_candidate(current, candidate):
     """
     Choose the better slot row when duplicate logical slots exist for same time.
@@ -305,73 +347,58 @@ def get_slots_on_game_id(vendorId, gameId, date):
             return jsonify({"error": "Invalid date format. Use YYYYMMDD."}), 400
 
         formatted_date = f"{date[:4]}-{date[4:6]}-{date[6:8]}"
-        table_name = f"VENDOR_{vendorId}_SLOT"
-        _ensure_slots_for_date(vendorId, int(gameId), formatted_date)
+        cache_key = f"{vendorId}:{int(gameId)}:{date}"
+        now_ts = time.time()
+        with _slots_single_cache_lock:
+            cached = _slots_single_cache.get(cache_key)
+        if cached and cached["expires_at"] > now_ts:
+            response = jsonify(cached["payload"])
+            response.headers["X-Cache"] = "HIT"
+            return response, 200
 
-        # Step 1: Get price from AvailableGame and ensure real console mapping exists.
+        # Step 1: Get game price.
         available_game = AvailableGame.query.filter_by(id=gameId, vendor_id=vendorId).first()
         if not available_game:
             return jsonify({"error": "Game not found for this vendor."}), 404
-        mapped_console_count = (
-            db.session.query(func.count(func.distinct(Console.id)))
-            .select_from(available_game_console)
-            .join(Console, Console.id == available_game_console.c.console_id)
-            .filter(
-                available_game_console.c.available_game_id == gameId,
-                Console.vendor_id == vendorId,
-            )
-            .scalar()
-            or 0
-        )
-        if mapped_console_count <= 0:
-            return jsonify({"slots": []}), 200
 
         single_slot_price = available_game.single_slot_price
 
-        # Step 2: Fetch relevant slots from dynamic slot table
-        sql_query = text(f"""
-            SELECT slot_id, is_available, available_slot
-            FROM {table_name}
-            WHERE date = :date AND slot_id IN (
-                SELECT id FROM slots WHERE gaming_type_id = :gameId
-            )
-            ORDER BY slot_id;
-        """)
-        result = db.session.execute(sql_query, {"date": formatted_date, "gameId": gameId}).fetchall()
-
-        slot_ids = [int(row[0]) for row in result]
-        slot_rows = []
-        if slot_ids:
-            slot_rows = (
-                Slot.query
-                .filter(Slot.id.in_(slot_ids), Slot.gaming_type_id == gameId)
-                .order_by(Slot.start_time.asc())
-                .all()
-            )
-        vendor_slot_map = {int(row[0]): {"is_available": bool(row[1]), "available_slot": int(row[2] or 0)} for row in result}
+        result = _load_vendor_slot_rows(vendorId, int(gameId), formatted_date)
+        if not result:
+            _ensure_slots_for_date(vendorId, int(gameId), formatted_date)
+            result = _load_vendor_slot_rows(vendorId, int(gameId), formatted_date)
+        if not result:
+            payload = {"slots": []}
+            with _slots_single_cache_lock:
+                _slots_single_cache[cache_key] = {
+                    "payload": payload,
+                    "expires_at": now_ts + SLOTS_SINGLE_CACHE_TTL_SEC,
+                }
+            response = jsonify(payload)
+            response.headers["X-Cache"] = "MISS"
+            return response, 200
 
         total_slots_for_game = int(available_game.total_slot or 0)
         booking_counts = _load_booking_counts(vendorId, [int(gameId)], [formatted_date])
         expected_blocks = _expected_blocks_for_date(vendorId, formatted_date)
 
         slots_by_key = {}
-        for slot in slot_rows:
-            if expected_blocks and (slot.start_time, slot.end_time) not in expected_blocks:
+        for row in result:
+            slot_id = int(row[0])
+            slot_start = row[3]
+            slot_end = row[4]
+            if expected_blocks and (slot_start, slot_end) not in expected_blocks:
                 continue
-            vendor_entry = vendor_slot_map.get(int(slot.id))
-            if vendor_entry:
-                raw_available = int(vendor_entry.get("available_slot") or 0)
-                booked_count = int(booking_counts.get((int(slot.id), formatted_date), 0))
-                computed_available = max(total_slots_for_game - booked_count, 0)
-                resolved_available = max(raw_available, computed_available)
-                slot_is_available = resolved_available > 0
-            else:
-                continue
+            raw_available = int(row[2] or 0)
+            booked_count = int(booking_counts.get((slot_id, formatted_date), 0))
+            computed_available = max(total_slots_for_game - booked_count, 0)
+            resolved_available = max(raw_available, computed_available)
+            slot_is_available = resolved_available > 0
 
             candidate = {
-                "slot_id": int(slot.id),
-                "start_time": slot.start_time.strftime("%H:%M:%S"),
-                "end_time": slot.end_time.strftime("%H:%M:%S"),
+                "slot_id": slot_id,
+                "start_time": slot_start.strftime("%H:%M:%S"),
+                "end_time": slot_end.strftime("%H:%M:%S"),
                 "is_available": bool(slot_is_available),
                 "available_slot": int(resolved_available),
                 "single_slot_price": single_slot_price
@@ -380,7 +407,15 @@ def get_slots_on_game_id(vendorId, gameId, date):
             slots_by_key[dedupe_key] = _prefer_slot_candidate(slots_by_key.get(dedupe_key), candidate)
 
         slots = sorted(slots_by_key.values(), key=lambda s: s["start_time"])
-        return jsonify({"slots": slots}), 200
+        payload = {"slots": slots}
+        with _slots_single_cache_lock:
+            _slots_single_cache[cache_key] = {
+                "payload": payload,
+                "expires_at": now_ts + SLOTS_SINGLE_CACHE_TTL_SEC,
+            }
+        response = jsonify(payload)
+        response.headers["X-Cache"] = "MISS"
+        return response, 200
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
