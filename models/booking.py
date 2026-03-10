@@ -1,5 +1,5 @@
 # models/booking.py
-from sqlalchemy import Column, Integer, ForeignKey, DateTime, String, Numeric, Time
+from sqlalchemy import Column, Integer, ForeignKey, DateTime, String, Numeric, Time, JSON
 from sqlalchemy.orm import relationship
 from db.extensions import db
 from datetime import datetime
@@ -38,6 +38,8 @@ class Booking(db.Model):
     custom_start_time = Column(Time, nullable=True)
     custom_end_time = Column(Time, nullable=True)
     duration_hours = Column(Numeric(5, 2), nullable=True)
+    # Squad booking metadata persisted per booking for dashboard visibility/audit.
+    squad_details = Column(JSON, nullable=True)
     
     status = db.Column(db.String(20), default='pending_verified')
 
@@ -50,6 +52,7 @@ class Booking(db.Model):
     slot = relationship('Slot', back_populates='bookings')
     transaction = relationship('Transaction', back_populates='booking', uselist=False)
     booking_extra_services = relationship('BookingExtraService', back_populates='booking', cascade='all, delete-orphan')
+    squad_members = relationship('BookingSquadMember', back_populates='booking', cascade='all, delete-orphan')
     access_code_id = Column(Integer, ForeignKey('access_booking_codes.id'), nullable=True)
     access_code_entry = db.relationship('AccessBookingCode', back_populates='bookings')
 
@@ -98,5 +101,12 @@ class Booking(db.Model):
                 'custom_end_time': str(self.custom_end_time) if self.custom_end_time else None,
                 'duration_hours': float(self.duration_hours) if self.duration_hours else None
             })
+        base_dict['squad_details'] = self.squad_details or {}
+        base_dict['squad_members'] = [
+            member.to_dict() for member in sorted(
+                self.squad_members or [],
+                key=lambda m: int(m.member_position or 9999)
+            )
+        ]
         
         return base_dict

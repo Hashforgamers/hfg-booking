@@ -20,6 +20,7 @@ from sqlalchemy import or_
 from utils.realtime import emit_booking_event
 from flask import current_app, g
 from sqlalchemy import text
+from typing import Optional
 import uuid
 
 
@@ -74,7 +75,8 @@ class BookingService:
         socketio, 
         book_date, 
         is_pay_at_cafe: bool = False,
-        booking_mode: str = 'regular'  # ✅ NEW PARAMETER
+        booking_mode: str = 'regular',  # ✅ NEW PARAMETER
+        squad_details: Optional[dict] = None
     ):
         """
         Create a booking with specified mode.
@@ -214,6 +216,7 @@ class BookingService:
                 game_id=game_id,
                 user_id=user_id,
                 booking_mode=booking_mode,  # ✅ SET THE MODE HERE
+                squad_details=squad_details or None,
                 status="pending_acceptance" if is_pay_at_cafe else "pending_verified",
                 created_at=datetime.utcnow()
             )
@@ -275,6 +278,7 @@ class BookingService:
                 "status": machine_status,
                 "booking_status": "pending_acceptance" if is_pay_at_cafe else "pending_verified",
                 "booking_mode": booking_mode,  # ✅ ADD MODE TO EVENT
+                "squad_details": squad_details or {},
                 "cid": cid,
             }
 

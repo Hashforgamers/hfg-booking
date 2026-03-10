@@ -22,6 +22,7 @@ from models.paymentTransactionMapping import PaymentTransactionMapping
 from models.userHashCoin import UserHashCoin
 from models.accessBookingCode import AccessBookingCode
 from models.bookingExtraService  import BookingExtraService
+from models.bookingSquadMember import BookingSquadMember
 from models.extraServiceCategory import ExtraServiceCategory
 from models.extraServiceMenu import ExtraServiceMenu
 from models.passModels import UserPass
@@ -2030,6 +2031,7 @@ def new_booking(vendor_id):
         except (TypeError, ValueError):
             return jsonify({"message": "extraControllerQty must be a valid integer"}), 400
         selected_meals = data.get("selectedMeals", [])
+        squad_payload = data.get("squadDetails") or {}
         
         # ✅ NEW: Get booking mode from frontend
         booking_mode = data.get("bookingMode", "regular")
@@ -2038,6 +2040,52 @@ def new_booking(vendor_id):
         if booking_mode not in ['regular', 'private']:
             current_app.logger.warning(f"Invalid booking_mode '{booking_mode}', defaulting to 'regular'")
             booking_mode = 'regular'
+
+        # Normalize squad payload (frontend sends this for squad bookings).
+        if not isinstance(squad_payload, dict):
+            return jsonify({"message": "squadDetails must be an object"}), 400
+
+        squad_enabled = bool(squad_payload.get("enabled", False))
+        try:
+            squad_player_count = int(squad_payload.get("playerCount", 1) or 1)
+        except (TypeError, ValueError):
+            return jsonify({"message": "squadDetails.playerCount must be a valid integer"}), 400
+        try:
+            suggested_extra_controller_qty = int(
+                squad_payload.get("suggestedExtraControllerQty", 0) or 0
+            )
+        except (TypeError, ValueError):
+            return jsonify({"message": "squadDetails.suggestedExtraControllerQty must be a valid integer"}), 400
+
+        raw_members = squad_payload.get("members", [])
+        if raw_members is None:
+            raw_members = []
+        if not isinstance(raw_members, list):
+            return jsonify({"message": "squadDetails.members must be an array"}), 400
+
+        normalized_squad_members = []
+        for member in raw_members[:20]:
+            if not isinstance(member, dict):
+                continue
+            member_name = str(member.get("name", "")).strip()
+            member_phone = str(member.get("phone", "")).strip()
+            if not member_name and not member_phone:
+                continue
+            if not member_name or not member_phone:
+                return jsonify({
+                    "message": "Each squad member must include both name and phone"
+                }), 400
+            normalized_squad_members.append({
+                "name": member_name[:120],
+                "phone": member_phone[:32],
+            })
+
+        normalized_squad_details = {
+            "enabled": squad_enabled,
+            "player_count": max(squad_player_count, 1),
+            "suggested_extra_controller_qty": max(suggested_extra_controller_qty, 0),
+            "members": normalized_squad_members,
+        }
 
         # ✅ Log received data with booking mode
         current_app.logger.info(
@@ -2189,6 +2237,27 @@ def new_booking(vendor_id):
             f"Price={available_game.single_slot_price}, Requested_Type={console_type}, Mode={booking_mode}"
         )
 
+        # Validate squad size against console type limits.
+        if squad_enabled:
+            console_name = (available_game.game_name or "").lower()
+            max_players = 6
+            if "ps" in console_name:
+                max_players = 8
+            elif "xbox" in console_name:
+                max_players = 6
+            elif "vr" in console_name:
+                max_players = 4
+            elif "pc" in console_name:
+                max_players = 10
+
+            if normalized_squad_details["player_count"] < 2:
+                return jsonify({"message": "Squad booking requires at least 2 players"}), 400
+            if normalized_squad_details["player_count"] > max_players:
+                return jsonify({
+                    "message": f"Squad player count cannot exceed {max_players} for this console type"
+                }), 400
+            normalized_squad_details["max_players_for_console"] = max_players
+
         # Validate and calculate extra services cost
         total_meals_cost = 0
         meal_details = []
@@ -2263,6 +2332,42 @@ def new_booking(vendor_id):
             db.session.flush()
             current_app.logger.info(f"Created new user: {name}")
 
+        squad_member_bindings = []
+        if squad_enabled:
+            squad_member_bindings.append({
+                "member_user_id": int(user.id),
+                "member_position": 1,
+                "is_captain": True,
+                "name_snapshot": str(name or "").strip()[:255] or "Captain",
+                "phone_snapshot": str(phone or "").strip()[:50],
+            })
+
+            phone_binding_cache = {}
+            for idx, member in enumerate(normalized_squad_members, start=2):
+                member_phone = str(member.get("phone", "")).strip()[:50]
+                member_name = str(member.get("name", "")).strip()[:255]
+                resolved_user_id = None
+                if member_phone:
+                    if member_phone in phone_binding_cache:
+                        resolved_user_id = phone_binding_cache[member_phone]
+                    else:
+                        contact_match = ContactInfo.query.filter(
+                            and_(
+                                ContactInfo.parent_type == 'user',
+                                ContactInfo.phone == member_phone,
+                            )
+                        ).first()
+                        resolved_user_id = int(contact_match.parent_id) if contact_match else None
+                        phone_binding_cache[member_phone] = resolved_user_id
+
+                squad_member_bindings.append({
+                    "member_user_id": resolved_user_id,
+                    "member_position": idx,
+                    "is_captain": False,
+                    "name_snapshot": member_name,
+                    "phone_snapshot": member_phone,
+                })
+
         # Get socketio instance
         socketio = current_app.extensions.get('socketio')
 
@@ -2280,7 +2385,8 @@ def new_booking(vendor_id):
                     socketio=socketio,
                     book_date=datetime.strptime(booked_date, '%Y-%m-%d').date(),
                     is_pay_at_cafe=(payment_type == 'Cash'),
-                    booking_mode=booking_mode  # ✅ PASS BOOKING MODE HERE
+                    booking_mode=booking_mode,  # ✅ PASS BOOKING MODE HERE
+                    squad_details=normalized_squad_details if squad_enabled else None
                 )
                 
                 bookings.append(booking)
@@ -2318,6 +2424,21 @@ def new_booking(vendor_id):
                 )
                 db.session.add(booking_extra_service)
                 current_app.logger.info(f"Added extra service to booking {booking.id}: {meal_detail['menu_item'].name}")
+
+        # Persist relational squad-member bindings per booking (captain + squad members).
+        if squad_enabled and squad_member_bindings:
+            for booking in bookings:
+                for binding in squad_member_bindings:
+                    db.session.add(
+                        BookingSquadMember(
+                            booking_id=int(booking.id),
+                            member_user_id=binding.get("member_user_id"),
+                            member_position=int(binding.get("member_position") or 0),
+                            is_captain=bool(binding.get("is_captain", False)),
+                            name_snapshot=str(binding.get("name_snapshot") or "")[:255],
+                            phone_snapshot=str(binding.get("phone_snapshot") or "")[:50],
+                        )
+                    )
 
         # Generate access code
         code = generate_access_code()
@@ -2588,6 +2709,13 @@ def new_booking(vendor_id):
             "transaction_ids": [t.id for t in transactions],
             "access_code": code,
             "booking_mode": booking_mode,  # ✅ Return booking mode
+            "squad_details": normalized_squad_details if squad_enabled else {
+                "enabled": False,
+                "player_count": 1,
+                "suggested_extra_controller_qty": 0,
+                "members": []
+            },
+            "squad_member_bindings": squad_member_bindings if squad_enabled else [],
             "requested_console_type": console_type,
             "matched_game_id": available_game.id,
             "matched_game_name": available_game.game_name,
@@ -2686,6 +2814,12 @@ def get_booking_details(booking_id):
         transactions = (
             Transaction.query.filter(Transaction.booking_id == booking.id).all()
         )
+        squad_members = (
+            BookingSquadMember.query
+            .filter(BookingSquadMember.booking_id == booking.id)
+            .order_by(BookingSquadMember.member_position.asc())
+            .all()
+        )
         
         base_price = sum(t.amount for t in transactions if t.booking_type == 'direct')
         extra_services_price = 0
@@ -2720,6 +2854,8 @@ def get_booking_details(booking_id):
         response = {
             "booking_id": booking.id,
             "status": booking.status,
+            "squad_details": booking.squad_details or {},
+            "squad_members": [member.to_dict() for member in squad_members],
             "user": {
                 "id": user.id if user else None,
                 "name": user.name if user else "Unknown",
