@@ -40,13 +40,17 @@ from sqlalchemy.orm import joinedload
 
 IST = pytz.timezone("Asia/Kolkata")
 
-# Squad cost engine (backend source of truth).
-# Percentage discount is applied on slot base amount only (not meals/controllers).
+# Squad platform policy (backend source of truth).
+# Discount rule-engine applies only to PC squad bookings.
+SQUAD_PLATFORM_RULES = {
+    "pc": {"enabled": True, "max_players": 10, "pricing_mode": "squad_discount"},
+    "ps": {"enabled": True, "max_players": 4, "pricing_mode": "controller_pricing"},
+    "xbox": {"enabled": True, "max_players": 4, "pricing_mode": "controller_pricing"},
+    "vr": {"enabled": False, "max_players": 1, "pricing_mode": "solo_only"},
+}
+
 DEFAULT_SQUAD_PRICING_POLICY = {
-    "ps": {2: 0, 3: 5, 4: 10, 5: 12, 6: 15, 7: 18, 8: 20},
-    "xbox": {2: 0, 3: 4, 4: 8, 5: 10, 6: 12},
     "pc": {2: 0, 3: 3, 4: 5, 5: 8, 6: 10, 7: 12, 8: 15, 9: 18, 10: 20},
-    "vr": {2: 0, 3: 0, 4: 0},
 }
 
 from sqlalchemy.sql import text
@@ -179,7 +183,7 @@ def _resolve_console_group(console_name: str) -> str:
         return "vr"
     if "pc" in value:
         return "pc"
-    return "xbox"
+    return "unknown"
 
 
 def _load_squad_pricing_policy(vendor_id: int):
@@ -195,41 +199,50 @@ def _load_squad_pricing_policy(vendor_id: int):
     if not rows:
         return policy
 
-    for group in policy.keys():
+    for group in list(policy.keys()):
         policy[group] = {}
 
     for row in rows:
         group = str(row.console_group or "").strip().lower()
-        if group not in policy:
+        if group != "pc":
             continue
-        max_rule_players = _max_players_for_console(group)
+        max_rule_players = int(SQUAD_PLATFORM_RULES["pc"]["max_players"])
         if int(row.player_count) < 2 or int(row.player_count) > max_rule_players:
             continue
         policy[group][int(row.player_count)] = float(row.discount_percent or 0)
 
-    for group, defaults in DEFAULT_SQUAD_PRICING_POLICY.items():
-        if not policy.get(group):
-            policy[group] = {int(k): float(v) for k, v in defaults.items()}
+    if not policy.get("pc"):
+        defaults = DEFAULT_SQUAD_PRICING_POLICY["pc"]
+        policy["pc"] = {int(k): float(v) for k, v in defaults.items()}
 
     return policy
 
 
 def _max_players_for_console(console_name: str, policy: dict = None) -> int:
     group = _resolve_console_group(console_name)
-    source = policy or DEFAULT_SQUAD_PRICING_POLICY
-    return max(source.get(group, {1: 1}).keys())
+    rules = SQUAD_PLATFORM_RULES.get(group)
+    if not rules:
+        return 1
+    return int(rules.get("max_players", 1))
 
 
 def _resolve_squad_discount_percent(console_name: str, player_count: int, policy: dict = None) -> float:
     if player_count <= 1:
         return 0.0
     group = _resolve_console_group(console_name)
+    if group != "pc":
+        return 0.0
     source = policy or DEFAULT_SQUAD_PRICING_POLICY
     grid = source.get(group, {})
     if not grid:
         return 0.0
     capped_players = max(2, min(int(player_count), max(grid.keys())))
     return float(grid.get(capped_players, 0.0))
+
+
+def _resolve_squad_pricing_mode(console_name: str) -> str:
+    group = _resolve_console_group(console_name)
+    return str(SQUAD_PLATFORM_RULES.get(group, {}).get("pricing_mode", "solo_only"))
 
 
 def _safe_decode_jwt_claims(token: str):
@@ -306,6 +319,57 @@ def resolve_settlement_status(payment_use_case: str) -> str:
     if payment_use_case in {"cash", "upi", "card", "payment_gateway", "hash_wallet", "pass"}:
         return "completed"
     return "pending"
+
+
+def _resolve_or_create_squad_member_user(member_name: str, member_phone: str):
+    phone = str(member_phone or "").strip()
+    name = str(member_name or "").strip()
+    if not phone:
+        return None
+
+    contact_match = ContactInfo.query.filter(
+        and_(
+            ContactInfo.parent_type == "user",
+            ContactInfo.phone == phone,
+        )
+    ).first()
+    if contact_match and contact_match.parent_id:
+        return int(contact_match.parent_id)
+
+    safe_phone = "".join(ch for ch in phone if ch.isdigit())[-10:] or str(random.randint(1000000000, 9999999999))
+    base_email = f"squad+{safe_phone}@hash.local"
+    email_candidate = base_email
+    suffix = 1
+    while ContactInfo.query.filter(
+        and_(
+            ContactInfo.parent_type == "user",
+            ContactInfo.email == email_candidate,
+        )
+    ).first():
+        email_candidate = f"squad+{safe_phone}.{suffix}@hash.local"
+        suffix += 1
+
+    username_base = "".join(ch for ch in (name.lower() or "player") if ch.isalnum())[:16] or "player"
+    game_username = f"{username_base}_{random.randint(1000, 9999)}"
+    while User.query.filter(User.game_username == game_username).first():
+        game_username = f"{username_base}_{random.randint(1000, 9999)}"
+
+    new_user = User(
+        fid=generate_fid(),
+        avatar_path="Not defined",
+        name=name or f"Player {safe_phone[-4:]}",
+        game_username=game_username,
+        parent_type="user",
+    )
+    new_contact = ContactInfo(
+        phone=phone,
+        email=email_candidate,
+        parent_type="user",
+    )
+    new_user.contact_info = new_contact
+    db.session.add(new_user)
+    db.session.flush()
+    return int(new_user.id)
 
 
 def _is_slot_live_now_ist(slot_date, start_time, end_time) -> bool:
@@ -391,6 +455,8 @@ def get_squad_pricing_policy(vendor_id):
                 for group, values in policy.items()
             },
             "available_console_groups": console_groups,
+            "platform_rules": SQUAD_PLATFORM_RULES,
+            "rule_engine_scope": ["pc"],
             "discount_basis": "slot_base_only",
             "note": "Discount applies per slot on console base amount only. Meals/controllers are excluded."
         }), 200
@@ -1084,7 +1150,8 @@ def confirm_booking():
                 end_time=end_time_val,
                 console_id=console_id_val,
                 status="confirmed",
-                booking_status=booking_status_dim
+                booking_status=booking_status_dim,
+                squad_details=booking.squad_details or {}
             )
 
             # Emit after DB state is consistent; you can emit pre-commit if you prefer,
@@ -1580,7 +1647,8 @@ def confirm_booking():
                     end_time=slot_obj.end_time,
                     console_id=None,
                     status="confirmed",
-                    booking_status="upcoming"
+                    booking_status="upcoming",
+                    squad_details=booking.squad_details or {}
                 )
                 emit_booking_event(socketio, event="booking", data=event_payload, vendor_id=vendor.id)
                 socketio.emit("booking_admin", event_payload, to="dashboard_admin")
@@ -2347,24 +2415,36 @@ def new_booking(vendor_id):
 
         vendor_squad_policy = _load_squad_pricing_policy(vendor_id)
 
-        # Validate squad size against console type limits.
+        # Validate squad size against console policy:
+        # - PC: squad discount rule-engine
+        # - PS/Xbox: squad supported via controller-pricing only
+        # - VR: squad not supported
         if squad_enabled:
             console_name = available_game.game_name or ""
-            max_players = _max_players_for_console(console_name, policy=vendor_squad_policy)
+            console_group = _resolve_console_group(console_name)
+            group_rules = SQUAD_PLATFORM_RULES.get(console_group, {"enabled": False, "max_players": 1, "pricing_mode": "solo_only"})
+            max_players = int(group_rules.get("max_players", 1))
+            pricing_mode = str(group_rules.get("pricing_mode", "solo_only"))
 
+            if not bool(group_rules.get("enabled")):
+                return jsonify({
+                    "message": f"Squad booking is not supported for {console_name}"
+                }), 400
             if normalized_squad_details["player_count"] < 2:
                 return jsonify({"message": "Squad booking requires at least 2 players"}), 400
             if normalized_squad_details["player_count"] > max_players:
                 return jsonify({
                     "message": f"Squad player count cannot exceed {max_players} for this console type"
                 }), 400
+
             discount_pct = _resolve_squad_discount_percent(
                 console_name,
                 normalized_squad_details["player_count"],
                 policy=vendor_squad_policy
             )
-            normalized_squad_details["console_group"] = _resolve_console_group(console_name)
+            normalized_squad_details["console_group"] = console_group
             normalized_squad_details["max_players_for_console"] = max_players
+            normalized_squad_details["pricing_mode"] = pricing_mode
             normalized_squad_details["discount_percent"] = discount_pct
 
         # Validate and calculate extra services cost
@@ -2460,13 +2540,7 @@ def new_booking(vendor_id):
                     if member_phone in phone_binding_cache:
                         resolved_user_id = phone_binding_cache[member_phone]
                     else:
-                        contact_match = ContactInfo.query.filter(
-                            and_(
-                                ContactInfo.parent_type == 'user',
-                                ContactInfo.phone == member_phone,
-                            )
-                        ).first()
-                        resolved_user_id = int(contact_match.parent_id) if contact_match else None
+                        resolved_user_id = _resolve_or_create_squad_member_user(member_name, member_phone)
                         phone_binding_cache[member_phone] = resolved_user_id
 
                 squad_member_bindings.append({
@@ -2476,6 +2550,11 @@ def new_booking(vendor_id):
                     "name_snapshot": member_name,
                     "phone_snapshot": member_phone,
                 })
+            normalized_squad_details["member_user_ids"] = [
+                int(b["member_user_id"])
+                for b in squad_member_bindings
+                if b.get("member_user_id")
+            ]
 
         # Get socketio instance
         socketio = current_app.extensions.get('socketio')
@@ -2568,22 +2647,27 @@ def new_booking(vendor_id):
         waive_off_per_slot = waive_off_total / len(bookings) if bookings else 0.0
         meals_cost_per_slot = total_meals_cost / len(bookings) if bookings and total_meals_cost > 0 else 0.0
         effective_price = get_effective_price(vendor_id, available_game)
-        squad_player_multiplier = int(normalized_squad_details.get("player_count", 1)) if squad_enabled else 1
+        console_group_for_pricing = str(normalized_squad_details.get("console_group", _resolve_console_group(available_game.game_name or "")))
+        is_pc_squad = bool(squad_enabled and console_group_for_pricing == "pc")
+        squad_player_multiplier = int(normalized_squad_details.get("player_count", 1)) if is_pc_squad else 1
+        squad_pricing_mode = str(normalized_squad_details.get("pricing_mode", _resolve_squad_pricing_mode(available_game.game_name or "")))
+        squad_discount_applicable = bool(is_pc_squad and squad_pricing_mode == "squad_discount")
         squad_discount_percent = (
             _resolve_squad_discount_percent(
                 available_game.game_name or "",
                 int(normalized_squad_details.get("player_count", 1)),
                 policy=vendor_squad_policy
             )
-            if squad_enabled else 0.0
+            if squad_discount_applicable else 0.0
         )
         base_slot_price_for_squad = effective_price * squad_player_multiplier
-        squad_discount_per_slot = (base_slot_price_for_squad * squad_discount_percent / 100.0) if squad_enabled else 0.0
-        squad_discount_total = squad_discount_per_slot * len(bookings) if squad_enabled else 0.0
+        squad_discount_per_slot = (base_slot_price_for_squad * squad_discount_percent / 100.0) if squad_discount_applicable else 0.0
+        squad_discount_total = squad_discount_per_slot * len(bookings) if squad_discount_applicable else 0.0
 
         if squad_enabled:
             normalized_squad_details["discount_per_slot"] = round(squad_discount_per_slot, 2)
             normalized_squad_details["total_discount"] = round(squad_discount_total, 2)
+            normalized_squad_details["slot_base_multiplier"] = int(squad_player_multiplier)
             normalized_squad_details["slot_unit_price"] = round(effective_price, 2)
             normalized_squad_details["slot_price_for_squad"] = round(base_slot_price_for_squad, 2)
             normalized_squad_details["slot_base_total_before_discount"] = round(base_slot_price_for_squad * len(bookings), 2)
