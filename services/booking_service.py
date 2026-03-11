@@ -76,7 +76,8 @@ class BookingService:
         book_date, 
         is_pay_at_cafe: bool = False,
         booking_mode: str = 'regular',  # ✅ NEW PARAMETER
-        squad_details: Optional[dict] = None
+        squad_details: Optional[dict] = None,
+        slot_units: int = 1,
     ):
         """
         Create a booking with specified mode.
@@ -88,10 +89,12 @@ class BookingService:
         cid = getattr(g, "cid", None) or str(uuid.uuid4())
         log = current_app.logger
 
+        slot_units = max(1, int(slot_units or 1))
+
         log.info(
             "create_booking.start cid=%s slot_id=%s game_id=%s user_id=%s book_date=%s "
-            "is_pay_at_cafe=%s booking_mode=%s",
-            cid, slot_id, game_id, user_id, book_date, is_pay_at_cafe, booking_mode
+            "is_pay_at_cafe=%s booking_mode=%s slot_units=%s",
+            cid, slot_id, game_id, user_id, book_date, is_pay_at_cafe, booking_mode, slot_units
         )
 
         # ✅ Validate booking_mode
@@ -155,7 +158,7 @@ class BookingService:
         log.info("create_booking.vendor_slot_state cid=%s available_slot=%s date=%s",
                  cid, available_slot, date_value)
 
-        if available_slot is None or available_slot <= 0:
+        if available_slot is None or int(available_slot) < slot_units:
             log.warning("create_booking.slot_full cid=%s vendor_id=%s slot_id=%s date=%s",
                         cid, vendor_id, slot_id, date_value)
             raise ValueError("Slot is fully booked for this date.")
@@ -188,12 +191,12 @@ class BookingService:
             update_res = db.session.execute(
                 text(f"""
                     UPDATE VENDOR_{vendor_id}_SLOT
-                    SET available_slot = available_slot - 1,
-                        is_available = CASE WHEN available_slot - 1 = 0 THEN FALSE ELSE is_available END
-                    WHERE slot_id = :slot_id AND date = :book_date AND available_slot > 0
+                    SET available_slot = available_slot - :slot_units,
+                        is_available = CASE WHEN available_slot - :slot_units = 0 THEN FALSE ELSE is_available END
+                    WHERE slot_id = :slot_id AND date = :book_date AND available_slot >= :slot_units
                     RETURNING available_slot
                 """),
-                {"slot_id": slot_id, "book_date": book_date}
+                {"slot_id": slot_id, "book_date": book_date, "slot_units": slot_units}
             ).fetchone()
             log.info("create_booking.vendor_slot_decrement cid=%s success=%s new_available_slot=%s",
                      cid, bool(update_res), (update_res[0] if update_res else None))

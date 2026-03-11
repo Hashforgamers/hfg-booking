@@ -110,3 +110,7 @@ class Booking(db.Model):
         ]
         
         return base_dict
+
+
+# Ensure BookingSquadMember mapper is registered before first mapper configure.
+from .bookingSquadMember import BookingSquadMember  # noqa: E402,F401

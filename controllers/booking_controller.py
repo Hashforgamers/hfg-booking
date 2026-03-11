@@ -2447,6 +2447,22 @@ def new_booking(vendor_id):
             normalized_squad_details["pricing_mode"] = pricing_mode
             normalized_squad_details["discount_percent"] = discount_pct
 
+            # For PS/Xbox squad sessions, pricing is controller-driven; ensure controller qty matches players.
+            if pricing_mode == "controller_pricing":
+                required_extra_controller_qty = max(0, int(normalized_squad_details["player_count"]) - 2)
+                if required_extra_controller_qty > extra_controller_qty:
+                    extra_controller_qty = required_extra_controller_qty
+
+        # Recompute controller surcharge after squad normalization.
+        if is_controller_pricing_supported(available_game.game_name) and extra_controller_qty > 0:
+            computed_controller_fare = calculate_extra_controller_fare(
+                vendor_id=vendor_id,
+                available_game_id=available_game.id,
+                quantity=extra_controller_qty
+            )
+            if computed_controller_fare is not None:
+                extra_controller_fare = computed_controller_fare
+
         # Validate and calculate extra services cost
         total_meals_cost = 0
         meal_details = []
@@ -2574,7 +2590,12 @@ def new_booking(vendor_id):
                     book_date=datetime.strptime(booked_date, '%Y-%m-%d').date(),
                     is_pay_at_cafe=(payment_type == 'Cash'),
                     booking_mode=booking_mode,  # ✅ PASS BOOKING MODE HERE
-                    squad_details=normalized_squad_details if squad_enabled else None
+                    squad_details=normalized_squad_details if squad_enabled else None,
+                    slot_units=(
+                        int(normalized_squad_details.get("player_count", 1))
+                        if squad_enabled and str(normalized_squad_details.get("console_group", "")) == "pc"
+                        else 1
+                    )
                 )
                 
                 bookings.append(booking)
@@ -2668,6 +2689,7 @@ def new_booking(vendor_id):
             normalized_squad_details["discount_per_slot"] = round(squad_discount_per_slot, 2)
             normalized_squad_details["total_discount"] = round(squad_discount_total, 2)
             normalized_squad_details["slot_base_multiplier"] = int(squad_player_multiplier)
+            normalized_squad_details["applied_extra_controller_qty"] = int(extra_controller_qty)
             normalized_squad_details["slot_unit_price"] = round(effective_price, 2)
             normalized_squad_details["slot_price_for_squad"] = round(base_slot_price_for_squad, 2)
             normalized_squad_details["slot_base_total_before_discount"] = round(base_slot_price_for_squad * len(bookings), 2)
@@ -2692,7 +2714,9 @@ def new_booking(vendor_id):
                 }), 400
 
         for booking in bookings:
-            base_slot_price = base_slot_price_for_squad if squad_enabled else effective_price
+            if squad_enabled:
+                booking.squad_details = normalized_squad_details
+            base_slot_price = base_slot_price_for_squad if is_pc_squad else effective_price
             slot_meal_cost = meals_cost_per_slot
             
             original_amount = base_slot_price + slot_meal_cost
