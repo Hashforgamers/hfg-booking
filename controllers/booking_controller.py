@@ -4771,7 +4771,8 @@ def get_slot_bookings(vendor_id):
             .options(
                 joinedload(Booking.transaction),
                 joinedload(Booking.slot),
-                joinedload(Booking.booking_extra_services).joinedload(BookingExtraService.extra_service_menu)
+                joinedload(Booking.booking_extra_services).joinedload(BookingExtraService.extra_service_menu),
+                joinedload(Booking.squad_members)
             )\
             .distinct()\
             .all()
@@ -4804,6 +4805,29 @@ def get_slot_bookings(vendor_id):
             meal_text = "No meal selected"
             if meals:
                 meal_text = ", ".join([f"{m['quantity']}x {m['name']}" for m in meals])
+
+            squad_details = booking.squad_details if isinstance(booking.squad_details, dict) else {}
+            squad_member_rows = sorted(
+                booking.squad_members or [],
+                key=lambda m: int(getattr(m, "member_position", 9999) or 9999)
+            )
+            squad_members = [
+                {
+                    "id": int(member.id),
+                    "member_user_id": int(member.member_user_id) if member.member_user_id else None,
+                    "member_position": int(member.member_position),
+                    "is_captain": bool(member.is_captain),
+                    "name": member.name_snapshot,
+                    "phone": member.phone_snapshot,
+                }
+                for member in squad_member_rows
+            ]
+            squad_player_count = int(
+                squad_details.get("player_count")
+                or squad_details.get("playerCount")
+                or (len(squad_members) if squad_members else 1)
+            )
+            squad_enabled = bool(squad_details.get("enabled")) or squad_player_count > 1
             
             bookings_data.append({
                 'booking_id': booking.id,
@@ -4817,7 +4841,14 @@ def get_slot_bookings(vendor_id):
                 'slot_id': booking.slot_id,
                 'booking_mode': booking.booking_mode,
                 'created_at': booking.created_at.isoformat() if booking.created_at else None,
-                'amount_paid': float(booking.transaction.amount) if booking.transaction else 0
+                'amount_paid': float(booking.transaction.amount) if booking.transaction else 0,
+                'booking_date': booking.transaction.booked_date.isoformat() if booking.transaction and booking.transaction.booked_date else booking_date.isoformat(),
+                'slot_start_time': booking.slot.start_time.strftime('%I:%M %p') if booking.slot and booking.slot.start_time else None,
+                'slot_end_time': booking.slot.end_time.strftime('%I:%M %p') if booking.slot and booking.slot.end_time else None,
+                'squad_enabled': squad_enabled,
+                'squad_player_count': max(1, squad_player_count),
+                'squad_members': squad_members,
+                'squad_details': squad_details,
             })
         
         return jsonify({
