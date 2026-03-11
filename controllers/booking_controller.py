@@ -3596,10 +3596,26 @@ def get_user_details(vendor_id):
         )
         user_ids.update([row[0] for row in credit_user_ids if row[0]])
 
+        # Step 3: Include squad member user IDs mapped to this vendor's bookings.
+        # Without this, users created through squad member rows won't appear
+        # in the quick selector until they become a primary booking user.
+        squad_user_ids = (
+            db.session.query(BookingSquadMember.member_user_id)
+            .join(Booking, Booking.id == BookingSquadMember.booking_id)
+            .join(Transaction, Transaction.booking_id == Booking.id)
+            .filter(
+                Transaction.vendor_id == vendor_id_int,
+                BookingSquadMember.member_user_id.isnot(None),
+            )
+            .distinct()
+            .all()
+        )
+        user_ids.update([row[0] for row in squad_user_ids if row[0]])
+
         if not user_ids:
             return jsonify([]), 200
 
-        # Step 3: Fetch User and ContactInfo
+        # Step 4: Fetch User and ContactInfo
         users = User.query.filter(User.id.in_(list(user_ids))).all()
 
         user_list = []
@@ -4185,6 +4201,21 @@ def add_meals_to_booking(booking_id):
         meals = data.get("meals", [])
         if not meals:
             return jsonify({"success": False, "message": "No meals provided"}), 400
+
+        squad_member = data.get("squad_member") if isinstance(data.get("squad_member"), dict) else None
+        squad_member_position = None
+        squad_member_user_id = None
+        squad_member_name = None
+        if squad_member:
+            try:
+                squad_member_position = int(squad_member.get("member_position")) if squad_member.get("member_position") is not None else None
+            except (TypeError, ValueError):
+                squad_member_position = None
+            try:
+                squad_member_user_id = int(squad_member.get("member_user_id")) if squad_member.get("member_user_id") is not None else None
+            except (TypeError, ValueError):
+                squad_member_user_id = None
+            squad_member_name = str(squad_member.get("name") or "").strip() or None
         
         # Validate booking exists and get vendor_id
         booking = db.session.query(Booking).filter_by(id=booking_id).first()
@@ -4250,6 +4281,33 @@ def add_meals_to_booking(booking_id):
             )
             db.session.add(booking_extra_service)
             current_app.logger.info(f"Created extra service for booking {booking_id}: {meal_detail['menu_item'].name}")
+
+        # Persist member-level meal attribution inside squad_details ledger for audit/billing clarity.
+        if squad_member and isinstance(booking.squad_details, dict):
+            ledger = booking.squad_details.get("member_meal_ledger")
+            if not isinstance(ledger, list):
+                ledger = []
+            ledger_entry = {
+                "added_at": datetime.utcnow().isoformat(),
+                "member_position": squad_member_position,
+                "member_user_id": squad_member_user_id,
+                "member_name": squad_member_name,
+                "meals_total": float(total_meals_cost),
+                "meals": [
+                    {
+                        "menu_item_id": int(detail["menu_item"].id),
+                        "name": str(detail["menu_item"].name),
+                        "quantity": int(detail["quantity"]),
+                        "unit_price": float(detail["unit_price"]),
+                        "total_price": float(detail["total_price"]),
+                    }
+                    for detail in meal_details
+                ],
+            }
+            ledger.append(ledger_entry)
+            updated_squad_details = dict(booking.squad_details)
+            updated_squad_details["member_meal_ledger"] = ledger
+            booking.squad_details = updated_squad_details
         
         actor = resolve_transaction_actor(request)
         # Default behavior for in-session meal additions:
@@ -4370,6 +4428,11 @@ def add_meals_to_booking(booking_id):
             "message": "Meals added successfully",
             "booking_id": booking_id,
             "total_meals_cost": float(total_meals_cost),
+            "squad_member": {
+                "member_position": squad_member_position,
+                "member_user_id": squad_member_user_id,
+                "member_name": squad_member_name,
+            } if squad_member else None,
             "payment_status": {
                 "label": "Extra Payment Required" if summary["amount_due"] > 0 else "Settled",
                 "amount_paid": summary["amount_paid"],
@@ -4418,7 +4481,12 @@ def booking_payment_summary(booking_id):
                 "amount_due": summary["amount_due"],
                 "total_charged": summary["total_charged"],
             },
-            "financial_summary": summary
+            "financial_summary": summary,
+            "squad_member_meal_ledger": (
+                booking.squad_details.get("member_meal_ledger", [])
+                if isinstance(booking.squad_details, dict)
+                else []
+            ),
         }), 200
     except Exception as e:
         current_app.logger.error(f"Failed to build booking payment summary for {booking_id}: {str(e)}")
