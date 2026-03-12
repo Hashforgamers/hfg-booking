@@ -3465,7 +3465,19 @@ def extra_booking():
             db.session.add(primary_booking)
             db.session.flush()
 
-        original_amount = amount
+        squad_details = primary_booking.squad_details if isinstance(primary_booking.squad_details, dict) else {}
+        squad_console_group = str(squad_details.get("console_group") or "").strip().lower()
+        squad_player_count = int(squad_details.get("player_count") or squad_details.get("playerCount") or 1)
+        is_pc_squad = bool(
+            squad_console_group == "pc"
+            and squad_player_count > 1
+            and (squad_details.get("enabled") is True or squad_player_count > 1)
+        )
+        effective_multiplier = max(squad_player_count, 1) if is_pc_squad else 1
+
+        # Frontend sends overtime amount at per-player rate.
+        # For PC squad, apply to full squad so billing remains transparent and complete.
+        original_amount = amount * effective_multiplier
         discounted_amount = waive_off_amount
         final_amount = max(original_amount - discounted_amount, 0.0)
         gst = calculate_gst_breakdown(vendor_id, final_amount)
@@ -3502,7 +3514,40 @@ def extra_booking():
             reference_id=reference_id,
         )
         db.session.add(transaction)
+
+        if is_pc_squad:
+            updated_squad = dict(squad_details)
+            ledger = updated_squad.get("extra_session_ledger")
+            if not isinstance(ledger, list):
+                ledger = []
+            ledger.append({
+                "recorded_at": datetime.utcnow().isoformat(),
+                "slot_id": int(slot_id),
+                "console_group": "pc",
+                "player_count": int(effective_multiplier),
+                "per_player_amount": round(float(amount), 2),
+                "original_amount": round(float(original_amount), 2),
+                "waive_off_amount": round(float(discounted_amount), 2),
+                "final_amount": round(float(final_amount), 2),
+                "transaction_id_preview": None,
+                "recorded_by": actor["source_channel"],
+            })
+            updated_squad["extra_session_ledger"] = ledger
+            updated_squad["last_extra_charge_amount"] = round(float(final_amount), 2)
+            updated_squad["last_extra_charge_multiplier"] = int(effective_multiplier)
+            primary_booking.squad_details = updated_squad
+
         db.session.commit()
+
+        if is_pc_squad and isinstance(primary_booking.squad_details, dict):
+            # Backfill transaction id after commit for traceability.
+            updated_squad = dict(primary_booking.squad_details)
+            ledger = updated_squad.get("extra_session_ledger")
+            if isinstance(ledger, list) and ledger:
+                ledger[-1]["transaction_id_preview"] = int(transaction.id)
+                updated_squad["extra_session_ledger"] = ledger
+                primary_booking.squad_details = updated_squad
+                db.session.commit()
 
         BookingService.insert_into_vendor_dashboard_table(transaction.id, console_number)
         BookingService.insert_into_vendor_promo_table(transaction.id, console_number)
@@ -3539,7 +3584,14 @@ def extra_booking():
                 "total_charged": summary["total_charged"],
             },
             "session_notice": f"The session for {username} on {console_type} #{console_number} has exceeded the allotted time.",
-            "financial_summary": summary
+            "financial_summary": summary,
+            "squad_charge": {
+                "is_pc_squad": is_pc_squad,
+                "player_count": int(effective_multiplier),
+                "per_player_amount": round(float(amount), 2),
+                "charged_original_amount": round(float(original_amount), 2),
+                "charged_final_amount": round(float(final_amount), 2),
+            }
         }), 201
 
     except Exception as e:
