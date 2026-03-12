@@ -389,13 +389,22 @@ def _reserve_specific_console(vendor_id: int, game_id: int, console_id: int):
     table_name = f"VENDOR_{vendor_id}_CONSOLE_AVAILABILITY"
     row = db.session.execute(
         text(f"""
-            UPDATE {table_name}
+            WITH candidate AS (
+                SELECT console_id
+                FROM {table_name}
+                WHERE vendor_id = :vendor_id
+                  AND game_id = :game_id
+                  AND console_id = :console_id
+                  AND is_available = TRUE
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE {table_name} c
             SET is_available = FALSE
-            WHERE vendor_id = :vendor_id
-              AND game_id = :game_id
-              AND console_id = :console_id
-              AND is_available = TRUE
-            RETURNING console_id
+            FROM candidate
+            WHERE c.vendor_id = :vendor_id
+              AND c.console_id = candidate.console_id
+            RETURNING c.console_id
         """),
         {"vendor_id": vendor_id, "game_id": game_id, "console_id": console_id},
     ).fetchone()
@@ -426,6 +435,59 @@ def _reserve_any_console(vendor_id: int, game_id: int):
         {"vendor_id": vendor_id, "game_id": game_id},
     ).fetchone()
     return int(row[0]) if row else None
+
+
+def _reserve_multiple_consoles(vendor_id: int, game_id: int, quantity: int):
+    if int(quantity or 0) <= 0:
+        return []
+    table_name = f"VENDOR_{vendor_id}_CONSOLE_AVAILABILITY"
+    rows = db.session.execute(
+        text(f"""
+            WITH candidate AS (
+                SELECT console_id
+                FROM {table_name}
+                WHERE vendor_id = :vendor_id
+                  AND game_id = :game_id
+                  AND is_available = TRUE
+                ORDER BY console_id
+                LIMIT :quantity
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE {table_name} c
+            SET is_available = FALSE
+            FROM candidate
+            WHERE c.vendor_id = :vendor_id
+              AND c.console_id = candidate.console_id
+            RETURNING c.console_id
+        """),
+        {"vendor_id": vendor_id, "game_id": game_id, "quantity": int(quantity)},
+    ).fetchall()
+
+    reserved_ids = []
+    seen = set()
+    for row in rows or []:
+        cid = int(row[0])
+        if cid in seen:
+            continue
+        seen.add(cid)
+        reserved_ids.append(cid)
+    return reserved_ids
+
+
+def _release_reserved_consoles(vendor_id: int, console_ids):
+    cleaned_ids = [int(cid) for cid in (console_ids or []) if cid is not None]
+    if not cleaned_ids:
+        return
+    table_name = f"VENDOR_{vendor_id}_CONSOLE_AVAILABILITY"
+    db.session.execute(
+        text(f"""
+            UPDATE {table_name}
+            SET is_available = TRUE
+            WHERE vendor_id = :vendor_id
+              AND console_id = ANY(:console_ids)
+        """),
+        {"vendor_id": vendor_id, "console_ids": cleaned_ids},
+    )
 
 
 @booking_blueprint.route('/vendor/<int:vendor_id>/squad-pricing-policy', methods=['GET'])
@@ -2851,27 +2913,86 @@ def new_booking(vendor_id):
             runtime_console_id = int(console_id) if console_id is not None else -1
 
             if slot_obj and _is_slot_live_now_ist(booked_for_date_obj, slot_obj.start_time, slot_obj.end_time):
-                reserved_console_id = None
+                console_group = str(normalized_squad_details.get("console_group", "")).lower()
+                is_pc_squad = bool(squad_enabled and console_group == "pc")
+                required_console_count = (
+                    int(normalized_squad_details.get("player_count", 1))
+                    if is_pc_squad
+                    else 1
+                )
+                required_console_count = max(required_console_count, 1)
+
+                reserved_console_ids = []
                 if is_rapid_booking and console_id is not None:
-                    reserved_console_id = _reserve_specific_console(
+                    reserved_specific = _reserve_specific_console(
                         vendor_id=vendor_id,
                         game_id=available_game.id,
                         console_id=int(console_id),
                     )
-                if reserved_console_id is None:
-                    reserved_console_id = _reserve_any_console(
-                        vendor_id=vendor_id,
-                        game_id=available_game.id,
+                    if reserved_specific is not None:
+                        reserved_console_ids.append(int(reserved_specific))
+
+                remaining_needed = required_console_count - len(reserved_console_ids)
+                if remaining_needed > 0:
+                    reserved_console_ids.extend(
+                        _reserve_multiple_consoles(
+                            vendor_id=vendor_id,
+                            game_id=available_game.id,
+                            quantity=remaining_needed,
+                        )
                     )
 
-                if reserved_console_id is not None:
+                if len(reserved_console_ids) >= required_console_count:
+                    reserved_console_ids = reserved_console_ids[:required_console_count]
                     runtime_status = "current"
-                    runtime_console_id = int(reserved_console_id)
+                    runtime_console_id = int(reserved_console_ids[0])
                     booking.status = "checked_in"
+                    if squad_enabled and isinstance(booking.squad_details, dict):
+                        updated_squad = dict(booking.squad_details)
+                        updated_squad["assigned_console_ids"] = [int(cid) for cid in reserved_console_ids]
+                        console_rows = (
+                            Console.query
+                            .filter(Console.id.in_([int(cid) for cid in reserved_console_ids]))
+                            .all()
+                        )
+                        label_by_console = {
+                            int(c.id): str(c.console_model_number or f"Console {c.id}")
+                            for c in console_rows
+                        }
+                        updated_squad["assigned_console_labels"] = {
+                            str(cid): label_by_console.get(int(cid), f"Console {cid}")
+                            for cid in reserved_console_ids
+                        }
+
+                        if is_pc_squad:
+                            squad_members = (
+                                BookingSquadMember.query
+                                .filter(BookingSquadMember.booking_id == int(booking.id))
+                                .order_by(BookingSquadMember.member_position.asc())
+                                .all()
+                            )
+                            member_console_map = []
+                            for idx, member in enumerate(squad_members):
+                                if idx >= len(reserved_console_ids):
+                                    break
+                                mapped_console_id = int(reserved_console_ids[idx])
+                                member_console_map.append({
+                                    "member_position": int(member.member_position or idx + 1),
+                                    "member_user_id": int(member.member_user_id) if member.member_user_id else None,
+                                    "member_name": str(member.name_snapshot or f"Player {idx + 1}"),
+                                    "console_id": mapped_console_id,
+                                    "console_label": label_by_console.get(mapped_console_id, f"Console {mapped_console_id}"),
+                                })
+                            if member_console_map:
+                                updated_squad["member_console_map"] = member_console_map
+
+                        booking.squad_details = updated_squad
                 else:
+                    if reserved_console_ids:
+                        _release_reserved_consoles(vendor_id=vendor_id, console_ids=reserved_console_ids)
                     current_app.logger.warning(
-                        "No console available for live booking_id=%s vendor_id=%s game_id=%s",
-                        booking.id, vendor_id, available_game.id
+                        "Insufficient consoles for live booking_id=%s vendor_id=%s game_id=%s required=%s reserved=%s",
+                        booking.id, vendor_id, available_game.id, required_console_count, len(reserved_console_ids)
                     )
 
             booking_runtime[int(booking.id)] = {
