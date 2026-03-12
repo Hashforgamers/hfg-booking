@@ -4456,8 +4456,9 @@ def add_meals_to_booking(booking_id):
             current_app.logger.info(f"Created extra service for booking {booking_id}: {meal_detail['menu_item'].name}")
 
         # Persist member-level meal attribution inside squad_details ledger for audit/billing clarity.
-        if squad_member and isinstance(booking.squad_details, dict):
-            ledger = booking.squad_details.get("member_meal_ledger")
+        if squad_member:
+            existing_squad_details = booking.squad_details if isinstance(booking.squad_details, dict) else {}
+            ledger = existing_squad_details.get("member_meal_ledger")
             if not isinstance(ledger, list):
                 ledger = []
             ledger_entry = {
@@ -4478,7 +4479,8 @@ def add_meals_to_booking(booking_id):
                 ],
             }
             ledger.append(ledger_entry)
-            updated_squad_details = dict(booking.squad_details)
+            updated_squad_details = dict(existing_squad_details)
+            updated_squad_details["enabled"] = bool(updated_squad_details.get("enabled", True))
             updated_squad_details["member_meal_ledger"] = ledger
             booking.squad_details = updated_squad_details
         
