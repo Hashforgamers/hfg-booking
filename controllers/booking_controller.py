@@ -2956,7 +2956,7 @@ def new_booking(vendor_id):
                             .all()
                         )
                         label_by_console = {
-                            int(c.id): str(c.console_model_number or f"Console {c.id}")
+                            int(c.id): str(c.model_number or f"Console {c.id}")
                             for c in console_rows
                         }
                         updated_squad["assigned_console_labels"] = {
