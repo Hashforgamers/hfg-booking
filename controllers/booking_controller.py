@@ -311,6 +311,24 @@ def normalize_payment_use_case(payment_type: str, source_channel: str) -> str:
     return pt or "unknown"
 
 
+def validate_monthly_credit_capacity(credit_account, requested_charge: float):
+    requested_charge = max(float(requested_charge or 0.0), 0.0)
+    outstanding_amount = float(getattr(credit_account, "outstanding_amount", 0.0) or 0.0)
+    credit_limit = float(getattr(credit_account, "credit_limit", 0.0) or 0.0)
+    available_credit = max(credit_limit - outstanding_amount, 0.0)
+
+    if requested_charge > available_credit:
+        return {
+            "success": False,
+            "message": "Monthly credit limit exceeded for this customer.",
+            "credit_limit": round(credit_limit, 2),
+            "current_outstanding": round(outstanding_amount, 2),
+            "requested_charge": round(requested_charge, 2),
+            "available_credit": round(available_credit, 2),
+        }
+    return None
+
+
 def resolve_settlement_status(payment_use_case: str) -> str:
     if payment_use_case == "pay_at_cafe":
         return "pending"
@@ -2774,6 +2792,17 @@ def new_booking(vendor_id):
                     "success": False,
                     "message": "Monthly credit account not configured for this customer."
                 }), 400
+            projected_credit_charge = 0.0
+            for _ in bookings:
+                projected_credit_charge += max(
+                    ((base_slot_price_for_squad if is_pc_squad else effective_price) + meals_cost_per_slot)
+                    - (waive_off_per_slot + squad_discount_per_slot),
+                    0.0,
+                )
+            projected_credit_charge += max(float(extra_controller_fare or 0.0), 0.0)
+            credit_limit_error = validate_monthly_credit_capacity(credit_account, projected_credit_charge)
+            if credit_limit_error:
+                return jsonify(credit_limit_error), 400
 
         for booking in bookings:
             if squad_enabled:
@@ -3446,6 +3475,18 @@ def extra_booking():
         actor = resolve_transaction_actor(request)
         payment_use_case = normalize_payment_use_case(mode_of_payment, actor["source_channel"])
         settlement_status = resolve_settlement_status(payment_use_case)
+        credit_account = None
+        if payment_use_case == "monthly_credit":
+            credit_account = MonthlyCreditAccount.query.filter_by(
+                vendor_id=vendor_id,
+                user_id=user_id,
+                is_active=True
+            ).first()
+            if not credit_account:
+                return jsonify({
+                    "success": False,
+                    "message": "Monthly credit account not configured for this customer."
+                }), 400
 
         user = db.session.query(User).filter_by(id=user_id).first()
         slot = db.session.query(Slot).filter_by(id=slot_id).first()
@@ -3480,6 +3521,10 @@ def extra_booking():
         original_amount = amount * effective_multiplier
         discounted_amount = waive_off_amount
         final_amount = max(original_amount - discounted_amount, 0.0)
+        if credit_account:
+            credit_limit_error = validate_monthly_credit_capacity(credit_account, final_amount)
+            if credit_limit_error:
+                return jsonify(credit_limit_error), 400
         gst = calculate_gst_breakdown(vendor_id, final_amount)
 
         transaction = Transaction(
@@ -4760,6 +4805,11 @@ def settle_pending_booking_transactions(booking_id):
             pending_total += max(line_total, 0.0)
 
         applied_waive_off = min(max(waive_off_amount, 0.0), pending_total)
+        if credit_account:
+            projected_credit_charge = max(pending_total - applied_waive_off, 0.0)
+            credit_limit_error = validate_monthly_credit_capacity(credit_account, projected_credit_charge)
+            if credit_limit_error:
+                return jsonify(credit_limit_error), 400
 
         # Keep discount auditable via a dedicated negative transaction.
         if applied_waive_off > 0:
