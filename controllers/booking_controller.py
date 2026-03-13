@@ -294,11 +294,13 @@ def resolve_transaction_actor(request_obj):
 
 def normalize_payment_use_case(payment_type: str, source_channel: str) -> str:
     pt = str(payment_type or "").strip().lower()
+    if pt in {"monthly_credit", "credit", "month_end"}:
+        return "monthly_credit"
     if pt == "cash":
         return "pay_at_cafe" if source_channel == "app" else "cash"
     if pt == "upi":
         return "upi"
-    if pt in {"card", "cards", "credit", "credit_card", "debit", "debit_card"}:
+    if pt in {"card", "cards", "credit_card", "debit", "debit_card"}:
         return "card"
     if pt in {"pass", "date_pass", "hour_pass"}:
         return "pass"
@@ -306,8 +308,6 @@ def normalize_payment_use_case(payment_type: str, source_channel: str) -> str:
         return "hash_wallet"
     if pt in {"gateway", "payment_gateway", "paid", "online"}:
         return "payment_gateway"
-    if pt in {"monthly_credit", "credit", "month_end"}:
-        return "monthly_credit"
     return pt or "unknown"
 
 
@@ -4730,6 +4730,18 @@ def settle_pending_booking_transactions(booking_id):
 
         actor = resolve_transaction_actor(request)
         payment_use_case = normalize_payment_use_case(mode, actor["source_channel"])
+        credit_account = None
+        if payment_use_case == "monthly_credit":
+            credit_account = MonthlyCreditAccount.query.filter_by(
+                vendor_id=booking.game.vendor_id if booking.game else None,
+                user_id=booking.user_id,
+                is_active=True
+            ).first()
+            if not credit_account:
+                return jsonify({
+                    "success": False,
+                    "message": "Monthly credit account not configured for this customer."
+                }), 400
 
         pending_rows = (
             Transaction.query
@@ -4790,12 +4802,33 @@ def settle_pending_booking_transactions(booking_id):
             settled_amount += line_total
             tx.mode_of_payment = mode
             tx.payment_use_case = payment_use_case
-            tx.settlement_status = "completed"
+            tx.settlement_status = "pending" if payment_use_case == "monthly_credit" else "completed"
             tx.source_channel = actor["source_channel"]
             tx.initiated_by_staff_id = actor["staff_id"]
             tx.initiated_by_staff_name = actor["staff_name"]
             tx.initiated_by_staff_role = actor["staff_role"]
             settled_ids.append(tx.id)
+
+        if credit_account and settled_amount > 0:
+            due_date = compute_credit_due_date(
+                datetime.utcnow().date(),
+                credit_account.billing_cycle_day
+            )
+            db.session.add(
+                MonthlyCreditLedger(
+                    account_id=credit_account.id,
+                    transaction_id=None,
+                    entry_type="charge",
+                    amount=max(settled_amount - applied_waive_off, 0.0),
+                    description=f"Pending session settlement #{booking_id}",
+                    booked_date=datetime.utcnow().date(),
+                    due_date=due_date,
+                    source_channel=actor["source_channel"],
+                    staff_id=actor["staff_id"],
+                    staff_name=actor["staff_name"],
+                )
+            )
+            credit_account.outstanding_amount = float(credit_account.outstanding_amount or 0) + max(settled_amount - applied_waive_off, 0.0)
 
         db.session.commit()
 
