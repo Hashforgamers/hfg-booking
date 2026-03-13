@@ -2511,7 +2511,7 @@ def new_booking(vendor_id):
 
             # For PS/Xbox squad sessions, pricing is controller-driven; ensure controller qty matches players.
             if pricing_mode == "controller_pricing":
-                required_extra_controller_qty = max(0, int(normalized_squad_details["player_count"]) - 2)
+                required_extra_controller_qty = max(0, int(normalized_squad_details["player_count"]) - 1)
                 if required_extra_controller_qty > extra_controller_qty:
                     extra_controller_qty = required_extra_controller_qty
 
