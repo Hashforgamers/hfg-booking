@@ -392,7 +392,10 @@ def get_slots_on_game_id(vendorId, gameId, date):
             raw_available = int(row[2] or 0)
             booked_count = int(booking_counts.get((slot_id, formatted_date), 0))
             computed_available = max(total_slots_for_game - booked_count, 0)
-            resolved_available = max(raw_available, computed_available)
+            # `available_slot` in VENDOR_<id>_SLOT is the source of truth and already
+            # decremented by booking flow (including PC squad slot_units). Never inflate
+            # availability above this value via booking-row count heuristics.
+            resolved_available = min(raw_available, computed_available)
             slot_is_available = resolved_available > 0
 
             candidate = {
@@ -537,7 +540,8 @@ def get_slots_batch(vendorId):
             game_id = int(row[8])
             booked_count = int(booking_counts.get((int(row[0]), date_obj.strftime("%Y-%m-%d")), 0))
             computed_available = max(int(total_slots_map.get(game_id, 0)) - booked_count, 0)
-            resolved_available = max(raw_available, computed_available)
+            # Keep DB availability authoritative; count-based estimate is only a cap.
+            resolved_available = min(raw_available, computed_available)
             slot_is_available = resolved_available > 0
             
             candidate = {

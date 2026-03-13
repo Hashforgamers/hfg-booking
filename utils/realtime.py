@@ -20,6 +20,7 @@ CANONICAL_KEYS = {
     "date", "slot_price",
     "status", "statusLabel", "booking_status",
     "time", "processed_time",
+    "squad_details",
 }
 
 def _fmt_time(t: TimeLike, fmt: str = "%I:%M %p") -> str:
@@ -134,6 +135,7 @@ def _canonical_payload(data: Dict[str, Any], time_fmt: str) -> Dict[str, Any]:
 
     time_block = _normalize_block(data.get("time"), time_fmt)
     processed_block = _normalize_block(data.get("processed_time"), time_fmt)
+    squad_details = data.get("squad_details") or data.get("squadDetails")
 
     payload = {
         "bookingId": booking_id,
@@ -152,6 +154,7 @@ def _canonical_payload(data: Dict[str, Any], time_fmt: str) -> Dict[str, Any]:
         "booking_status": booking_status,
         "time": time_block,
         "processed_time": processed_block,
+        "squad_details": squad_details if isinstance(squad_details, dict) else None,
     }
     return {k: v for k, v in payload.items() if v is not None}
 
@@ -219,7 +222,8 @@ def emit_booking_event(
 def build_booking_event_payload(*, vendor_id, booking_id, slot_id, user_id, username,
                                 game_id, game_name, date_value, slot_price,
                                 start_time, end_time, console_id,
-                                status: str, booking_status: str):
+                                status: str, booking_status: str,
+                                squad_details: Optional[Dict[str, Any]] = None):
     # status: 'pending_verified' | 'pending_acceptance' | 'confirmed' | ...
     # booking_status: 'upcoming' | 'current' | 'past'
     payload = {
@@ -238,6 +242,7 @@ def build_booking_event_payload(*, vendor_id, booking_id, slot_id, user_id, user
         "processed_time": [{"start_time": start_time, "end_time": end_time}],
         "status": status,                   # machine status
         "booking_status": booking_status,   # stage dimension per your UI contract
+        "squad_details": squad_details if isinstance(squad_details, dict) else None,
     }
     # Remove Nones to keep payload tight; emitter also filters
     return {k: v for k, v in payload.items() if v is not None}

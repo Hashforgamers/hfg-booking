@@ -20,6 +20,7 @@ from sqlalchemy import or_
 from utils.realtime import emit_booking_event
 from flask import current_app, g
 from sqlalchemy import text
+from typing import Optional
 import uuid
 
 
@@ -74,7 +75,9 @@ class BookingService:
         socketio, 
         book_date, 
         is_pay_at_cafe: bool = False,
-        booking_mode: str = 'regular'  # ✅ NEW PARAMETER
+        booking_mode: str = 'regular',  # ✅ NEW PARAMETER
+        squad_details: Optional[dict] = None,
+        slot_units: int = 1,
     ):
         """
         Create a booking with specified mode.
@@ -86,10 +89,12 @@ class BookingService:
         cid = getattr(g, "cid", None) or str(uuid.uuid4())
         log = current_app.logger
 
+        slot_units = max(1, int(slot_units or 1))
+
         log.info(
             "create_booking.start cid=%s slot_id=%s game_id=%s user_id=%s book_date=%s "
-            "is_pay_at_cafe=%s booking_mode=%s",
-            cid, slot_id, game_id, user_id, book_date, is_pay_at_cafe, booking_mode
+            "is_pay_at_cafe=%s booking_mode=%s slot_units=%s",
+            cid, slot_id, game_id, user_id, book_date, is_pay_at_cafe, booking_mode, slot_units
         )
 
         # ✅ Validate booking_mode
@@ -153,7 +158,7 @@ class BookingService:
         log.info("create_booking.vendor_slot_state cid=%s available_slot=%s date=%s",
                  cid, available_slot, date_value)
 
-        if available_slot is None or available_slot <= 0:
+        if available_slot is None or int(available_slot) < slot_units:
             log.warning("create_booking.slot_full cid=%s vendor_id=%s slot_id=%s date=%s",
                         cid, vendor_id, slot_id, date_value)
             raise ValueError("Slot is fully booked for this date.")
@@ -186,12 +191,12 @@ class BookingService:
             update_res = db.session.execute(
                 text(f"""
                     UPDATE VENDOR_{vendor_id}_SLOT
-                    SET available_slot = available_slot - 1,
-                        is_available = CASE WHEN available_slot - 1 = 0 THEN FALSE ELSE is_available END
-                    WHERE slot_id = :slot_id AND date = :book_date AND available_slot > 0
+                    SET available_slot = available_slot - :slot_units,
+                        is_available = CASE WHEN available_slot - :slot_units = 0 THEN FALSE ELSE is_available END
+                    WHERE slot_id = :slot_id AND date = :book_date AND available_slot >= :slot_units
                     RETURNING available_slot
                 """),
-                {"slot_id": slot_id, "book_date": book_date}
+                {"slot_id": slot_id, "book_date": book_date, "slot_units": slot_units}
             ).fetchone()
             log.info("create_booking.vendor_slot_decrement cid=%s success=%s new_available_slot=%s",
                      cid, bool(update_res), (update_res[0] if update_res else None))
@@ -214,6 +219,7 @@ class BookingService:
                 game_id=game_id,
                 user_id=user_id,
                 booking_mode=booking_mode,  # ✅ SET THE MODE HERE
+                squad_details=squad_details or None,
                 status="pending_acceptance" if is_pay_at_cafe else "pending_verified",
                 created_at=datetime.utcnow()
             )
@@ -275,6 +281,7 @@ class BookingService:
                 "status": machine_status,
                 "booking_status": "pending_acceptance" if is_pay_at_cafe else "pending_verified",
                 "booking_mode": booking_mode,  # ✅ ADD MODE TO EVENT
+                "squad_details": squad_details or {},
                 "cid": cid,
             }
 
@@ -315,6 +322,13 @@ class BookingService:
                 booking = Booking.query.get(booking_id)
 
                 if booking and booking.status in ["pending_verified", "cancelled"]:
+                    squad_details = booking.squad_details if isinstance(booking.squad_details, dict) else {}
+                    slot_units = (
+                        max(1, int(squad_details.get("player_count") or squad_details.get("playerCount") or 1))
+                        if str(squad_details.get("console_group") or "").strip().lower() == "pc"
+                        and bool(squad_details.get("enabled") or int(squad_details.get("player_count") or squad_details.get("playerCount") or 1) > 1)
+                        else 1
+                    )
                     # ✅ Get vendor_id from available_games
                     available_game = db.session.execute(
                         text("SELECT vendor_id FROM available_games WHERE id = (SELECT gaming_type_id FROM slots WHERE id = :slot_id)"),
@@ -330,12 +344,12 @@ class BookingService:
                     # ✅ Restore `available_slot` in the table
                     update_query = text(f"""
                         UPDATE VENDOR_{vendor_id}_SLOT
-                        SET available_slot = available_slot + 1,
+                        SET available_slot = available_slot + :slot_units,
                             is_available = TRUE
                         WHERE slot_id = :slot_id
                         AND date = :book_date;
                     """)
-                    db.session.execute(update_query, {"slot_id": slot_id, "book_date": book_date})
+                    db.session.execute(update_query, {"slot_id": slot_id, "book_date": book_date, "slot_units": slot_units})
                     db.session.commit()
 
                     # ✅ Update booking status

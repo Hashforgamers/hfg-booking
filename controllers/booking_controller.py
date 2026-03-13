@@ -22,6 +22,7 @@ from models.paymentTransactionMapping import PaymentTransactionMapping
 from models.userHashCoin import UserHashCoin
 from models.accessBookingCode import AccessBookingCode
 from models.bookingExtraService  import BookingExtraService
+from models.bookingSquadMember import BookingSquadMember
 from models.extraServiceCategory import ExtraServiceCategory
 from models.extraServiceMenu import ExtraServiceMenu
 from models.passModels import UserPass
@@ -29,6 +30,7 @@ from models.consolePricingOffer import ConsolePricingOffer
 from models.controllerPricingRule import ControllerPricingRule
 from models.controllerPricingTier import ControllerPricingTier  # noqa: F401 (mapper registration)
 from models.vendorTaxProfile import VendorTaxProfile
+from models.squadPricingRule import SquadPricingRule
 from models.timeWallet import TimeWalletAccount, TimeWalletLedger
 from models.monthlyCredit import MonthlyCreditAccount, MonthlyCreditLedger
 from datetime import datetime, timedelta, timezone
@@ -37,6 +39,19 @@ from flask import current_app, jsonify
 from sqlalchemy.orm import joinedload
 
 IST = pytz.timezone("Asia/Kolkata")
+
+# Squad platform policy (backend source of truth).
+# Discount rule-engine applies only to PC squad bookings.
+SQUAD_PLATFORM_RULES = {
+    "pc": {"enabled": True, "max_players": 10, "pricing_mode": "squad_discount"},
+    "ps": {"enabled": True, "max_players": 4, "pricing_mode": "controller_pricing"},
+    "xbox": {"enabled": True, "max_players": 4, "pricing_mode": "controller_pricing"},
+    "vr": {"enabled": False, "max_players": 1, "pricing_mode": "solo_only"},
+}
+
+DEFAULT_SQUAD_PRICING_POLICY = {
+    "pc": {2: 0, 3: 3, 4: 5, 5: 8, 6: 10, 7: 12, 8: 15, 9: 18, 10: 20},
+}
 
 from sqlalchemy.sql import text
 from sqlalchemy.orm import joinedload
@@ -117,6 +132,105 @@ def get_effective_price(vendor_id: int, available_game) -> float:
     return float(available_game.single_slot_price)
 
 
+def get_effective_price_for_schedule(vendor_id: int, available_game, booking_date, slot_obj=None) -> float:
+    """
+    Returns offered price for the selected booking date/slot window if an active pricing
+    offer exists for that schedule. Falls back to the game base price.
+    """
+    if not available_game:
+        return 0.0
+
+    try:
+        if isinstance(booking_date, str):
+            booking_date = datetime.strptime(booking_date, "%Y-%m-%d").date()
+    except ValueError:
+        return float(available_game.single_slot_price or 0.0)
+
+    slot_start = getattr(slot_obj, "start_time", None)
+    slot_end = getattr(slot_obj, "end_time", None)
+
+    query = (
+        ConsolePricingOffer.query
+        .filter(
+            ConsolePricingOffer.vendor_id == vendor_id,
+            ConsolePricingOffer.available_game_id == available_game.id,
+            ConsolePricingOffer.is_active == True,
+            ConsolePricingOffer.start_date <= booking_date,
+            ConsolePricingOffer.end_date >= booking_date,
+        )
+    )
+
+    if slot_start is not None and slot_end is not None:
+        query = query.filter(
+            or_(
+                and_(
+                    ConsolePricingOffer.start_date == ConsolePricingOffer.end_date,
+                    ConsolePricingOffer.start_time <= slot_start,
+                    ConsolePricingOffer.end_time >= slot_end,
+                ),
+                and_(
+                    ConsolePricingOffer.start_date == booking_date,
+                    ConsolePricingOffer.end_date > booking_date,
+                    ConsolePricingOffer.start_time <= slot_start,
+                ),
+                and_(
+                    ConsolePricingOffer.start_date < booking_date,
+                    ConsolePricingOffer.end_date == booking_date,
+                    ConsolePricingOffer.end_time >= slot_end,
+                ),
+                and_(
+                    ConsolePricingOffer.start_date < booking_date,
+                    ConsolePricingOffer.end_date > booking_date,
+                )
+            )
+        )
+
+    current_offer = query.order_by(ConsolePricingOffer.offered_price.asc()).first()
+    if current_offer is not None:
+        return float(current_offer.offered_price)
+    return float(available_game.single_slot_price or 0.0)
+
+
+def _resolve_available_game_for_vendor(vendor_id: int, console_type: str = None, console_id: int = None, game_id: int = None):
+    """
+    Resolve the available game row using explicit game_id first, then console_id, then console type.
+    Mirrors the dashboard booking resolution strategy so app preview stays aligned.
+    """
+    resolved_game = None
+
+    if game_id:
+        resolved_game = db.session.query(AvailableGame).filter_by(vendor_id=vendor_id, id=game_id).first()
+        if resolved_game:
+            return resolved_game
+
+    if console_id:
+        resolved_game = db.session.query(AvailableGame).filter_by(vendor_id=vendor_id, id=console_id).first()
+        if resolved_game:
+            return resolved_game
+
+    console_type_lower = str(console_type or "").strip().lower()
+    if not console_type_lower:
+        return db.session.query(AvailableGame).filter_by(vendor_id=vendor_id).first()
+
+    pattern_groups = {
+        "pc": ["%pc%", "%gaming%", "%computer%"],
+        "ps5": ["%ps5%", "%playstation%", "%sony%"],
+        "ps": ["%ps%", "%playstation%", "%sony%"],
+        "xbox": ["%xbox%", "%microsoft%"],
+        "vr": ["%vr%", "%virtual%", "%reality%"],
+    }
+
+    for pattern in pattern_groups.get(console_type_lower, [f"%{console_type_lower}%"]):
+        resolved_game = db.session.query(AvailableGame).filter(
+            AvailableGame.vendor_id == vendor_id,
+            AvailableGame.game_name.ilike(pattern)
+        ).first()
+        if resolved_game:
+            return resolved_game
+
+    return db.session.query(AvailableGame).filter_by(vendor_id=vendor_id).first()
+
+
 def calculate_extra_controller_fare(vendor_id: int, available_game_id: int, quantity: int):
     """
     Calculate controller fare using tiered pricing rules.
@@ -156,6 +270,78 @@ def calculate_extra_controller_fare(vendor_id: int, available_game_id: int, quan
 def is_controller_pricing_supported(console_name: str) -> bool:
     value = str(console_name or "").strip().lower()
     return ("ps" in value) or ("xbox" in value)
+
+
+def _resolve_console_group(console_name: str) -> str:
+    value = str(console_name or "").strip().lower()
+    if "ps" in value:
+        return "ps"
+    if "xbox" in value:
+        return "xbox"
+    if "vr" in value:
+        return "vr"
+    if "pc" in value:
+        return "pc"
+    return "unknown"
+
+
+def _load_squad_pricing_policy(vendor_id: int):
+    policy = {
+        group: {int(players): float(discount) for players, discount in values.items()}
+        for group, values in DEFAULT_SQUAD_PRICING_POLICY.items()
+    }
+    rows = (
+        SquadPricingRule.query
+        .filter_by(vendor_id=vendor_id, is_active=True)
+        .all()
+    )
+    if not rows:
+        return policy
+
+    for group in list(policy.keys()):
+        policy[group] = {}
+
+    for row in rows:
+        group = str(row.console_group or "").strip().lower()
+        if group != "pc":
+            continue
+        max_rule_players = int(SQUAD_PLATFORM_RULES["pc"]["max_players"])
+        if int(row.player_count) < 2 or int(row.player_count) > max_rule_players:
+            continue
+        policy[group][int(row.player_count)] = float(row.discount_percent or 0)
+
+    if not policy.get("pc"):
+        defaults = DEFAULT_SQUAD_PRICING_POLICY["pc"]
+        policy["pc"] = {int(k): float(v) for k, v in defaults.items()}
+
+    return policy
+
+
+def _max_players_for_console(console_name: str, policy: dict = None) -> int:
+    group = _resolve_console_group(console_name)
+    rules = SQUAD_PLATFORM_RULES.get(group)
+    if not rules:
+        return 1
+    return int(rules.get("max_players", 1))
+
+
+def _resolve_squad_discount_percent(console_name: str, player_count: int, policy: dict = None) -> float:
+    if player_count <= 1:
+        return 0.0
+    group = _resolve_console_group(console_name)
+    if group != "pc":
+        return 0.0
+    source = policy or DEFAULT_SQUAD_PRICING_POLICY
+    grid = source.get(group, {})
+    if not grid:
+        return 0.0
+    capped_players = max(2, min(int(player_count), max(grid.keys())))
+    return float(grid.get(capped_players, 0.0))
+
+
+def _resolve_squad_pricing_mode(console_name: str) -> str:
+    group = _resolve_console_group(console_name)
+    return str(SQUAD_PLATFORM_RULES.get(group, {}).get("pricing_mode", "solo_only"))
 
 
 def _safe_decode_jwt_claims(token: str):
@@ -207,11 +393,13 @@ def resolve_transaction_actor(request_obj):
 
 def normalize_payment_use_case(payment_type: str, source_channel: str) -> str:
     pt = str(payment_type or "").strip().lower()
+    if pt in {"monthly_credit", "credit", "month_end"}:
+        return "monthly_credit"
     if pt == "cash":
         return "pay_at_cafe" if source_channel == "app" else "cash"
     if pt == "upi":
         return "upi"
-    if pt in {"card", "cards", "credit", "credit_card", "debit", "debit_card"}:
+    if pt in {"card", "cards", "credit_card", "debit", "debit_card"}:
         return "card"
     if pt in {"pass", "date_pass", "hour_pass"}:
         return "pass"
@@ -219,9 +407,25 @@ def normalize_payment_use_case(payment_type: str, source_channel: str) -> str:
         return "hash_wallet"
     if pt in {"gateway", "payment_gateway", "paid", "online"}:
         return "payment_gateway"
-    if pt in {"monthly_credit", "credit", "month_end"}:
-        return "monthly_credit"
     return pt or "unknown"
+
+
+def validate_monthly_credit_capacity(credit_account, requested_charge: float):
+    requested_charge = max(float(requested_charge or 0.0), 0.0)
+    outstanding_amount = float(getattr(credit_account, "outstanding_amount", 0.0) or 0.0)
+    credit_limit = float(getattr(credit_account, "credit_limit", 0.0) or 0.0)
+    available_credit = max(credit_limit - outstanding_amount, 0.0)
+
+    if requested_charge > available_credit:
+        return {
+            "success": False,
+            "message": "Monthly credit limit exceeded for this customer.",
+            "credit_limit": round(credit_limit, 2),
+            "current_outstanding": round(outstanding_amount, 2),
+            "requested_charge": round(requested_charge, 2),
+            "available_credit": round(available_credit, 2),
+        }
+    return None
 
 
 def resolve_settlement_status(payment_use_case: str) -> str:
@@ -232,6 +436,188 @@ def resolve_settlement_status(payment_use_case: str) -> str:
     if payment_use_case in {"cash", "upi", "card", "payment_gateway", "hash_wallet", "pass"}:
         return "completed"
     return "pending"
+
+
+def _resolve_or_create_squad_member_user(member_name: str, member_phone: str):
+    phone = str(member_phone or "").strip()
+    name = str(member_name or "").strip()
+    if not phone:
+        return None
+
+    contact_match = ContactInfo.query.filter(
+        and_(
+            ContactInfo.parent_type == "user",
+            ContactInfo.phone == phone,
+        )
+    ).first()
+    if contact_match and contact_match.parent_id:
+        return int(contact_match.parent_id)
+
+    safe_phone = "".join(ch for ch in phone if ch.isdigit())[-10:] or str(random.randint(1000000000, 9999999999))
+    base_email = f"squad+{safe_phone}@hash.local"
+    email_candidate = base_email
+    suffix = 1
+    while ContactInfo.query.filter(
+        and_(
+            ContactInfo.parent_type == "user",
+            ContactInfo.email == email_candidate,
+        )
+    ).first():
+        email_candidate = f"squad+{safe_phone}.{suffix}@hash.local"
+        suffix += 1
+
+    username_base = "".join(ch for ch in (name.lower() or "player") if ch.isalnum())[:16] or "player"
+    game_username = f"{username_base}_{random.randint(1000, 9999)}"
+    while User.query.filter(User.game_username == game_username).first():
+        game_username = f"{username_base}_{random.randint(1000, 9999)}"
+
+    new_user = User(
+        fid=generate_fid(),
+        avatar_path="Not defined",
+        name=name or f"Player {safe_phone[-4:]}",
+        game_username=game_username,
+        parent_type="user",
+    )
+    new_contact = ContactInfo(
+        phone=phone,
+        email=email_candidate,
+        parent_type="user",
+    )
+    new_user.contact_info = new_contact
+    db.session.add(new_user)
+    db.session.flush()
+    return int(new_user.id)
+
+
+def _normalize_squad_booking_payload(
+    squad_payload,
+    console_name: str,
+    vendor_policy: dict = None,
+):
+    if not isinstance(squad_payload, dict):
+        raise ValueError("squad_details must be an object")
+
+    squad_enabled = bool(squad_payload.get("enabled", False))
+    try:
+        squad_player_count = int(
+            squad_payload.get("player_count")
+            or squad_payload.get("playerCount")
+            or 1
+        )
+    except (TypeError, ValueError):
+        raise ValueError("squad_details.player_count must be a valid integer")
+
+    try:
+        suggested_extra_controller_qty = int(
+            squad_payload.get("suggested_extra_controller_qty")
+            or squad_payload.get("suggestedExtraControllerQty")
+            or 0
+        )
+    except (TypeError, ValueError):
+        raise ValueError("squad_details.suggested_extra_controller_qty must be a valid integer")
+
+    raw_members = squad_payload.get("members", [])
+    if raw_members is None:
+        raw_members = []
+    if not isinstance(raw_members, list):
+        raise ValueError("squad_details.members must be an array")
+
+    normalized_members = []
+    for member in raw_members[:20]:
+        if not isinstance(member, dict):
+            continue
+        member_name = str(member.get("name", "")).strip()
+        member_phone = str(member.get("phone", "")).strip()
+        if not member_name and not member_phone:
+            continue
+        if not member_name or not member_phone:
+            raise ValueError("Each squad member must include both name and phone")
+        normalized_members.append({
+            "name": member_name[:120],
+            "phone": member_phone[:32],
+        })
+
+    normalized_details = {
+        "enabled": squad_enabled,
+        "player_count": max(squad_player_count, 1),
+        "suggested_extra_controller_qty": max(suggested_extra_controller_qty, 0),
+        "members": normalized_members,
+    }
+
+    if not squad_enabled:
+        return normalized_details
+
+    console_group = _resolve_console_group(console_name or "")
+    group_rules = SQUAD_PLATFORM_RULES.get(
+        console_group,
+        {"enabled": False, "max_players": 1, "pricing_mode": "solo_only"},
+    )
+    max_players = int(group_rules.get("max_players", 1))
+    pricing_mode = str(group_rules.get("pricing_mode", "solo_only"))
+
+    if not bool(group_rules.get("enabled")):
+        raise ValueError(f"Squad booking is not supported for {console_name}")
+    if normalized_details["player_count"] < 2:
+        raise ValueError("Squad booking requires at least 2 players")
+    if normalized_details["player_count"] > max_players:
+        raise ValueError(f"Squad player count cannot exceed {max_players} for this console type")
+
+    discount_pct = _resolve_squad_discount_percent(
+        console_name or "",
+        normalized_details["player_count"],
+        policy=vendor_policy,
+    )
+    normalized_details["console_group"] = console_group
+    normalized_details["max_players_for_console"] = max_players
+    normalized_details["pricing_mode"] = pricing_mode
+    normalized_details["discount_percent"] = discount_pct
+
+    if pricing_mode == "controller_pricing":
+        normalized_details["suggested_extra_controller_qty"] = max(
+            normalized_details["suggested_extra_controller_qty"],
+            normalized_details["player_count"] - 1,
+        )
+
+    return normalized_details
+
+
+def _build_squad_member_bindings(captain_user, captain_name: str, captain_phone: str, normalized_squad_details: dict):
+    if not normalized_squad_details or not bool(normalized_squad_details.get("enabled")):
+        return []
+
+    bindings = [{
+        "member_user_id": int(captain_user.id),
+        "member_position": 1,
+        "is_captain": True,
+        "name_snapshot": str(captain_name or getattr(captain_user, "name", "") or "Captain").strip()[:255] or "Captain",
+        "phone_snapshot": str(captain_phone or "").strip()[:50],
+    }]
+
+    phone_binding_cache = {}
+    for idx, member in enumerate(normalized_squad_details.get("members", []), start=2):
+        member_phone = str(member.get("phone", "")).strip()[:50]
+        member_name = str(member.get("name", "")).strip()[:255]
+        resolved_user_id = None
+        if member_phone:
+            if member_phone in phone_binding_cache:
+                resolved_user_id = phone_binding_cache[member_phone]
+            else:
+                resolved_user_id = _resolve_or_create_squad_member_user(member_name, member_phone)
+                phone_binding_cache[member_phone] = resolved_user_id
+        bindings.append({
+            "member_user_id": resolved_user_id,
+            "member_position": idx,
+            "is_captain": False,
+            "name_snapshot": member_name,
+            "phone_snapshot": member_phone,
+        })
+
+    normalized_squad_details["member_user_ids"] = [
+        int(binding["member_user_id"])
+        for binding in bindings
+        if binding.get("member_user_id")
+    ]
+    return bindings
 
 
 def _is_slot_live_now_ist(slot_date, start_time, end_time) -> bool:
@@ -251,13 +637,22 @@ def _reserve_specific_console(vendor_id: int, game_id: int, console_id: int):
     table_name = f"VENDOR_{vendor_id}_CONSOLE_AVAILABILITY"
     row = db.session.execute(
         text(f"""
-            UPDATE {table_name}
+            WITH candidate AS (
+                SELECT console_id
+                FROM {table_name}
+                WHERE vendor_id = :vendor_id
+                  AND game_id = :game_id
+                  AND console_id = :console_id
+                  AND is_available = TRUE
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE {table_name} c
             SET is_available = FALSE
-            WHERE vendor_id = :vendor_id
-              AND game_id = :game_id
-              AND console_id = :console_id
-              AND is_available = TRUE
-            RETURNING console_id
+            FROM candidate
+            WHERE c.vendor_id = :vendor_id
+              AND c.console_id = candidate.console_id
+            RETURNING c.console_id
         """),
         {"vendor_id": vendor_id, "game_id": game_id, "console_id": console_id},
     ).fetchone()
@@ -288,6 +683,585 @@ def _reserve_any_console(vendor_id: int, game_id: int):
         {"vendor_id": vendor_id, "game_id": game_id},
     ).fetchone()
     return int(row[0]) if row else None
+
+
+def _reserve_multiple_consoles(vendor_id: int, game_id: int, quantity: int):
+    if int(quantity or 0) <= 0:
+        return []
+    table_name = f"VENDOR_{vendor_id}_CONSOLE_AVAILABILITY"
+    rows = db.session.execute(
+        text(f"""
+            WITH candidate AS (
+                SELECT console_id
+                FROM {table_name}
+                WHERE vendor_id = :vendor_id
+                  AND game_id = :game_id
+                  AND is_available = TRUE
+                ORDER BY console_id
+                LIMIT :quantity
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE {table_name} c
+            SET is_available = FALSE
+            FROM candidate
+            WHERE c.vendor_id = :vendor_id
+              AND c.console_id = candidate.console_id
+            RETURNING c.console_id
+        """),
+        {"vendor_id": vendor_id, "game_id": game_id, "quantity": int(quantity)},
+    ).fetchall()
+
+    reserved_ids = []
+    seen = set()
+    for row in rows or []:
+        cid = int(row[0])
+        if cid in seen:
+            continue
+        seen.add(cid)
+        reserved_ids.append(cid)
+    return reserved_ids
+
+
+def _release_reserved_consoles(vendor_id: int, console_ids):
+    cleaned_ids = [int(cid) for cid in (console_ids or []) if cid is not None]
+    if not cleaned_ids:
+        return
+    table_name = f"VENDOR_{vendor_id}_CONSOLE_AVAILABILITY"
+    db.session.execute(
+        text(f"""
+            UPDATE {table_name}
+            SET is_available = TRUE
+            WHERE vendor_id = :vendor_id
+              AND console_id = ANY(:console_ids)
+        """),
+        {"vendor_id": vendor_id, "console_ids": cleaned_ids},
+    )
+
+
+@booking_blueprint.route('/vendor/<int:vendor_id>/squad-pricing-policy', methods=['GET'])
+def get_squad_pricing_policy(vendor_id):
+    """
+    Return current squad pricing matrix.
+    This is a backend source-of-truth policy for frontend previews.
+    """
+    try:
+        available_games = (
+            AvailableGame.query
+            .filter(AvailableGame.vendor_id == vendor_id)
+            .all()
+        )
+        console_groups = sorted({
+            _resolve_console_group(game.game_name or "")
+            for game in available_games
+        })
+        if not console_groups:
+            console_groups = sorted(DEFAULT_SQUAD_PRICING_POLICY.keys())
+        policy = _load_squad_pricing_policy(vendor_id)
+
+        return jsonify({
+            "success": True,
+            "policy": {
+                group: {str(k): float(v) for k, v in values.items()}
+                for group, values in policy.items()
+            },
+            "available_console_groups": console_groups,
+            "platform_rules": SQUAD_PLATFORM_RULES,
+            "rule_engine_scope": ["pc"],
+            "discount_basis": "slot_base_only",
+            "note": "Discount applies per slot on console base amount only. Meals/controllers are excluded."
+        }), 200
+    except Exception as e:
+        current_app.logger.error(f"Failed to fetch squad pricing policy: {str(e)}")
+        return jsonify({"success": False, "message": "Failed to fetch squad pricing policy"}), 500
+
+
+@booking_blueprint.route('/bookings/pricing-preview', methods=['POST'])
+def booking_pricing_preview():
+    try:
+        data = request.get_json(force=True) or {}
+
+        vendor_id = data.get("vendor_id")
+        game_id = data.get("game_id")
+        console_id = data.get("console_id") or data.get("consoleId")
+        console_type = data.get("console_type") or data.get("consoleType")
+        book_date_str = data.get("book_date")
+        raw_slot_ids = data.get("slot_id") or data.get("slot_ids") or []
+        raw_selected_slots = data.get("selected_slots") or data.get("selectedSlots") or []
+        slot_count = data.get("slot_count") or data.get("slotCount")
+        squad_payload = data.get("squad_details") or data.get("squadDetails") or {}
+        selected_meals = data.get("selected_meals") or data.get("selectedMeals") or []
+        waive_off_total = float(data.get("waive_off_amount") or data.get("waiveOffAmount") or 0.0)
+
+        if not vendor_id or not book_date_str or (not raw_slot_ids and not raw_selected_slots and not slot_count):
+            return jsonify({
+                "success": False,
+                "message": "vendor_id, book_date and one of slot_id, selected_slots or slot_count are required"
+            }), 400
+
+        try:
+            vendor_id = int(vendor_id)
+        except (TypeError, ValueError):
+            return jsonify({"success": False, "message": "vendor_id must be a valid integer"}), 400
+
+        slot_ids = []
+        if raw_slot_ids:
+            if isinstance(raw_slot_ids, int):
+                slot_ids = [raw_slot_ids]
+            elif isinstance(raw_slot_ids, list):
+                slot_ids = raw_slot_ids
+            else:
+                return jsonify({"success": False, "message": "slot_id must be a list or integer"}), 400
+
+            try:
+                slot_ids = [int(slot_id) for slot_id in slot_ids]
+            except (TypeError, ValueError):
+                return jsonify({"success": False, "message": "slot_id contains invalid values"}), 400
+
+        try:
+            if "T" in str(book_date_str):
+                book_date = datetime.fromisoformat(str(book_date_str)).date()
+            else:
+                book_date = datetime.strptime(str(book_date_str), "%Y-%m-%d").date()
+        except ValueError:
+            return jsonify({"success": False, "message": "Invalid book_date format"}), 400
+
+        available_game = _resolve_available_game_for_vendor(
+            vendor_id=vendor_id,
+            console_type=console_type,
+            console_id=console_id,
+            game_id=game_id,
+        )
+        if not available_game:
+            return jsonify({"success": False, "message": "Game not found for this vendor"}), 404
+
+        vendor_squad_policy = _load_squad_pricing_policy(vendor_id)
+        try:
+            normalized_squad_details = _normalize_squad_booking_payload(
+                squad_payload,
+                available_game.game_name or "",
+                vendor_policy=vendor_squad_policy,
+            )
+        except ValueError as squad_error:
+            return jsonify({"success": False, "message": str(squad_error)}), 400
+
+        squad_enabled = bool(normalized_squad_details.get("enabled"))
+        console_group = str(
+            normalized_squad_details.get("console_group") or _resolve_console_group(available_game.game_name or "")
+        ).strip().lower()
+        is_pc_squad = bool(squad_enabled and console_group == "pc")
+        squad_player_count = int(normalized_squad_details.get("player_count") or normalized_squad_details.get("playerCount") or 1)
+        slot_units_required = squad_player_count if is_pc_squad else 1
+        squad_discount_percent = float(normalized_squad_details.get("discount_percent") or 0.0)
+
+        def _parse_preview_time(value):
+            if value is None:
+                return None
+            value = str(value).strip()
+            for fmt in ("%H:%M:%S", "%H:%M"):
+                try:
+                    return datetime.strptime(value, fmt).time()
+                except ValueError:
+                    continue
+            return None
+
+        slot_entries = []
+        if slot_ids:
+            slot_rows = Slot.query.filter(Slot.id.in_(slot_ids)).all()
+            slot_map = {int(slot.id): slot for slot in slot_rows}
+            missing_slots = [slot_id for slot_id in slot_ids if slot_id not in slot_map]
+            if missing_slots:
+                return jsonify({
+                    "success": False,
+                    "message": "One or more slots were not found",
+                    "missing_slot_ids": missing_slots,
+                }), 404
+            for slot_id in slot_ids:
+                slot_entries.append({
+                    "slot_id": int(slot_id),
+                    "slot_obj": slot_map[slot_id],
+                    "availability_check": True,
+                })
+        elif raw_selected_slots:
+            if not isinstance(raw_selected_slots, list):
+                return jsonify({"success": False, "message": "selected_slots must be an array"}), 400
+
+            fallback_slots = Slot.query.filter(Slot.gaming_type_id == available_game.id).all()
+            for idx, raw_slot in enumerate(raw_selected_slots, start=1):
+                start_time = None
+                end_time = None
+                slot_id = None
+                matched_slot = None
+
+                if isinstance(raw_slot, dict):
+                    slot_id = raw_slot.get("slot_id") or raw_slot.get("slotId")
+                    start_time = _parse_preview_time(raw_slot.get("start_time") or raw_slot.get("startTime"))
+                    end_time = _parse_preview_time(raw_slot.get("end_time") or raw_slot.get("endTime"))
+                elif isinstance(raw_slot, str):
+                    normalized = raw_slot.strip()
+                    if "-" in normalized:
+                        parts = [part.strip() for part in normalized.split("-", 1)]
+                        start_time = _parse_preview_time(parts[0])
+                        end_time = _parse_preview_time(parts[1])
+                    else:
+                        start_time = _parse_preview_time(normalized)
+                else:
+                    return jsonify({"success": False, "message": "selected_slots contains invalid entries"}), 400
+
+                if slot_id is not None:
+                    try:
+                        slot_id = int(slot_id)
+                    except (TypeError, ValueError):
+                        return jsonify({"success": False, "message": "selected_slots.slot_id must be a valid integer"}), 400
+                    matched_slot = Slot.query.filter_by(id=slot_id, gaming_type_id=available_game.id).first()
+                    if not matched_slot:
+                        return jsonify({"success": False, "message": f"Slot {slot_id} not found for selected console"}), 404
+                    if start_time is None:
+                        start_time = matched_slot.start_time
+                    if end_time is None:
+                        end_time = matched_slot.end_time
+                else:
+                    for candidate in fallback_slots:
+                        if start_time is not None and candidate.start_time != start_time:
+                            continue
+                        if end_time is not None and candidate.end_time != end_time:
+                            continue
+                        matched_slot = candidate
+                        break
+
+                if start_time is None and matched_slot is not None:
+                    start_time = matched_slot.start_time
+                if end_time is None and matched_slot is not None:
+                    end_time = matched_slot.end_time
+                if start_time is None or end_time is None:
+                    return jsonify({
+                        "success": False,
+                        "message": "Each selected slot must include start_time and end_time when slot_id is not provided"
+                    }), 400
+
+                slot_entries.append({
+                    "slot_id": int(matched_slot.id) if matched_slot else None,
+                    "slot_obj": matched_slot or type("PreviewSlot", (), {
+                        "id": None,
+                        "start_time": start_time,
+                        "end_time": end_time
+                    })(),
+                    "availability_check": bool(matched_slot),
+                })
+        else:
+            try:
+                slot_count = int(slot_count or 0)
+            except (TypeError, ValueError):
+                return jsonify({"success": False, "message": "slot_count must be a valid integer"}), 400
+            if slot_count <= 0:
+                return jsonify({"success": False, "message": "slot_count must be greater than 0"}), 400
+
+            first_slot = (
+                Slot.query
+                .filter(Slot.gaming_type_id == available_game.id)
+                .order_by(Slot.start_time.asc())
+                .first()
+            )
+            if not first_slot:
+                return jsonify({"success": False, "message": "No slots configured for this console"}), 404
+
+            for index in range(slot_count):
+                slot_entries.append({
+                    "slot_id": None,
+                    "slot_obj": first_slot,
+                    "availability_check": False,
+                    "sequence": index + 1,
+                })
+
+        total_meals_cost = 0.0
+        meal_breakdown = []
+        for meal in selected_meals:
+            menu_item_id = meal.get("menu_item_id") or meal.get("item_id")
+            quantity = meal.get("quantity", 1)
+            try:
+                quantity = int(quantity or 1)
+            except (TypeError, ValueError):
+                return jsonify({"success": False, "message": "Meal quantity must be a valid integer"}), 400
+            if not menu_item_id or quantity <= 0:
+                return jsonify({"success": False, "message": "Invalid meal data provided"}), 400
+
+            menu_item = db.session.query(ExtraServiceMenu).join(
+                ExtraServiceCategory
+            ).filter(
+                ExtraServiceMenu.id == int(menu_item_id),
+                ExtraServiceCategory.vendor_id == vendor_id,
+                ExtraServiceMenu.is_active == True,
+                ExtraServiceCategory.is_active == True
+            ).first()
+
+            if not menu_item:
+                return jsonify({
+                    "success": False,
+                    "message": f"Invalid or inactive menu item {menu_item_id} for this vendor"
+                }), 400
+
+            item_total = float(menu_item.price or 0.0) * quantity
+            total_meals_cost += item_total
+            meal_breakdown.append({
+                "menu_item_id": int(menu_item.id),
+                "name": menu_item.name,
+                "quantity": quantity,
+                "unit_price": float(menu_item.price or 0.0),
+                "total_price": round(item_total, 2),
+            })
+
+        try:
+            requested_extra_controller_qty = int(
+                data.get("extra_controller_qty")
+                or data.get("extraControllerQty")
+                or 0
+            )
+        except (TypeError, ValueError):
+            return jsonify({"success": False, "message": "extra_controller_qty must be a valid integer"}), 400
+        if requested_extra_controller_qty < 0:
+            return jsonify({"success": False, "message": "extra_controller_qty cannot be negative"}), 400
+
+        if squad_enabled and console_group in {"ps", "xbox"}:
+            requested_extra_controller_qty = max(requested_extra_controller_qty, squad_player_count - 1)
+        elif not is_controller_pricing_supported(available_game.game_name):
+            requested_extra_controller_qty = 0
+
+        extra_controller_fare = 0.0
+        if requested_extra_controller_qty > 0:
+            computed_controller_fare = calculate_extra_controller_fare(
+                vendor_id=vendor_id,
+                available_game_id=available_game.id,
+                quantity=requested_extra_controller_qty,
+            )
+            if computed_controller_fare is None:
+                return jsonify({
+                    "success": False,
+                    "message": "Controller pricing is not configured for this console type."
+                }), 400
+            extra_controller_fare = float(computed_controller_fare or 0.0)
+
+        slot_breakdown = []
+        total_base_before_discount = 0.0
+        total_discount = 0.0
+
+        for entry in slot_entries:
+            slot_obj = entry["slot_obj"]
+            slot_id = entry.get("slot_id")
+            effective_price = get_effective_price_for_schedule(vendor_id, available_game, book_date, slot_obj)
+            slot_base_price = float(effective_price or 0.0) * (squad_player_count if is_pc_squad else 1)
+            slot_discount = (
+                (slot_base_price * squad_discount_percent / 100.0)
+                if is_pc_squad and str(normalized_squad_details.get("pricing_mode") or "") == "squad_discount"
+                else 0.0
+            )
+
+            available_slot = None
+            slot_is_available = None
+            if entry.get("availability_check") and slot_id is not None:
+                availability_row = db.session.execute(
+                    text(f"""
+                        SELECT available_slot, is_available
+                        FROM VENDOR_{vendor_id}_SLOT
+                        WHERE slot_id = :slot_id AND date = :book_date
+                    """),
+                    {"slot_id": slot_id, "book_date": book_date}
+                ).fetchone()
+
+                available_slot = int(availability_row[0]) if availability_row and availability_row[0] is not None else None
+                slot_is_available = bool(availability_row[1]) if availability_row and availability_row[1] is not None else False
+
+            total_base_before_discount += slot_base_price
+            total_discount += slot_discount
+            slot_breakdown.append({
+                "slot_id": int(slot_id) if slot_id is not None else None,
+                "start_time": str(slot_obj.start_time),
+                "end_time": str(slot_obj.end_time),
+                "slot_unit_price": round(float(effective_price or 0.0), 2),
+                "slot_base_price": round(float(slot_base_price or 0.0), 2),
+                "slot_discount_amount": round(float(slot_discount or 0.0), 2),
+                "slot_final_amount": round(max(float(slot_base_price or 0.0) - float(slot_discount or 0.0), 0.0), 2),
+                "available_slot": available_slot,
+                "slot_units_required": int(slot_units_required),
+                "can_book": (
+                    bool(available_slot is not None and available_slot >= slot_units_required and slot_is_available)
+                    if entry.get("availability_check")
+                    else None
+                ),
+            })
+
+        final_amount = max(
+            float(total_base_before_discount)
+            - float(total_discount)
+            - float(waive_off_total or 0.0)
+            + float(total_meals_cost or 0.0)
+            + float(extra_controller_fare or 0.0),
+            0.0
+        )
+
+        if squad_enabled:
+            normalized_squad_details["discount_per_slot"] = round(
+                (slot_breakdown[0]["slot_discount_amount"] if slot_breakdown else 0.0), 2
+            )
+            normalized_squad_details["total_discount"] = round(float(total_discount or 0.0), 2)
+            normalized_squad_details["slot_base_multiplier"] = int(squad_player_count if is_pc_squad else 1)
+            normalized_squad_details["applied_extra_controller_qty"] = int(requested_extra_controller_qty)
+
+        return jsonify({
+            "success": True,
+            "vendor_id": vendor_id,
+            "matched_game_id": int(available_game.id),
+            "matched_game_name": available_game.game_name,
+            "book_date": str(book_date),
+            "slot_breakdown": slot_breakdown,
+            "squad_details": normalized_squad_details if squad_enabled else {
+                "enabled": False,
+                "player_count": 1,
+                "suggested_extra_controller_qty": 0,
+                "members": [],
+            },
+            "pricing_engine": {
+                "slot_base_total": round(float(total_base_before_discount or 0.0), 2),
+                "squad_discount_percent": round(float(squad_discount_percent or 0.0), 2),
+                "squad_discount_amount": round(float(total_discount or 0.0), 2),
+                "manual_waive_off_amount": round(float(waive_off_total or 0.0), 2),
+                "meals_total": round(float(total_meals_cost or 0.0), 2),
+                "extra_controller_qty": int(requested_extra_controller_qty),
+                "extra_controller_total": round(float(extra_controller_fare or 0.0), 2),
+                "final_amount": round(float(final_amount or 0.0), 2),
+            },
+            "meal_breakdown": meal_breakdown,
+        }), 200
+
+    except Exception as e:
+        current_app.logger.exception("Failed to build booking pricing preview")
+        return jsonify({
+            "success": False,
+            "message": "Failed to build booking pricing preview",
+            "error": str(e),
+        }), 500
+
+
+@booking_blueprint.route('/bookings/pricing-estimate', methods=['GET'])
+def booking_pricing_estimate():
+    try:
+        payload = request.get_json(silent=True) or {}
+        query = request.args
+
+        vendor_id = query.get("vendor_id", payload.get("vendor_id"))
+        game_id = query.get("game_id", payload.get("game_id"))
+        console_type = query.get("consoleType") or query.get("console_type") or payload.get("consoleType") or payload.get("console_type")
+        squad_payload = payload.get("squadDetails") or payload.get("squad_details") or {}
+        if not squad_payload:
+            squad_enabled_raw = query.get("squadEnabled", query.get("enabled", payload.get("squadEnabled", payload.get("enabled"))))
+            player_count_raw = query.get("playerCount", query.get("player_count", payload.get("playerCount", payload.get("player_count"))))
+            squad_payload = {
+                "enabled": str(squad_enabled_raw).lower() == "true" if squad_enabled_raw is not None else False,
+                "player_count": player_count_raw or 1,
+            }
+
+        if not vendor_id:
+            return jsonify({"success": False, "message": "vendor_id is required"}), 400
+
+        try:
+            vendor_id = int(vendor_id)
+        except (TypeError, ValueError):
+            return jsonify({"success": False, "message": "vendor_id must be a valid integer"}), 400
+
+        if game_id is not None:
+            try:
+                game_id = int(game_id)
+            except (TypeError, ValueError):
+                return jsonify({"success": False, "message": "game_id must be a valid integer"}), 400
+
+        available_game = _resolve_available_game_for_vendor(
+            vendor_id=vendor_id,
+            console_type=console_type,
+            game_id=game_id,
+        )
+        if not available_game:
+            return jsonify({"success": False, "message": "Game not found for this vendor"}), 404
+
+        vendor_squad_policy = _load_squad_pricing_policy(vendor_id)
+        try:
+            normalized_squad_details = _normalize_squad_booking_payload(
+                squad_payload,
+                available_game.game_name or "",
+                vendor_policy=vendor_squad_policy,
+            )
+        except ValueError as squad_error:
+            return jsonify({"success": False, "message": str(squad_error)}), 400
+
+        squad_enabled = bool(normalized_squad_details.get("enabled"))
+        console_group = str(
+            normalized_squad_details.get("console_group") or _resolve_console_group(available_game.game_name or "")
+        ).strip().lower()
+        is_pc_squad = bool(squad_enabled and console_group == "pc")
+        squad_player_count = int(normalized_squad_details.get("player_count") or normalized_squad_details.get("playerCount") or 1)
+        effective_price = get_effective_price(vendor_id, available_game)
+
+        slot_unit_price = float(effective_price or 0.0)
+        slot_base_price = slot_unit_price * (squad_player_count if is_pc_squad else 1)
+        squad_discount_percent = float(normalized_squad_details.get("discount_percent") or 0.0)
+        squad_discount_amount = (
+            (slot_base_price * squad_discount_percent / 100.0)
+            if is_pc_squad and str(normalized_squad_details.get("pricing_mode") or "") == "squad_discount"
+            else 0.0
+        )
+
+        extra_controller_qty = 0
+        extra_controller_fare = 0.0
+        if squad_enabled and console_group in {"ps", "xbox"}:
+            extra_controller_qty = max(0, squad_player_count - 1)
+            if extra_controller_qty > 0:
+                computed_controller_fare = calculate_extra_controller_fare(
+                    vendor_id=vendor_id,
+                    available_game_id=available_game.id,
+                    quantity=extra_controller_qty,
+                )
+                if computed_controller_fare is None:
+                    return jsonify({
+                        "success": False,
+                        "message": "Controller pricing is not configured for this console type."
+                    }), 400
+                extra_controller_fare = float(computed_controller_fare or 0.0)
+
+        estimated_final_amount = max((slot_base_price - squad_discount_amount) + extra_controller_fare, 0.0)
+
+        if squad_enabled:
+            normalized_squad_details["discount_per_slot"] = round(float(squad_discount_amount or 0.0), 2)
+            normalized_squad_details["slot_base_multiplier"] = int(squad_player_count if is_pc_squad else 1)
+            normalized_squad_details["applied_extra_controller_qty"] = int(extra_controller_qty)
+
+        return jsonify({
+            "success": True,
+            "vendor_id": vendor_id,
+            "matched_game_id": int(available_game.id),
+            "matched_game_name": available_game.game_name,
+            "estimate_scope": "per_slot",
+            "price_basis": "current_effective_price",
+            "squad_details": normalized_squad_details if squad_enabled else {
+                "enabled": False,
+                "player_count": 1,
+                "suggested_extra_controller_qty": 0,
+                "members": [],
+            },
+            "pricing_engine": {
+                "slot_unit_price": round(slot_unit_price, 2),
+                "slot_base_total": round(slot_base_price, 2),
+                "squad_discount_percent": round(squad_discount_percent, 2),
+                "squad_discount_amount": round(squad_discount_amount, 2),
+                "extra_controller_qty": int(extra_controller_qty),
+                "extra_controller_total": round(extra_controller_fare, 2),
+                "estimated_final_amount": round(estimated_final_amount, 2),
+            },
+        }), 200
+
+    except Exception as e:
+        current_app.logger.exception("Failed to build booking pricing estimate")
+        return jsonify({
+            "success": False,
+            "message": "Failed to build booking pricing estimate",
+            "error": str(e),
+        }), 500
 
 
 def calculate_slot_minutes(slot_obj: Slot) -> int:
@@ -535,6 +1509,7 @@ def create_booking():
     game_id = data.get("game_id")
     book_date = data.get("book_date")
     is_pay_at_cafe = data.get("is_pay_at_cafe", False)
+    squad_payload = data.get("squad_details") or data.get("squadDetails") or {}
 
     log.info("bookings.post.payload cid=%s slot_ids_len=%s game_id=%s book_date=%s",
              cid, (len(slot_ids) if isinstance(slot_ids, list) else None), game_id, book_date)
@@ -555,6 +1530,21 @@ def create_booking():
             return jsonify({"message": "Game not found"}), 404
 
         vendor_id = available_game.vendor_id
+        vendor_squad_policy = _load_squad_pricing_policy(vendor_id)
+        try:
+            normalized_squad_details = _normalize_squad_booking_payload(
+                squad_payload,
+                available_game.game_name or "",
+                vendor_policy=vendor_squad_policy,
+            )
+        except ValueError as squad_error:
+            return jsonify({"message": str(squad_error)}), 400
+        squad_enabled = bool(normalized_squad_details.get("enabled"))
+        slot_units = (
+            int(normalized_squad_details.get("player_count", 1))
+            if squad_enabled and str(normalized_squad_details.get("console_group", "")).lower() == "pc"
+            else 1
+        )
         log.info("bookings.post.vendor_resolved cid=%s vendor_id=%s", cid, vendor_id)
 
         booking_mappings = []
@@ -575,14 +1565,23 @@ def create_booking():
                 log.info("bookings.post.slot_check.result cid=%s slot_id=%s has_entry=%s entry=%s",
                          cid, slot_id, bool(slot_entry), (tuple(slot_entry) if slot_entry else None))
 
-                if slot_entry is None or slot_entry[0] <= 0 or not slot_entry:
+                if slot_entry is None or int(slot_entry[0] or 0) < slot_units or not slot_entry:
                     skipped += 1
                     log.info("bookings.post.slot_skipped cid=%s slot_id=%s reason=%s",
                              cid, slot_id,
-                             ("no_entry" if slot_entry is None else ("no_slots" if slot_entry <= 0 else "not_available")))
+                             ("no_entry" if slot_entry is None else ("no_slots" if int(slot_entry[0] or 0) < slot_units else "not_available")))
                     continue
 
-                booking = BookingService.create_booking(slot_id, game_id, user_id, socketio, book_date, is_pay_at_cafe)
+                booking = BookingService.create_booking(
+                    slot_id=slot_id,
+                    game_id=game_id,
+                    user_id=user_id,
+                    socketio=socketio,
+                    book_date=book_date,
+                    is_pay_at_cafe=is_pay_at_cafe,
+                    squad_details=normalized_squad_details if squad_enabled else None,
+                    slot_units=slot_units,
+                )
                 db.session.flush()
 
                 log.info("bookings.post.slot_booked cid=%s slot_id=%s booking_id=%s",
@@ -590,7 +1589,9 @@ def create_booking():
 
                 booking_mappings.append({
                     "slot_id": slot_id,
-                    "booking_id": booking.id
+                    "booking_id": booking.id,
+                    "slot_units": slot_units,
+                    "squad_details": normalized_squad_details if squad_enabled else {},
                 })
 
                 if scheduler:
@@ -625,7 +1626,8 @@ def create_booking():
         log.info("bookings.post.success cid=%s bookings=%s", cid, booking_mappings)
         return jsonify({
             "message": "Slots frozen",
-            "bookings": booking_mappings
+            "bookings": booking_mappings,
+            "squad_details": normalized_squad_details if squad_enabled else {},
         }), 200
 
     except Exception as e:
@@ -975,7 +1977,8 @@ def confirm_booking():
                 end_time=end_time_val,
                 console_id=console_id_val,
                 status="confirmed",
-                booking_status=booking_status_dim
+                booking_status=booking_status_dim,
+                squad_details=booking.squad_details or {}
             )
 
             # Emit after DB state is consistent; you can emit pre-commit if you prefer,
@@ -1044,6 +2047,7 @@ def confirm_booking():
         book_date_str = data.get('book_date')
         voucher_code = data.get('voucher_code')
         payment_mode = data.get('payment_mode', "payment_gateway")
+        squad_payload = data.get("squad_details") or data.get("squadDetails") or None
         
         # NEW: Hour-based pass parameters
         use_hour_pass = bool(data.get('use_hour_pass', False))
@@ -1119,6 +2123,7 @@ def confirm_booking():
         pass_used_id = None
         hour_pass_used = None
         amount_payable = 0
+        total_amount_paid = 0.0
         total_hours_deducted = Decimal('0')
         mail_jobs = []
         voucher_used = False
@@ -1128,11 +2133,40 @@ def confirm_booking():
             .options(
                 joinedload(Booking.game),
                 joinedload(Booking.slot),
+                joinedload(Booking.squad_members),
             )
             .filter(Booking.id.in_(booking_ids))
             .all()
         )
+        if not booking_objects:
+            return jsonify({'message': 'No pending bookings found for confirmation'}), 404
         booking_map = {b.id: b for b in booking_objects}
+        first_booking = booking_objects[0] if booking_objects else None
+        first_game = first_booking.game if first_booking else None
+        vendor_squad_policy = _load_squad_pricing_policy(first_game.vendor_id) if first_game else DEFAULT_SQUAD_PRICING_POLICY
+
+        persisted_squad_details = first_booking.squad_details if first_booking and isinstance(first_booking.squad_details, dict) else {}
+        if squad_payload is not None and first_game:
+            try:
+                persisted_squad_details = _normalize_squad_booking_payload(
+                    squad_payload,
+                    first_game.game_name or "",
+                    vendor_policy=vendor_squad_policy,
+                )
+            except ValueError as squad_error:
+                return jsonify({"message": str(squad_error)}), 400
+            for booking in booking_objects:
+                booking.squad_details = persisted_squad_details if persisted_squad_details.get("enabled") else None
+
+        squad_enabled = bool(persisted_squad_details.get("enabled"))
+        squad_console_group = str(persisted_squad_details.get("console_group") or "").strip().lower()
+        squad_player_count = int(
+            persisted_squad_details.get("player_count")
+            or persisted_squad_details.get("playerCount")
+            or 1
+        )
+        if squad_enabled and (use_hour_pass or use_pass):
+            return jsonify({"message": "Pass-based confirmation is not supported for squad bookings."}), 400
 
         user_ids = {b.user_id for b in booking_objects}
         users = (
@@ -1200,6 +2234,51 @@ def confirm_booking():
             if menu_ids else []
         )
         menu_map = {m.id: m for m in menu_rows}
+        total_extras_cost = 0.0
+        for extra in extra_services_list:
+            menu_obj = menu_map.get(extra.get('item_id'))
+            if not menu_obj:
+                continue
+            total_extras_cost += float(menu_obj.price or 0) * float(extra.get('quantity', 1) or 1)
+        extras_total_per_booking = (total_extras_cost / len(booking_ids)) if booking_ids else 0.0
+
+        effective_price_by_game = effective_price_by_game or {}
+        base_slot_price_for_squad_by_game = {}
+        squad_discount_per_slot_by_game = {}
+        required_extra_controller_qty = 0
+        extra_controller_fare_total = 0.0
+
+        if squad_enabled and squad_console_group in {"ps", "xbox"}:
+            required_extra_controller_qty = max(0, squad_player_count - 1)
+            if required_extra_controller_qty > 0 and first_game:
+                computed_controller_fare = calculate_extra_controller_fare(
+                    vendor_id=first_game.vendor_id,
+                    available_game_id=first_game.id,
+                    quantity=required_extra_controller_qty,
+                )
+                if computed_controller_fare is None:
+                    return jsonify({
+                        "message": "Controller pricing is not configured for this console type."
+                    }), 400
+                extra_controller_fare_total = float(computed_controller_fare or 0.0)
+
+        for booking in booking_objects:
+            if not booking.game:
+                continue
+            game_effective_price = effective_price_by_game.get(
+                booking.game.id,
+                float(booking.game.single_slot_price or 0.0)
+            )
+            is_pc_squad_booking = bool(squad_enabled and squad_console_group == "pc")
+            base_slot_price_for_squad_by_game[booking.game.id] = (
+                game_effective_price * squad_player_count
+                if is_pc_squad_booking else game_effective_price
+            )
+            squad_discount_per_slot_by_game[booking.game.id] = (
+                (base_slot_price_for_squad_by_game[booking.game.id] * float(persisted_squad_details.get("discount_percent") or 0.0) / 100.0)
+                if is_pc_squad_booking and str(persisted_squad_details.get("pricing_mode") or "") == "squad_discount"
+                else 0.0
+            )
 
         user_hash_coins = (
             UserHashCoin.query.filter(UserHashCoin.user_id.in_(user_ids)).all()
@@ -1222,6 +2301,26 @@ def confirm_booking():
             if not all([available_game, vendor, slot_obj, user]):
                 current_app.logger.warning(f"Booking {booking_id} missing related data")
                 continue
+
+            captain_phone = user.contact_info.phone if user and user.contact_info else ""
+            if squad_enabled and not booking.squad_members:
+                squad_member_bindings = _build_squad_member_bindings(
+                    user,
+                    user.name,
+                    captain_phone,
+                    persisted_squad_details,
+                )
+                for binding in squad_member_bindings:
+                    db.session.add(
+                        BookingSquadMember(
+                            booking_id=int(booking.id),
+                            member_user_id=binding.get("member_user_id"),
+                            member_position=int(binding.get("member_position") or 0),
+                            is_captain=bool(binding.get("is_captain", False)),
+                            name_snapshot=str(binding.get("name_snapshot") or "")[:255],
+                            phone_snapshot=str(binding.get("phone_snapshot") or "")[:50],
+                        )
+                    )
 
             # HOUR-BASED PASS LOGIC
             if use_hour_pass:
@@ -1303,20 +2402,15 @@ def confirm_booking():
 
             # NO PASS - REGULAR PAYMENT
             else:
-                slot_price = effective_price_by_game.get(available_game.id, float(available_game.single_slot_price))
-                discount_amount = 0
-                amount_payable = slot_price
+                slot_price = base_slot_price_for_squad_by_game.get(
+                    available_game.id,
+                    effective_price_by_game.get(available_game.id, float(available_game.single_slot_price or 0.0))
+                )
+                discount_amount = float(squad_discount_per_slot_by_game.get(available_game.id, 0.0))
+                amount_payable = max(slot_price - discount_amount, 0.0)
 
-            # Calculate extras total
-            extras_total = 0
-            for extra in extra_services_list:
-                menu_obj = menu_map.get(extra.get('item_id'))
-                if not menu_obj:
-                    continue
-                extras_total += menu_obj.price * extra.get('quantity', 1)
-
-            # Add extras to payable amount
-            amount_payable += extras_total
+            # Add per-slot share of extras
+            amount_payable += extras_total_per_booking
 
             # Apply voucher discount (only on remaining amount)
             voucher = None
@@ -1360,7 +2454,7 @@ def confirm_booking():
                 vendor_id=vendor.id,
                 user_id=user.id,
                 user_name=user.name,
-                original_amount=slot_price + extras_total,
+                original_amount=slot_price + extras_total_per_booking,
                 discounted_amount=discount_amount,
                 amount=amount_payable,
                 mode_of_payment=payment_mode_used,
@@ -1371,6 +2465,7 @@ def confirm_booking():
             )
             db.session.add(transaction)
             db.session.flush()
+            total_amount_paid += float(amount_payable or 0.0)
 
             # Save payment mapping if gateway used
             if payment_id and payment_mode_used == "payment_gateway":
@@ -1471,7 +2566,8 @@ def confirm_booking():
                     end_time=slot_obj.end_time,
                     console_id=None,
                     status="confirmed",
-                    booking_status="upcoming"
+                    booking_status="upcoming",
+                    squad_details=booking.squad_details or {}
                 )
                 emit_booking_event(socketio, event="booking", data=event_payload, vendor_id=vendor.id)
                 socketio.emit("booking_admin", event_payload, to="dashboard_admin")
@@ -1496,13 +2592,55 @@ def confirm_booking():
 
             confirmed_ids.append(booking.id)
 
+        if squad_enabled and squad_console_group in {"ps", "xbox"} and extra_controller_fare_total > 0 and booking_objects:
+            controller_booking = booking_objects[0]
+            controller_game = controller_booking.game
+            controller_user = user_map.get(controller_booking.user_id)
+            controller_vendor = vendor_map.get(controller_game.vendor_id) if controller_game else None
+            if controller_game and controller_user and controller_vendor:
+                if payment_mode == "wallet":
+                    BookingService.debit_wallet(
+                        controller_user.id,
+                        controller_booking.id,
+                        float(extra_controller_fare_total or 0.0)
+                    )
+                controller_payment_mode = "wallet" if payment_mode == "wallet" else "payment_gateway"
+                controller_transaction = Transaction(
+                    booking_id=controller_booking.id,
+                    vendor_id=controller_vendor.id,
+                    user_id=controller_user.id,
+                    user_name=controller_user.name,
+                    original_amount=extra_controller_fare_total,
+                    discounted_amount=0.0,
+                    amount=extra_controller_fare_total,
+                    mode_of_payment=controller_payment_mode,
+                    payment_use_case="app_booking",
+                    booking_type="extra_controller",
+                    settlement_status="paid",
+                    source_channel="app",
+                    base_amount=0.0,
+                    meals_amount=0.0,
+                    controller_amount=extra_controller_fare_total,
+                    waive_off_amount=0.0,
+                    booking_date=datetime.utcnow().date(),
+                    booked_date=book_date,
+                    booking_time=datetime.utcnow().time(),
+                    reference_id=payment_id if payment_mode == "payment_gateway" else None,
+                )
+                db.session.add(controller_transaction)
+                total_amount_paid += float(extra_controller_fare_total or 0.0)
+
         db.session.commit()
         _send_booking_mail_async(current_app._get_current_object(), mail_jobs)
         
         response = {
             'message': 'Bookings confirmed successfully',
             'confirmed_ids': confirmed_ids,
-            'amount_paid': amount_payable
+            'amount_paid': round(float(total_amount_paid or 0.0), 2),
+            'squad_enabled': squad_enabled,
+            'squad_details': persisted_squad_details if squad_enabled else {},
+            'extra_controller_qty': required_extra_controller_qty,
+            'extra_controller_fare': round(float(extra_controller_fare_total or 0.0), 2),
         }
         
         # Add pass info to response
@@ -2030,6 +3168,7 @@ def new_booking(vendor_id):
         except (TypeError, ValueError):
             return jsonify({"message": "extraControllerQty must be a valid integer"}), 400
         selected_meals = data.get("selectedMeals", [])
+        squad_payload = data.get("squadDetails") or {}
         
         # ✅ NEW: Get booking mode from frontend
         booking_mode = data.get("bookingMode", "regular")
@@ -2038,6 +3177,52 @@ def new_booking(vendor_id):
         if booking_mode not in ['regular', 'private']:
             current_app.logger.warning(f"Invalid booking_mode '{booking_mode}', defaulting to 'regular'")
             booking_mode = 'regular'
+
+        # Normalize squad payload (frontend sends this for squad bookings).
+        if not isinstance(squad_payload, dict):
+            return jsonify({"message": "squadDetails must be an object"}), 400
+
+        squad_enabled = bool(squad_payload.get("enabled", False))
+        try:
+            squad_player_count = int(squad_payload.get("playerCount", 1) or 1)
+        except (TypeError, ValueError):
+            return jsonify({"message": "squadDetails.playerCount must be a valid integer"}), 400
+        try:
+            suggested_extra_controller_qty = int(
+                squad_payload.get("suggestedExtraControllerQty", 0) or 0
+            )
+        except (TypeError, ValueError):
+            return jsonify({"message": "squadDetails.suggestedExtraControllerQty must be a valid integer"}), 400
+
+        raw_members = squad_payload.get("members", [])
+        if raw_members is None:
+            raw_members = []
+        if not isinstance(raw_members, list):
+            return jsonify({"message": "squadDetails.members must be an array"}), 400
+
+        normalized_squad_members = []
+        for member in raw_members[:20]:
+            if not isinstance(member, dict):
+                continue
+            member_name = str(member.get("name", "")).strip()
+            member_phone = str(member.get("phone", "")).strip()
+            if not member_name and not member_phone:
+                continue
+            if not member_name or not member_phone:
+                return jsonify({
+                    "message": "Each squad member must include both name and phone"
+                }), 400
+            normalized_squad_members.append({
+                "name": member_name[:120],
+                "phone": member_phone[:32],
+            })
+
+        normalized_squad_details = {
+            "enabled": squad_enabled,
+            "player_count": max(squad_player_count, 1),
+            "suggested_extra_controller_qty": max(suggested_extra_controller_qty, 0),
+            "members": normalized_squad_members,
+        }
 
         # ✅ Log received data with booking mode
         current_app.logger.info(
@@ -2189,6 +3374,56 @@ def new_booking(vendor_id):
             f"Price={available_game.single_slot_price}, Requested_Type={console_type}, Mode={booking_mode}"
         )
 
+        vendor_squad_policy = _load_squad_pricing_policy(vendor_id)
+
+        # Validate squad size against console policy:
+        # - PC: squad discount rule-engine
+        # - PS/Xbox: squad supported via controller-pricing only
+        # - VR: squad not supported
+        if squad_enabled:
+            console_name = available_game.game_name or ""
+            console_group = _resolve_console_group(console_name)
+            group_rules = SQUAD_PLATFORM_RULES.get(console_group, {"enabled": False, "max_players": 1, "pricing_mode": "solo_only"})
+            max_players = int(group_rules.get("max_players", 1))
+            pricing_mode = str(group_rules.get("pricing_mode", "solo_only"))
+
+            if not bool(group_rules.get("enabled")):
+                return jsonify({
+                    "message": f"Squad booking is not supported for {console_name}"
+                }), 400
+            if normalized_squad_details["player_count"] < 2:
+                return jsonify({"message": "Squad booking requires at least 2 players"}), 400
+            if normalized_squad_details["player_count"] > max_players:
+                return jsonify({
+                    "message": f"Squad player count cannot exceed {max_players} for this console type"
+                }), 400
+
+            discount_pct = _resolve_squad_discount_percent(
+                console_name,
+                normalized_squad_details["player_count"],
+                policy=vendor_squad_policy
+            )
+            normalized_squad_details["console_group"] = console_group
+            normalized_squad_details["max_players_for_console"] = max_players
+            normalized_squad_details["pricing_mode"] = pricing_mode
+            normalized_squad_details["discount_percent"] = discount_pct
+
+            # For PS/Xbox squad sessions, pricing is controller-driven; ensure controller qty matches players.
+            if pricing_mode == "controller_pricing":
+                required_extra_controller_qty = max(0, int(normalized_squad_details["player_count"]) - 1)
+                if required_extra_controller_qty > extra_controller_qty:
+                    extra_controller_qty = required_extra_controller_qty
+
+        # Recompute controller surcharge after squad normalization.
+        if is_controller_pricing_supported(available_game.game_name) and extra_controller_qty > 0:
+            computed_controller_fare = calculate_extra_controller_fare(
+                vendor_id=vendor_id,
+                available_game_id=available_game.id,
+                quantity=extra_controller_qty
+            )
+            if computed_controller_fare is not None:
+                extra_controller_fare = computed_controller_fare
+
         # Validate and calculate extra services cost
         total_meals_cost = 0
         meal_details = []
@@ -2263,6 +3498,41 @@ def new_booking(vendor_id):
             db.session.flush()
             current_app.logger.info(f"Created new user: {name}")
 
+        squad_member_bindings = []
+        if squad_enabled:
+            squad_member_bindings.append({
+                "member_user_id": int(user.id),
+                "member_position": 1,
+                "is_captain": True,
+                "name_snapshot": str(name or "").strip()[:255] or "Captain",
+                "phone_snapshot": str(phone or "").strip()[:50],
+            })
+
+            phone_binding_cache = {}
+            for idx, member in enumerate(normalized_squad_members, start=2):
+                member_phone = str(member.get("phone", "")).strip()[:50]
+                member_name = str(member.get("name", "")).strip()[:255]
+                resolved_user_id = None
+                if member_phone:
+                    if member_phone in phone_binding_cache:
+                        resolved_user_id = phone_binding_cache[member_phone]
+                    else:
+                        resolved_user_id = _resolve_or_create_squad_member_user(member_name, member_phone)
+                        phone_binding_cache[member_phone] = resolved_user_id
+
+                squad_member_bindings.append({
+                    "member_user_id": resolved_user_id,
+                    "member_position": idx,
+                    "is_captain": False,
+                    "name_snapshot": member_name,
+                    "phone_snapshot": member_phone,
+                })
+            normalized_squad_details["member_user_ids"] = [
+                int(b["member_user_id"])
+                for b in squad_member_bindings
+                if b.get("member_user_id")
+            ]
+
         # Get socketio instance
         socketio = current_app.extensions.get('socketio')
 
@@ -2280,7 +3550,13 @@ def new_booking(vendor_id):
                     socketio=socketio,
                     book_date=datetime.strptime(booked_date, '%Y-%m-%d').date(),
                     is_pay_at_cafe=(payment_type == 'Cash'),
-                    booking_mode=booking_mode  # ✅ PASS BOOKING MODE HERE
+                    booking_mode=booking_mode,  # ✅ PASS BOOKING MODE HERE
+                    squad_details=normalized_squad_details if squad_enabled else None,
+                    slot_units=(
+                        int(normalized_squad_details.get("player_count", 1))
+                        if squad_enabled and str(normalized_squad_details.get("console_group", "")) == "pc"
+                        else 1
+                    )
                 )
                 
                 bookings.append(booking)
@@ -2319,6 +3595,21 @@ def new_booking(vendor_id):
                 db.session.add(booking_extra_service)
                 current_app.logger.info(f"Added extra service to booking {booking.id}: {meal_detail['menu_item'].name}")
 
+        # Persist relational squad-member bindings per booking (captain + squad members).
+        if squad_enabled and squad_member_bindings:
+            for booking in bookings:
+                for binding in squad_member_bindings:
+                    db.session.add(
+                        BookingSquadMember(
+                            booking_id=int(booking.id),
+                            member_user_id=binding.get("member_user_id"),
+                            member_position=int(binding.get("member_position") or 0),
+                            is_captain=bool(binding.get("is_captain", False)),
+                            name_snapshot=str(binding.get("name_snapshot") or "")[:255],
+                            phone_snapshot=str(binding.get("phone_snapshot") or "")[:50],
+                        )
+                    )
+
         # Generate access code
         code = generate_access_code()
         access_code_entry = AccessBookingCode(access_code=code)
@@ -2337,6 +3628,36 @@ def new_booking(vendor_id):
         transactions = []
         waive_off_per_slot = waive_off_total / len(bookings) if bookings else 0.0
         meals_cost_per_slot = total_meals_cost / len(bookings) if bookings and total_meals_cost > 0 else 0.0
+        effective_price = get_effective_price(vendor_id, available_game)
+        console_group_for_pricing = str(normalized_squad_details.get("console_group", _resolve_console_group(available_game.game_name or "")))
+        is_pc_squad = bool(squad_enabled and console_group_for_pricing == "pc")
+        squad_player_multiplier = int(normalized_squad_details.get("player_count", 1)) if is_pc_squad else 1
+        squad_pricing_mode = str(normalized_squad_details.get("pricing_mode", _resolve_squad_pricing_mode(available_game.game_name or "")))
+        squad_discount_applicable = bool(is_pc_squad and squad_pricing_mode == "squad_discount")
+        squad_discount_percent = (
+            _resolve_squad_discount_percent(
+                available_game.game_name or "",
+                int(normalized_squad_details.get("player_count", 1)),
+                policy=vendor_squad_policy
+            )
+            if squad_discount_applicable else 0.0
+        )
+        base_slot_price_for_squad = effective_price * squad_player_multiplier
+        squad_discount_per_slot = (base_slot_price_for_squad * squad_discount_percent / 100.0) if squad_discount_applicable else 0.0
+        squad_discount_total = squad_discount_per_slot * len(bookings) if squad_discount_applicable else 0.0
+
+        if squad_enabled:
+            normalized_squad_details["discount_per_slot"] = round(squad_discount_per_slot, 2)
+            normalized_squad_details["total_discount"] = round(squad_discount_total, 2)
+            normalized_squad_details["slot_base_multiplier"] = int(squad_player_multiplier)
+            normalized_squad_details["applied_extra_controller_qty"] = int(extra_controller_qty)
+            normalized_squad_details["slot_unit_price"] = round(effective_price, 2)
+            normalized_squad_details["slot_price_for_squad"] = round(base_slot_price_for_squad, 2)
+            normalized_squad_details["slot_base_total_before_discount"] = round(base_slot_price_for_squad * len(bookings), 2)
+            normalized_squad_details["slot_base_total_after_discount"] = round(
+                max((base_slot_price_for_squad * len(bookings)) - squad_discount_total, 0.0), 2
+            )
+
         actor = resolve_transaction_actor(request)
         payment_use_case = normalize_payment_use_case(payment_type, actor["source_channel"])
         settlement_status = resolve_settlement_status(payment_use_case)
@@ -2352,13 +3673,26 @@ def new_booking(vendor_id):
                     "success": False,
                     "message": "Monthly credit account not configured for this customer."
                 }), 400
+            projected_credit_charge = 0.0
+            for _ in bookings:
+                projected_credit_charge += max(
+                    ((base_slot_price_for_squad if is_pc_squad else effective_price) + meals_cost_per_slot)
+                    - (waive_off_per_slot + squad_discount_per_slot),
+                    0.0,
+                )
+            projected_credit_charge += max(float(extra_controller_fare or 0.0), 0.0)
+            credit_limit_error = validate_monthly_credit_capacity(credit_account, projected_credit_charge)
+            if credit_limit_error:
+                return jsonify(credit_limit_error), 400
 
         for booking in bookings:
-            base_slot_price = get_effective_price(vendor_id, available_game)
+            if squad_enabled:
+                booking.squad_details = normalized_squad_details
+            base_slot_price = base_slot_price_for_squad if is_pc_squad else effective_price
             slot_meal_cost = meals_cost_per_slot
             
             original_amount = base_slot_price + slot_meal_cost
-            discounted_amount = waive_off_per_slot
+            discounted_amount = waive_off_per_slot + squad_discount_per_slot
             final_amount = max(original_amount - discounted_amount, 0.0)
             gst = calculate_gst_breakdown(vendor_id, final_amount)
 
@@ -2489,27 +3823,86 @@ def new_booking(vendor_id):
             runtime_console_id = int(console_id) if console_id is not None else -1
 
             if slot_obj and _is_slot_live_now_ist(booked_for_date_obj, slot_obj.start_time, slot_obj.end_time):
-                reserved_console_id = None
+                console_group = str(normalized_squad_details.get("console_group", "")).lower()
+                is_pc_squad = bool(squad_enabled and console_group == "pc")
+                required_console_count = (
+                    int(normalized_squad_details.get("player_count", 1))
+                    if is_pc_squad
+                    else 1
+                )
+                required_console_count = max(required_console_count, 1)
+
+                reserved_console_ids = []
                 if is_rapid_booking and console_id is not None:
-                    reserved_console_id = _reserve_specific_console(
+                    reserved_specific = _reserve_specific_console(
                         vendor_id=vendor_id,
                         game_id=available_game.id,
                         console_id=int(console_id),
                     )
-                if reserved_console_id is None:
-                    reserved_console_id = _reserve_any_console(
-                        vendor_id=vendor_id,
-                        game_id=available_game.id,
+                    if reserved_specific is not None:
+                        reserved_console_ids.append(int(reserved_specific))
+
+                remaining_needed = required_console_count - len(reserved_console_ids)
+                if remaining_needed > 0:
+                    reserved_console_ids.extend(
+                        _reserve_multiple_consoles(
+                            vendor_id=vendor_id,
+                            game_id=available_game.id,
+                            quantity=remaining_needed,
+                        )
                     )
 
-                if reserved_console_id is not None:
+                if len(reserved_console_ids) >= required_console_count:
+                    reserved_console_ids = reserved_console_ids[:required_console_count]
                     runtime_status = "current"
-                    runtime_console_id = int(reserved_console_id)
+                    runtime_console_id = int(reserved_console_ids[0])
                     booking.status = "checked_in"
+                    if squad_enabled and isinstance(booking.squad_details, dict):
+                        updated_squad = dict(booking.squad_details)
+                        updated_squad["assigned_console_ids"] = [int(cid) for cid in reserved_console_ids]
+                        console_rows = (
+                            Console.query
+                            .filter(Console.id.in_([int(cid) for cid in reserved_console_ids]))
+                            .all()
+                        )
+                        label_by_console = {
+                            int(c.id): str(c.model_number or f"Console {c.id}")
+                            for c in console_rows
+                        }
+                        updated_squad["assigned_console_labels"] = {
+                            str(cid): label_by_console.get(int(cid), f"Console {cid}")
+                            for cid in reserved_console_ids
+                        }
+
+                        if is_pc_squad:
+                            squad_members = (
+                                BookingSquadMember.query
+                                .filter(BookingSquadMember.booking_id == int(booking.id))
+                                .order_by(BookingSquadMember.member_position.asc())
+                                .all()
+                            )
+                            member_console_map = []
+                            for idx, member in enumerate(squad_members):
+                                if idx >= len(reserved_console_ids):
+                                    break
+                                mapped_console_id = int(reserved_console_ids[idx])
+                                member_console_map.append({
+                                    "member_position": int(member.member_position or idx + 1),
+                                    "member_user_id": int(member.member_user_id) if member.member_user_id else None,
+                                    "member_name": str(member.name_snapshot or f"Player {idx + 1}"),
+                                    "console_id": mapped_console_id,
+                                    "console_label": label_by_console.get(mapped_console_id, f"Console {mapped_console_id}"),
+                                })
+                            if member_console_map:
+                                updated_squad["member_console_map"] = member_console_map
+
+                        booking.squad_details = updated_squad
                 else:
+                    if reserved_console_ids:
+                        _release_reserved_consoles(vendor_id=vendor_id, console_ids=reserved_console_ids)
                     current_app.logger.warning(
-                        "No console available for live booking_id=%s vendor_id=%s game_id=%s",
-                        booking.id, vendor_id, available_game.id
+                        "Insufficient consoles for live booking_id=%s vendor_id=%s game_id=%s required=%s reserved=%s",
+                        booking.id, vendor_id, available_game.id, required_console_count, len(reserved_console_ids)
                     )
 
             booking_runtime[int(booking.id)] = {
@@ -2542,9 +3935,11 @@ def new_booking(vendor_id):
             })
 
         # Calculate total amount paid
-        effective_price = get_effective_price(vendor_id, available_game)
-        total_base_cost = effective_price * len(bookings)
-        total_paid = total_base_cost + total_meals_cost + extra_controller_fare - waive_off_total
+        total_base_cost = base_slot_price_for_squad * len(bookings) if squad_enabled else effective_price * len(bookings)
+        total_paid = max(
+            total_base_cost + total_meals_cost + extra_controller_fare - waive_off_total - squad_discount_total,
+            0.0
+        )
 
         # Send booking confirmation email
         cafe_name = db.session.query(Vendor).filter_by(id=vendor_id).first().cafe_name
@@ -2588,15 +3983,32 @@ def new_booking(vendor_id):
             "transaction_ids": [t.id for t in transactions],
             "access_code": code,
             "booking_mode": booking_mode,  # ✅ Return booking mode
+            "squad_details": normalized_squad_details if squad_enabled else {
+                "enabled": False,
+                "player_count": 1,
+                "suggested_extra_controller_qty": 0,
+                "members": []
+            },
+            "squad_member_bindings": squad_member_bindings if squad_enabled else [],
             "requested_console_type": console_type,
             "matched_game_id": available_game.id,
             "matched_game_name": available_game.game_name,
             "total_base_cost": total_base_cost,
             "total_meals_cost": total_meals_cost,
+            "squad_discount_percent": squad_discount_percent,
+            "squad_discount_amount": squad_discount_total,
             "extra_controller_fare": extra_controller_fare,
             "extra_controller_qty": extra_controller_qty,
             "waive_off_amount": waive_off_total,
             "final_amount": total_paid,
+            "pricing_engine": {
+                "slot_base_total": round(total_base_cost, 2),
+                "squad_discount_amount": round(squad_discount_total, 2),
+                "manual_waive_off_amount": round(waive_off_total, 2),
+                "meals_total": round(total_meals_cost, 2),
+                "extra_controller_total": round(extra_controller_fare, 2),
+                "final_amount": round(total_paid, 2),
+            },
             "source_channel": actor["source_channel"],
             "staff": {
                 "id": actor["staff_id"],
@@ -2686,6 +4098,12 @@ def get_booking_details(booking_id):
         transactions = (
             Transaction.query.filter(Transaction.booking_id == booking.id).all()
         )
+        squad_members = (
+            BookingSquadMember.query
+            .filter(BookingSquadMember.booking_id == booking.id)
+            .order_by(BookingSquadMember.member_position.asc())
+            .all()
+        )
         
         base_price = sum(t.amount for t in transactions if t.booking_type == 'direct')
         extra_services_price = 0
@@ -2720,6 +4138,8 @@ def get_booking_details(booking_id):
         response = {
             "booking_id": booking.id,
             "status": booking.status,
+            "squad_details": booking.squad_details or {},
+            "squad_members": [member.to_dict() for member in squad_members],
             "user": {
                 "id": user.id if user else None,
                 "name": user.name if user else "Unknown",
@@ -2936,6 +4356,18 @@ def extra_booking():
         actor = resolve_transaction_actor(request)
         payment_use_case = normalize_payment_use_case(mode_of_payment, actor["source_channel"])
         settlement_status = resolve_settlement_status(payment_use_case)
+        credit_account = None
+        if payment_use_case == "monthly_credit":
+            credit_account = MonthlyCreditAccount.query.filter_by(
+                vendor_id=vendor_id,
+                user_id=user_id,
+                is_active=True
+            ).first()
+            if not credit_account:
+                return jsonify({
+                    "success": False,
+                    "message": "Monthly credit account not configured for this customer."
+                }), 400
 
         user = db.session.query(User).filter_by(id=user_id).first()
         slot = db.session.query(Slot).filter_by(id=slot_id).first()
@@ -2955,9 +4387,25 @@ def extra_booking():
             db.session.add(primary_booking)
             db.session.flush()
 
-        original_amount = amount
+        squad_details = primary_booking.squad_details if isinstance(primary_booking.squad_details, dict) else {}
+        squad_console_group = str(squad_details.get("console_group") or "").strip().lower()
+        squad_player_count = int(squad_details.get("player_count") or squad_details.get("playerCount") or 1)
+        is_pc_squad = bool(
+            squad_console_group == "pc"
+            and squad_player_count > 1
+            and (squad_details.get("enabled") is True or squad_player_count > 1)
+        )
+        effective_multiplier = max(squad_player_count, 1) if is_pc_squad else 1
+
+        # Frontend sends overtime amount at per-player rate.
+        # For PC squad, apply to full squad so billing remains transparent and complete.
+        original_amount = amount * effective_multiplier
         discounted_amount = waive_off_amount
         final_amount = max(original_amount - discounted_amount, 0.0)
+        if credit_account:
+            credit_limit_error = validate_monthly_credit_capacity(credit_account, final_amount)
+            if credit_limit_error:
+                return jsonify(credit_limit_error), 400
         gst = calculate_gst_breakdown(vendor_id, final_amount)
 
         transaction = Transaction(
@@ -2992,7 +4440,40 @@ def extra_booking():
             reference_id=reference_id,
         )
         db.session.add(transaction)
+
+        if is_pc_squad:
+            updated_squad = dict(squad_details)
+            ledger = updated_squad.get("extra_session_ledger")
+            if not isinstance(ledger, list):
+                ledger = []
+            ledger.append({
+                "recorded_at": datetime.utcnow().isoformat(),
+                "slot_id": int(slot_id),
+                "console_group": "pc",
+                "player_count": int(effective_multiplier),
+                "per_player_amount": round(float(amount), 2),
+                "original_amount": round(float(original_amount), 2),
+                "waive_off_amount": round(float(discounted_amount), 2),
+                "final_amount": round(float(final_amount), 2),
+                "transaction_id_preview": None,
+                "recorded_by": actor["source_channel"],
+            })
+            updated_squad["extra_session_ledger"] = ledger
+            updated_squad["last_extra_charge_amount"] = round(float(final_amount), 2)
+            updated_squad["last_extra_charge_multiplier"] = int(effective_multiplier)
+            primary_booking.squad_details = updated_squad
+
         db.session.commit()
+
+        if is_pc_squad and isinstance(primary_booking.squad_details, dict):
+            # Backfill transaction id after commit for traceability.
+            updated_squad = dict(primary_booking.squad_details)
+            ledger = updated_squad.get("extra_session_ledger")
+            if isinstance(ledger, list) and ledger:
+                ledger[-1]["transaction_id_preview"] = int(transaction.id)
+                updated_squad["extra_session_ledger"] = ledger
+                primary_booking.squad_details = updated_squad
+                db.session.commit()
 
         BookingService.insert_into_vendor_dashboard_table(transaction.id, console_number)
         BookingService.insert_into_vendor_promo_table(transaction.id, console_number)
@@ -3029,7 +4510,14 @@ def extra_booking():
                 "total_charged": summary["total_charged"],
             },
             "session_notice": f"The session for {username} on {console_type} #{console_number} has exceeded the allotted time.",
-            "financial_summary": summary
+            "financial_summary": summary,
+            "squad_charge": {
+                "is_pc_squad": is_pc_squad,
+                "player_count": int(effective_multiplier),
+                "per_player_amount": round(float(amount), 2),
+                "charged_original_amount": round(float(original_amount), 2),
+                "charged_final_amount": round(float(final_amount), 2),
+            }
         }), 201
 
     except Exception as e:
@@ -3207,10 +4695,26 @@ def get_user_details(vendor_id):
         )
         user_ids.update([row[0] for row in credit_user_ids if row[0]])
 
+        # Step 3: Include squad member user IDs mapped to this vendor's bookings.
+        # Without this, users created through squad member rows won't appear
+        # in the quick selector until they become a primary booking user.
+        squad_user_ids = (
+            db.session.query(BookingSquadMember.member_user_id)
+            .join(Booking, Booking.id == BookingSquadMember.booking_id)
+            .join(Transaction, Transaction.booking_id == Booking.id)
+            .filter(
+                Transaction.vendor_id == vendor_id_int,
+                BookingSquadMember.member_user_id.isnot(None),
+            )
+            .distinct()
+            .all()
+        )
+        user_ids.update([row[0] for row in squad_user_ids if row[0]])
+
         if not user_ids:
             return jsonify([]), 200
 
-        # Step 3: Fetch User and ContactInfo
+        # Step 4: Fetch User and ContactInfo
         users = User.query.filter(User.id.in_(list(user_ids))).all()
 
         user_list = []
@@ -3796,6 +5300,21 @@ def add_meals_to_booking(booking_id):
         meals = data.get("meals", [])
         if not meals:
             return jsonify({"success": False, "message": "No meals provided"}), 400
+
+        squad_member = data.get("squad_member") if isinstance(data.get("squad_member"), dict) else None
+        squad_member_position = None
+        squad_member_user_id = None
+        squad_member_name = None
+        if squad_member:
+            try:
+                squad_member_position = int(squad_member.get("member_position")) if squad_member.get("member_position") is not None else None
+            except (TypeError, ValueError):
+                squad_member_position = None
+            try:
+                squad_member_user_id = int(squad_member.get("member_user_id")) if squad_member.get("member_user_id") is not None else None
+            except (TypeError, ValueError):
+                squad_member_user_id = None
+            squad_member_name = str(squad_member.get("name") or "").strip() or None
         
         # Validate booking exists and get vendor_id
         booking = db.session.query(Booking).filter_by(id=booking_id).first()
@@ -3811,6 +5330,44 @@ def add_meals_to_booking(booking_id):
         vendor = db.session.query(Vendor).filter_by(id=vendor_id).first()
         current_app.logger.info(f"Adding meals to booking {booking_id} for vendor {vendor_id}")
         
+        squad_member_rows = (
+            BookingSquadMember.query
+            .filter_by(booking_id=booking_id)
+            .order_by(BookingSquadMember.member_position.asc())
+            .all()
+        )
+
+        if squad_member_rows:
+            resolved_member = None
+            if squad_member_user_id is not None:
+                resolved_member = next(
+                    (row for row in squad_member_rows if row.member_user_id == squad_member_user_id),
+                    None,
+                )
+            if resolved_member is None and squad_member_position is not None:
+                resolved_member = next(
+                    (row for row in squad_member_rows if int(row.member_position or 0) == int(squad_member_position)),
+                    None,
+                )
+            if resolved_member is None and squad_member_name:
+                normalized_name = squad_member_name.strip().lower()
+                resolved_member = next(
+                    (row for row in squad_member_rows if str(row.name_snapshot or "").strip().lower() == normalized_name),
+                    None,
+                )
+            if resolved_member is None:
+                # Default to captain for squad bookings when the client omits or partially sends member info.
+                resolved_member = next((row for row in squad_member_rows if bool(row.is_captain)), None) or squad_member_rows[0]
+
+            squad_member_position = int(resolved_member.member_position or 0) or squad_member_position
+            squad_member_user_id = int(resolved_member.member_user_id) if resolved_member.member_user_id else squad_member_user_id
+            squad_member_name = str(resolved_member.name_snapshot or squad_member_name or "").strip() or squad_member_name
+            squad_member = {
+                "member_position": squad_member_position,
+                "member_user_id": squad_member_user_id,
+                "name": squad_member_name,
+            }
+
         # Validate and process meals
         meal_details = []
         total_meals_cost = 0
@@ -3861,6 +5418,35 @@ def add_meals_to_booking(booking_id):
             )
             db.session.add(booking_extra_service)
             current_app.logger.info(f"Created extra service for booking {booking_id}: {meal_detail['menu_item'].name}")
+
+        # Persist member-level meal attribution inside squad_details ledger for audit/billing clarity.
+        if squad_member:
+            existing_squad_details = booking.squad_details if isinstance(booking.squad_details, dict) else {}
+            ledger = existing_squad_details.get("member_meal_ledger")
+            if not isinstance(ledger, list):
+                ledger = []
+            ledger_entry = {
+                "added_at": datetime.utcnow().isoformat(),
+                "member_position": squad_member_position,
+                "member_user_id": squad_member_user_id,
+                "member_name": squad_member_name,
+                "meals_total": float(total_meals_cost),
+                "meals": [
+                    {
+                        "menu_item_id": int(detail["menu_item"].id),
+                        "name": str(detail["menu_item"].name),
+                        "quantity": int(detail["quantity"]),
+                        "unit_price": float(detail["unit_price"]),
+                        "total_price": float(detail["total_price"]),
+                    }
+                    for detail in meal_details
+                ],
+            }
+            ledger.append(ledger_entry)
+            updated_squad_details = dict(existing_squad_details)
+            updated_squad_details["enabled"] = bool(updated_squad_details.get("enabled", True))
+            updated_squad_details["member_meal_ledger"] = ledger
+            booking.squad_details = updated_squad_details
         
         actor = resolve_transaction_actor(request)
         # Default behavior for in-session meal additions:
@@ -3981,6 +5567,11 @@ def add_meals_to_booking(booking_id):
             "message": "Meals added successfully",
             "booking_id": booking_id,
             "total_meals_cost": float(total_meals_cost),
+            "squad_member": {
+                "member_position": squad_member_position,
+                "member_user_id": squad_member_user_id,
+                "member_name": squad_member_name,
+            } if squad_member else None,
             "payment_status": {
                 "label": "Extra Payment Required" if summary["amount_due"] > 0 else "Settled",
                 "amount_paid": summary["amount_paid"],
@@ -4029,7 +5620,12 @@ def booking_payment_summary(booking_id):
                 "amount_due": summary["amount_due"],
                 "total_charged": summary["total_charged"],
             },
-            "financial_summary": summary
+            "financial_summary": summary,
+            "squad_member_meal_ledger": (
+                booking.squad_details.get("member_meal_ledger", [])
+                if isinstance(booking.squad_details, dict)
+                else []
+            ),
         }), 200
     except Exception as e:
         current_app.logger.error(f"Failed to build booking payment summary for {booking_id}: {str(e)}")
@@ -4060,6 +5656,18 @@ def settle_pending_booking_transactions(booking_id):
 
         actor = resolve_transaction_actor(request)
         payment_use_case = normalize_payment_use_case(mode, actor["source_channel"])
+        credit_account = None
+        if payment_use_case == "monthly_credit":
+            credit_account = MonthlyCreditAccount.query.filter_by(
+                vendor_id=booking.game.vendor_id if booking.game else None,
+                user_id=booking.user_id,
+                is_active=True
+            ).first()
+            if not credit_account:
+                return jsonify({
+                    "success": False,
+                    "message": "Monthly credit account not configured for this customer."
+                }), 400
 
         pending_rows = (
             Transaction.query
@@ -4078,6 +5686,11 @@ def settle_pending_booking_transactions(booking_id):
             pending_total += max(line_total, 0.0)
 
         applied_waive_off = min(max(waive_off_amount, 0.0), pending_total)
+        if credit_account:
+            projected_credit_charge = max(pending_total - applied_waive_off, 0.0)
+            credit_limit_error = validate_monthly_credit_capacity(credit_account, projected_credit_charge)
+            if credit_limit_error:
+                return jsonify(credit_limit_error), 400
 
         # Keep discount auditable via a dedicated negative transaction.
         if applied_waive_off > 0:
@@ -4120,12 +5733,33 @@ def settle_pending_booking_transactions(booking_id):
             settled_amount += line_total
             tx.mode_of_payment = mode
             tx.payment_use_case = payment_use_case
-            tx.settlement_status = "completed"
+            tx.settlement_status = "pending" if payment_use_case == "monthly_credit" else "completed"
             tx.source_channel = actor["source_channel"]
             tx.initiated_by_staff_id = actor["staff_id"]
             tx.initiated_by_staff_name = actor["staff_name"]
             tx.initiated_by_staff_role = actor["staff_role"]
             settled_ids.append(tx.id)
+
+        if credit_account and settled_amount > 0:
+            due_date = compute_credit_due_date(
+                datetime.utcnow().date(),
+                credit_account.billing_cycle_day
+            )
+            db.session.add(
+                MonthlyCreditLedger(
+                    account_id=credit_account.id,
+                    transaction_id=None,
+                    entry_type="charge",
+                    amount=max(settled_amount - applied_waive_off, 0.0),
+                    description=f"Pending session settlement #{booking_id}",
+                    booked_date=datetime.utcnow().date(),
+                    due_date=due_date,
+                    source_channel=actor["source_channel"],
+                    staff_id=actor["staff_id"],
+                    staff_name=actor["staff_name"],
+                )
+            )
+            credit_account.outstanding_amount = float(credit_account.outstanding_amount or 0) + max(settled_amount - applied_waive_off, 0.0)
 
         db.session.commit()
 
@@ -4382,7 +6016,8 @@ def get_slot_bookings(vendor_id):
             .options(
                 joinedload(Booking.transaction),
                 joinedload(Booking.slot),
-                joinedload(Booking.booking_extra_services).joinedload(BookingExtraService.extra_service_menu)
+                joinedload(Booking.booking_extra_services).joinedload(BookingExtraService.extra_service_menu),
+                joinedload(Booking.squad_members)
             )\
             .distinct()\
             .all()
@@ -4415,6 +6050,29 @@ def get_slot_bookings(vendor_id):
             meal_text = "No meal selected"
             if meals:
                 meal_text = ", ".join([f"{m['quantity']}x {m['name']}" for m in meals])
+
+            squad_details = booking.squad_details if isinstance(booking.squad_details, dict) else {}
+            squad_member_rows = sorted(
+                booking.squad_members or [],
+                key=lambda m: int(getattr(m, "member_position", 9999) or 9999)
+            )
+            squad_members = [
+                {
+                    "id": int(member.id),
+                    "member_user_id": int(member.member_user_id) if member.member_user_id else None,
+                    "member_position": int(member.member_position),
+                    "is_captain": bool(member.is_captain),
+                    "name": member.name_snapshot,
+                    "phone": member.phone_snapshot,
+                }
+                for member in squad_member_rows
+            ]
+            squad_player_count = int(
+                squad_details.get("player_count")
+                or squad_details.get("playerCount")
+                or (len(squad_members) if squad_members else 1)
+            )
+            squad_enabled = bool(squad_details.get("enabled")) or squad_player_count > 1
             
             bookings_data.append({
                 'booking_id': booking.id,
@@ -4428,7 +6086,14 @@ def get_slot_bookings(vendor_id):
                 'slot_id': booking.slot_id,
                 'booking_mode': booking.booking_mode,
                 'created_at': booking.created_at.isoformat() if booking.created_at else None,
-                'amount_paid': float(booking.transaction.amount) if booking.transaction else 0
+                'amount_paid': float(booking.transaction.amount) if booking.transaction else 0,
+                'booking_date': booking.transaction.booked_date.isoformat() if booking.transaction and booking.transaction.booked_date else booking_date.isoformat(),
+                'slot_start_time': booking.slot.start_time.strftime('%I:%M %p') if booking.slot and booking.slot.start_time else None,
+                'slot_end_time': booking.slot.end_time.strftime('%I:%M %p') if booking.slot and booking.slot.end_time else None,
+                'squad_enabled': squad_enabled,
+                'squad_player_count': max(1, squad_player_count),
+                'squad_members': squad_members,
+                'squad_details': squad_details,
             })
         
         return jsonify({
