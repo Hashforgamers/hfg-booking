@@ -4404,6 +4404,44 @@ def add_meals_to_booking(booking_id):
         vendor = db.session.query(Vendor).filter_by(id=vendor_id).first()
         current_app.logger.info(f"Adding meals to booking {booking_id} for vendor {vendor_id}")
         
+        squad_member_rows = (
+            BookingSquadMember.query
+            .filter_by(booking_id=booking_id)
+            .order_by(BookingSquadMember.member_position.asc())
+            .all()
+        )
+
+        if squad_member_rows:
+            resolved_member = None
+            if squad_member_user_id is not None:
+                resolved_member = next(
+                    (row for row in squad_member_rows if row.member_user_id == squad_member_user_id),
+                    None,
+                )
+            if resolved_member is None and squad_member_position is not None:
+                resolved_member = next(
+                    (row for row in squad_member_rows if int(row.member_position or 0) == int(squad_member_position)),
+                    None,
+                )
+            if resolved_member is None and squad_member_name:
+                normalized_name = squad_member_name.strip().lower()
+                resolved_member = next(
+                    (row for row in squad_member_rows if str(row.name_snapshot or "").strip().lower() == normalized_name),
+                    None,
+                )
+            if resolved_member is None:
+                # Default to captain for squad bookings when the client omits or partially sends member info.
+                resolved_member = next((row for row in squad_member_rows if bool(row.is_captain)), None) or squad_member_rows[0]
+
+            squad_member_position = int(resolved_member.member_position or 0) or squad_member_position
+            squad_member_user_id = int(resolved_member.member_user_id) if resolved_member.member_user_id else squad_member_user_id
+            squad_member_name = str(resolved_member.name_snapshot or squad_member_name or "").strip() or squad_member_name
+            squad_member = {
+                "member_position": squad_member_position,
+                "member_user_id": squad_member_user_id,
+                "name": squad_member_name,
+            }
+
         # Validate and process meals
         meal_details = []
         total_meals_cost = 0
