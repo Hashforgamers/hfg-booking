@@ -322,6 +322,13 @@ class BookingService:
                 booking = Booking.query.get(booking_id)
 
                 if booking and booking.status in ["pending_verified", "cancelled"]:
+                    squad_details = booking.squad_details if isinstance(booking.squad_details, dict) else {}
+                    slot_units = (
+                        max(1, int(squad_details.get("player_count") or squad_details.get("playerCount") or 1))
+                        if str(squad_details.get("console_group") or "").strip().lower() == "pc"
+                        and bool(squad_details.get("enabled") or int(squad_details.get("player_count") or squad_details.get("playerCount") or 1) > 1)
+                        else 1
+                    )
                     # ✅ Get vendor_id from available_games
                     available_game = db.session.execute(
                         text("SELECT vendor_id FROM available_games WHERE id = (SELECT gaming_type_id FROM slots WHERE id = :slot_id)"),
@@ -337,12 +344,12 @@ class BookingService:
                     # ✅ Restore `available_slot` in the table
                     update_query = text(f"""
                         UPDATE VENDOR_{vendor_id}_SLOT
-                        SET available_slot = available_slot + 1,
+                        SET available_slot = available_slot + :slot_units,
                             is_available = TRUE
                         WHERE slot_id = :slot_id
                         AND date = :book_date;
                     """)
-                    db.session.execute(update_query, {"slot_id": slot_id, "book_date": book_date})
+                    db.session.execute(update_query, {"slot_id": slot_id, "book_date": book_date, "slot_units": slot_units})
                     db.session.commit()
 
                     # ✅ Update booking status
