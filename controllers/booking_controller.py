@@ -1580,6 +1580,8 @@ def create_booking():
         except ValueError as squad_error:
             return jsonify({"message": str(squad_error)}), 400
         squad_enabled = bool(normalized_squad_details.get("enabled"))
+        if is_pay_at_cafe and squad_enabled and not normalized_squad_details.get("batch_id"):
+            normalized_squad_details["batch_id"] = str(uuid.uuid4())
         slot_units = (
             int(normalized_squad_details.get("player_count", 1))
             if squad_enabled and str(normalized_squad_details.get("console_group", "")).lower() == "pc"
@@ -3263,6 +3265,8 @@ def new_booking(vendor_id):
             "suggested_extra_controller_qty": max(suggested_extra_controller_qty, 0),
             "members": normalized_squad_members,
         }
+        if payment_type == 'Cash' and squad_enabled and not normalized_squad_details.get("batch_id"):
+            normalized_squad_details["batch_id"] = str(uuid.uuid4())
 
         # ✅ Log received data with booking mode
         current_app.logger.info(
@@ -5039,11 +5043,9 @@ def get_pending_pay_at_cafe_bookings(vendor_id):
              Booking.status == 'pending_acceptance'
          ).order_by(Booking.created_at.desc()).all()
 
-        # Transform to match your socket data structure
-        notifications = []
+        notifications_by_key = {}
         for booking in pending_bookings:
             try:
-                # Handle timezone-aware datetime
                 if booking.emitted_at:
                     emitted_at_iso = booking.emitted_at.isoformat()
                 else:
@@ -5066,40 +5068,55 @@ def get_pending_pay_at_cafe_bookings(vendor_id):
                 else:
                     time_slot = "N/A"
 
-                notification = {
-                    "event_id": f"db-{booking.bookingId}",
-                    "emitted_at": emitted_at_iso,
-                    "bookingId": booking.bookingId,
-                    "slotId": booking.slotId,
-                    "vendorId": booking.vendorId,
-                    "userId": booking.userId,
-                    "username": booking.username or "Unknown User",
-                    "game": {
-                        "vendor_id": booking.vendorId,
-                        "single_slot_price": booking.single_slot_price or 0,
-                        "game_name": booking.game_name or "Unknown Game"
-                    },
-                    "game_id": booking.game_id,
-                    "consoleType": "Console--1",
-                    "consoleNumber": "-1",
-                    "date": booking_date,
-                    "slot_price": {
-                        "vendor_id": booking.vendorId,
-                        "single_slot_price": booking.single_slot_price or 0,
-                        "game_name": booking.game_name or "Unknown Game"
-                    },
-                    "status": "pending_acceptance",
-                    "statusLabel": "Pending",
-                    "booking_status": "pending_acceptance",
-                    "time": time_slot,
-                    "processed_time": time_slot
-                }
-                notifications.append(notification)
-                
+                batch_id = details.get("batch_id") if isinstance(details, dict) else None
+                key = str(batch_id) if batch_id else f"booking:{booking.bookingId}"
+
+                if key not in notifications_by_key:
+                    notifications_by_key[key] = {
+                        "event_id": f"db-{booking.bookingId}",
+                        "emitted_at": emitted_at_iso,
+                        "bookingId": booking.bookingId,
+                        "slotId": booking.slotId,
+                        "vendorId": booking.vendorId,
+                        "userId": booking.userId,
+                        "username": booking.username or "Unknown User",
+                        "game": {
+                            "vendor_id": booking.vendorId,
+                            "single_slot_price": booking.single_slot_price or 0,
+                            "game_name": booking.game_name or "Unknown Game"
+                        },
+                        "game_id": booking.game_id,
+                        "consoleType": "Console--1",
+                        "consoleNumber": "-1",
+                        "date": booking_date,
+                        "slot_price": {
+                            "vendor_id": booking.vendorId,
+                            "single_slot_price": booking.single_slot_price or 0,
+                            "game_name": booking.game_name or "Unknown Game"
+                        },
+                        "status": "pending_acceptance",
+                        "statusLabel": "Pending",
+                        "booking_status": "pending_acceptance",
+                        "time": time_slot,
+                        "processed_time": time_slot,
+                        "batch_id": batch_id,
+                        "booking_ids": [booking.bookingId],
+                        "slot_ids": [booking.slotId],
+                        "slot_count": 1,
+                        "total_amount": float(booking.single_slot_price or 0),
+                    }
+                else:
+                    existing = notifications_by_key[key]
+                    existing["booking_ids"].append(booking.bookingId)
+                    existing["slot_ids"].append(booking.slotId)
+                    existing["slot_count"] = len(existing["booking_ids"])
+                    existing["total_amount"] = round(float(existing["total_amount"]) + float(booking.single_slot_price or 0), 2)
+
             except Exception as item_error:
                 current_app.logger.error(f"Error processing booking {booking.bookingId}: {item_error}")
                 continue
 
+        notifications = list(notifications_by_key.values())
         current_app.logger.info(f"Successfully processed {len(notifications)} pending bookings for vendor {vendor_id}")
         
         return jsonify({
@@ -5142,67 +5159,104 @@ def accept_pay_at_cafe_booking():
         if not available_game or available_game.vendor_id != vendor_id:
             return jsonify({"success": False, "message": "Unauthorized - This booking doesn't belong to your vendor"}), 403
 
+        # Resolve batch scope (squad)
+        details = booking.squad_details if isinstance(booking.squad_details, dict) else {}
+        batch_id = details.get("batch_id") if isinstance(details, dict) else None
+        if batch_id:
+            bookings_to_accept = (
+                Booking.query
+                .filter(Booking.status == 'pending_acceptance')
+                .filter(Booking.squad_details["batch_id"].astext == str(batch_id))
+                .all()
+            )
+        else:
+            bookings_to_accept = [booking]
+
         # Get related objects
-        user = User.query.filter_by(id=booking.user_id).first()
-        slot_obj = Slot.query.filter_by(id=booking.slot_id).first()
         vendor = Vendor.query.filter_by(id=vendor_id).first()
-        booked_date = resolve_booking_booked_date(booking)
         actor = resolve_transaction_actor(request)
         if actor.get("source_channel") != "dashboard":
             actor["source_channel"] = "dashboard"
 
-        # Accept the booking - change status to confirmed
-        booking.status = 'confirmed'
-        booking.updated_at = datetime.utcnow()
-        
-        # Create access code for confirmed booking
+        # Create access code for confirmed booking(s)
         code = generate_access_code()
         access_code_entry = AccessBookingCode(access_code=code)
         db.session.add(access_code_entry)
         db.session.flush()
-        booking.access_code_id = access_code_entry.id
 
-        # Persist booked_date for downstream visibility when available
-        if booked_date:
-            existing_details = booking.squad_details if isinstance(booking.squad_details, dict) else {}
-            updated_details = dict(existing_details)
-            updated_details["booked_date"] = booked_date.isoformat()
-            booking.squad_details = updated_details
-        
-        _price = get_effective_price(vendor_id, available_game)
-        # Create transaction record for the confirmed booking
-        transaction = Transaction(
-            booking_id=booking.id,
-            vendor_id=vendor_id,
-            user_id=booking.user_id,
-            user_name=user.name if user else "Unknown",
-            original_amount=_price,
-            amount=_price,
-            discounted_amount=0,
-            mode_of_payment="pay_at_cafe",
-            payment_use_case="pay_at_cafe",
-            booking_date=datetime.utcnow().date(),
-            booked_date=booked_date,
-            booking_time=datetime.utcnow().time(),
-            booking_type="pay_at_cafe",
-            settlement_status="pending",
-            source_channel=actor["source_channel"],
-            initiated_by_staff_id=actor.get("staff_id"),
-            initiated_by_staff_name=actor.get("staff_name"),
-            initiated_by_staff_role=actor.get("staff_role"),
-            base_amount=_price,
-            meals_amount=0.0,
-            controller_amount=0.0,
-            waive_off_amount=0.0,
+        accepted_booking_ids = []
+        for booking_row in bookings_to_accept:
+            available_game = AvailableGame.query.filter_by(id=booking_row.game_id).first()
+            if not available_game or available_game.vendor_id != vendor_id:
+                continue
+
+            user = User.query.filter_by(id=booking_row.user_id).first()
+            slot_obj = Slot.query.filter_by(id=booking_row.slot_id).first()
+            booked_date = resolve_booking_booked_date(booking_row)
+
+            booking_row.status = 'confirmed'
+            booking_row.updated_at = datetime.utcnow()
+            booking_row.access_code_id = access_code_entry.id
+
+            if booked_date:
+                existing_details = booking_row.squad_details if isinstance(booking_row.squad_details, dict) else {}
+                updated_details = dict(existing_details)
+                updated_details["booked_date"] = booked_date.isoformat()
+                booking_row.squad_details = updated_details
+
+            _price = get_effective_price(vendor_id, available_game)
+            transaction = Transaction(
+                booking_id=booking_row.id,
+                vendor_id=vendor_id,
+                user_id=booking_row.user_id,
+                user_name=user.name if user else "Unknown",
+                original_amount=_price,
+                amount=_price,
+                discounted_amount=0,
+                mode_of_payment="pay_at_cafe",
+                payment_use_case="pay_at_cafe",
+                booking_date=datetime.utcnow().date(),
+                booked_date=booked_date,
+                booking_time=datetime.utcnow().time(),
+                booking_type="pay_at_cafe",
+                settlement_status="pending",
+                source_channel=actor["source_channel"],
+                initiated_by_staff_id=actor.get("staff_id"),
+                initiated_by_staff_name=actor.get("staff_name"),
+                initiated_by_staff_role=actor.get("staff_role"),
+                base_amount=_price,
+                meals_amount=0.0,
+                controller_amount=0.0,
+                waive_off_amount=0.0,
+            )
+            db.session.add(transaction)
+            db.session.flush()
+
+            BookingService.insert_into_vendor_dashboard_table(transaction.id, -1)
+            BookingService.insert_into_vendor_promo_table(transaction.id, -1)
+
+            accepted_booking_ids.append(booking_row.id)
+
+            # Send booking confirmation email
+            if user and user.contact_info and slot_obj:
+                booking_mail(
+                    gamer_name=user.name,
+                    gamer_phone=user.contact_info.phone,
+                    gamer_email=user.contact_info.email,
+                    cafe_name=vendor.cafe_name if vendor else "Gaming Cafe",
+                    booking_date=datetime.utcnow().strftime("%Y-%m-%d"),
+                    booked_for_date=booked_date.strftime("%Y-%m-%d"),
+                    booking_details=[{
+                        "booking_id": booking_row.id,
+                        "slot_time": f"{slot_obj.start_time} - {slot_obj.end_time}"
+                    }],
+                    price_paid=_price
+                )
+
+        current_app.logger.info(
+            "Pay-at-cafe batch accepted booking_ids=%s vendor_id=%s",
+            accepted_booking_ids, vendor_id
         )
-        db.session.add(transaction)
-        db.session.flush()
-        
-        # Add to vendor analytics
-        BookingService.insert_into_vendor_dashboard_table(transaction.id, -1)
-        BookingService.insert_into_vendor_promo_table(transaction.id, -1)
-        
-        current_app.logger.info(f"Booking {booking_id} accepted and confirmed by vendor {vendor_id}")
         
         # Emit acceptance notification via socket
         socketio = current_app.extensions.get('socketio')
@@ -5210,29 +5264,15 @@ def accept_pay_at_cafe_booking():
             socketio.emit('pay_at_cafe_accepted', {
                 'bookingId': booking_id,
                 'vendorId': vendor_id,
+                'bookingIds': accepted_booking_ids,
+                'batch_id': batch_id,
                 'userId': booking.user_id,
                 'status': 'confirmed',
                 'access_code': code,
                 'message': 'Your booking has been accepted! Please visit the cafe with this confirmation.',
                 'timestamp': datetime.utcnow().isoformat()
             })
-        
-        # Send booking confirmation email
-        if user and user.contact_info:
-            booking_mail(
-                gamer_name=user.name,
-                gamer_phone=user.contact_info.phone,
-                gamer_email=user.contact_info.email,
-                cafe_name=vendor.cafe_name if vendor else "Gaming Cafe",
-                booking_date=datetime.utcnow().strftime("%Y-%m-%d"),
-                booked_for_date=booked_date.strftime("%Y-%m-%d"),
-                booking_details=[{
-                    "booking_id": booking.id,
-                    "slot_time": f"{slot_obj.start_time} - {slot_obj.end_time}" if slot_obj else "N/A"
-                }],
-                price_paid=get_effective_price(vendor_id, available_game)
-            )
-        
+
         # Commit all changes
         db.session.commit()
         
@@ -5240,7 +5280,9 @@ def accept_pay_at_cafe_booking():
             "success": True,
             "message": "Booking accepted and confirmed successfully!",
             "booking_id": booking_id,
-            "status": booking.status,
+            "booking_ids": accepted_booking_ids,
+            "status": "confirmed",
+            "batch_id": batch_id,
             "access_code": code
         }), 200
 
@@ -5281,24 +5323,46 @@ def reject_pay_at_cafe_booking():
         if not available_game or available_game.vendor_id != vendor_id:
             return jsonify({"success": False, "message": "Unauthorized - This booking doesn't belong to your vendor"}), 403
 
-        # Get related objects
-        user = User.query.filter_by(id=booking.user_id).first()
-        slot_obj = Slot.query.filter_by(id=booking.slot_id).first()
-        vendor = Vendor.query.filter_by(id=vendor_id).first()
-        booked_date = resolve_booking_booked_date(booking)
+        details = booking.squad_details if isinstance(booking.squad_details, dict) else {}
+        batch_id = details.get("batch_id") if isinstance(details, dict) else None
+        if batch_id:
+            bookings_to_reject = (
+                Booking.query
+                .filter(Booking.status == 'pending_acceptance')
+                .filter(Booking.squad_details["batch_id"].astext == str(batch_id))
+                .all()
+            )
+        else:
+            bookings_to_reject = [booking]
 
-        # Reject the booking - change status to cancelled
-        booking.status = 'cancelled'
-        booking.updated_at = datetime.utcnow()
+        vendor = Vendor.query.filter_by(id=vendor_id).first()
+        rejected_booking_ids = []
+        primary_user = None
+        for booking_row in bookings_to_reject:
+            available_game = AvailableGame.query.filter_by(id=booking_row.game_id).first()
+            if not available_game or available_game.vendor_id != vendor_id:
+                continue
+
+            user = User.query.filter_by(id=booking_row.user_id).first()
+            if primary_user is None:
+                primary_user = user
+
+            booked_date = resolve_booking_booked_date(booking_row)
+            booking_row.status = 'cancelled'
+            booking_row.updated_at = datetime.utcnow()
+
+            try:
+                BookingService.release_slot(booking_row.slot_id, booking_row.id, booked_date.strftime('%Y-%m-%d'))
+                current_app.logger.info(f"Slot {booking_row.slot_id} released for cancelled booking {booking_row.id}")
+            except Exception as e:
+                current_app.logger.error(f"Failed to release slot for booking {booking_row.id}: {e}")
+
+            rejected_booking_ids.append(booking_row.id)
         
-        # Release the slot using existing service
-        try:
-            BookingService.release_slot(booking.slot_id, booking_id, booked_date.strftime('%Y-%m-%d'))
-            current_app.logger.info(f"Slot {booking.slot_id} released for cancelled booking {booking_id}")
-        except Exception as e:
-            current_app.logger.error(f"Failed to release slot for booking {booking_id}: {e}")
-        
-        current_app.logger.info(f"Booking {booking_id} rejected and cancelled by vendor {vendor_id}. Reason: {rejection_reason}")
+        current_app.logger.info(
+            "Pay-at-cafe batch rejected booking_ids=%s vendor_id=%s reason=%s",
+            rejected_booking_ids, vendor_id, rejection_reason
+        )
         
         # Emit rejection notification via socket
         socketio = current_app.extensions.get('socketio')
@@ -5306,6 +5370,8 @@ def reject_pay_at_cafe_booking():
             socketio.emit('pay_at_cafe_rejected', {
                 'bookingId': booking_id,
                 'vendorId': vendor_id,
+                'bookingIds': rejected_booking_ids,
+                'batch_id': batch_id,
                 'userId': booking.user_id,
                 'status': 'cancelled',
                 'reason': rejection_reason,
@@ -5314,10 +5380,10 @@ def reject_pay_at_cafe_booking():
             })
         
         # Send rejection email to customer
-        if user and user.contact_info:
+        if primary_user and primary_user.contact_info:
             reject_booking_mail(
-                gamer_name=user.name,
-                gamer_email=user.contact_info.email,
+                gamer_name=primary_user.name,
+                gamer_email=primary_user.contact_info.email,
                 cafe_name=vendor.cafe_name if vendor else "Gaming Cafe",
                 reason=rejection_reason
             )
@@ -5329,7 +5395,9 @@ def reject_pay_at_cafe_booking():
             "success": True,
             "message": "Booking rejected and cancelled successfully!",
             "booking_id": booking_id,
-            "status": booking.status,
+            "booking_ids": rejected_booking_ids,
+            "batch_id": batch_id,
+            "status": "cancelled",
             "reason": rejection_reason
         }), 200
 

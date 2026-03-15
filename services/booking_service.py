@@ -284,6 +284,10 @@ class BookingService:
             log.info("create_booking.emit_prepare cid=%s bid=%s status=%s mode=%s", 
                      cid, bid, machine_status, booking_mode)
 
+            batch_id = None
+            if isinstance(stored_squad_details, dict):
+                batch_id = stored_squad_details.get("batch_id")
+
             event_data = {
                 "vendor_id": vendor_id,
                 "booking_id": bid,
@@ -302,6 +306,7 @@ class BookingService:
                 "booking_status": "pending_acceptance" if is_pay_at_cafe else "pending_verified",
                 "booking_mode": booking_mode,  # ✅ ADD MODE TO EVENT
                 "squad_details": squad_details or {},
+                "batch_id": batch_id,
                 "cid": cid,
             }
 
