@@ -5206,11 +5206,13 @@ def accept_pay_at_cafe_booking():
             booking_row.updated_at = datetime.utcnow()
             booking_row.access_code_id = access_code_entry.id
 
+            existing_details = booking_row.squad_details if isinstance(booking_row.squad_details, dict) else {}
+            updated_details = dict(existing_details)
             if booked_date:
-                existing_details = booking_row.squad_details if isinstance(booking_row.squad_details, dict) else {}
-                updated_details = dict(existing_details)
                 updated_details["booked_date"] = booked_date.isoformat()
-                booking_row.squad_details = updated_details
+            updated_details["payment_use_case"] = "pay_at_cafe"
+            updated_details["settlement_status"] = "pending"
+            booking_row.squad_details = updated_details
 
             _price = get_effective_price(vendor_id, available_game)
             transaction = Transaction(
