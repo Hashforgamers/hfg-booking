@@ -4,7 +4,7 @@ from flask_socketio import socketio
 from models.slot import Slot
 from models.booking import Booking
 from db.extensions import db
-from datetime import datetime
+from datetime import datetime, date
 from models.transaction import Transaction
 from models.user import User
 from models.paymentTransactionMapping import PaymentTransactionMapping
@@ -213,13 +213,33 @@ class BookingService:
             raise ValueError("Concurrent booking conflict. Please retry.")
 
         # STEP 4: Create booking with booking_mode
+        stored_squad_details = None
+        if isinstance(squad_details, dict):
+            stored_squad_details = dict(squad_details)
+        elif squad_details:
+            stored_squad_details = {"raw": squad_details}
+
+        if is_pay_at_cafe:
+            booked_date_value = None
+            if isinstance(book_date, datetime):
+                booked_date_value = book_date.date().isoformat()
+            elif isinstance(book_date, date):
+                booked_date_value = book_date.isoformat()
+            elif isinstance(book_date, str) and book_date.strip():
+                booked_date_value = book_date.strip()
+
+            if booked_date_value:
+                if stored_squad_details is None:
+                    stored_squad_details = {}
+                stored_squad_details["booked_date"] = booked_date_value
+
         try:
             booking = Booking(
                 slot_id=slot_id,
                 game_id=game_id,
                 user_id=user_id,
                 booking_mode=booking_mode,  # ✅ SET THE MODE HERE
-                squad_details=squad_details or None,
+                squad_details=stored_squad_details or None,
                 status="pending_acceptance" if is_pay_at_cafe else "pending_verified",
                 created_at=datetime.utcnow()
             )
