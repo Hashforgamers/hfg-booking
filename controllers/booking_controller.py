@@ -33,7 +33,7 @@ from models.vendorTaxProfile import VendorTaxProfile
 from models.squadPricingRule import SquadPricingRule
 from models.timeWallet import TimeWalletAccount, TimeWalletLedger
 from models.monthlyCredit import MonthlyCreditAccount, MonthlyCreditLedger
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 import pytz
 from flask import current_app, jsonify
 from sqlalchemy.orm import joinedload
@@ -389,6 +389,46 @@ def resolve_transaction_actor(request_obj):
             actor["source_channel"] = "dashboard"
 
     return actor
+
+
+def _coerce_date_value(raw_value):
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, datetime):
+        return raw_value.date()
+    if isinstance(raw_value, date):
+        return raw_value
+    if isinstance(raw_value, str):
+        text_value = raw_value.strip()
+        if not text_value:
+            return None
+        try:
+            if "T" in text_value:
+                return datetime.fromisoformat(text_value).date()
+            return datetime.strptime(text_value, "%Y-%m-%d").date()
+        except ValueError:
+            return None
+    return None
+
+
+def resolve_booking_booked_date(booking, fallback_date=None):
+    if not booking:
+        return _coerce_date_value(fallback_date) or datetime.utcnow().date()
+
+    direct_value = getattr(booking, "booked_date", None)
+    resolved = _coerce_date_value(direct_value)
+    if resolved:
+        return resolved
+
+    details = booking.squad_details if isinstance(booking.squad_details, dict) else {}
+    resolved = _coerce_date_value(details.get("booked_date") or details.get("book_date"))
+    if resolved:
+        return resolved
+
+    if booking.created_at:
+        return booking.created_at.date()
+
+    return _coerce_date_value(fallback_date) or datetime.utcnow().date()
 
 
 def normalize_payment_use_case(payment_type: str, source_channel: str) -> str:
@@ -4984,6 +5024,7 @@ def get_pending_pay_at_cafe_bookings(vendor_id):
             Booking.user_id.label('userId'),
             Booking.game_id,
             Booking.created_at.label('emitted_at'),  # Direct access since it's not nullable
+            Booking.squad_details.label('squad_details'),
             User.name.label('username'),
             Slot.start_time,
             Slot.end_time,
@@ -5004,15 +5045,15 @@ def get_pending_pay_at_cafe_bookings(vendor_id):
             try:
                 # Handle timezone-aware datetime
                 if booking.emitted_at:
-                    # Convert to ISO format with timezone info
                     emitted_at_iso = booking.emitted_at.isoformat()
-                    # Get date for booking
-                    booking_date = booking.emitted_at.date().strftime('%Y-%m-%d')
                 else:
-                    # Fallback to current time
-                    now = datetime.utcnow()
-                    emitted_at_iso = now.isoformat()
-                    booking_date = now.strftime('%Y-%m-%d')
+                    emitted_at_iso = datetime.utcnow().isoformat()
+
+                details = booking.squad_details if isinstance(booking.squad_details, dict) else {}
+                resolved_date = _coerce_date_value(details.get("booked_date") or details.get("book_date"))
+                if not resolved_date:
+                    resolved_date = booking.emitted_at.date() if booking.emitted_at else datetime.utcnow().date()
+                booking_date = resolved_date.strftime('%Y-%m-%d')
                 
                 # Format time slot
                 if booking.start_time and booking.end_time:
@@ -5105,6 +5146,10 @@ def accept_pay_at_cafe_booking():
         user = User.query.filter_by(id=booking.user_id).first()
         slot_obj = Slot.query.filter_by(id=booking.slot_id).first()
         vendor = Vendor.query.filter_by(id=vendor_id).first()
+        booked_date = resolve_booking_booked_date(booking)
+        actor = resolve_transaction_actor(request)
+        if actor.get("source_channel") != "dashboard":
+            actor["source_channel"] = "dashboard"
 
         # Accept the booking - change status to confirmed
         booking.status = 'confirmed'
@@ -5116,6 +5161,13 @@ def accept_pay_at_cafe_booking():
         db.session.add(access_code_entry)
         db.session.flush()
         booking.access_code_id = access_code_entry.id
+
+        # Persist booked_date for downstream visibility when available
+        if booked_date:
+            existing_details = booking.squad_details if isinstance(booking.squad_details, dict) else {}
+            updated_details = dict(existing_details)
+            updated_details["booked_date"] = booked_date.isoformat()
+            booking.squad_details = updated_details
         
         _price = get_effective_price(vendor_id, available_game)
         # Create transaction record for the confirmed booking
@@ -5128,10 +5180,20 @@ def accept_pay_at_cafe_booking():
             amount=_price,
             discounted_amount=0,
             mode_of_payment="pay_at_cafe",
+            payment_use_case="pay_at_cafe",
             booking_date=datetime.utcnow().date(),
-            booked_date=booking.created_at.date() if booking.created_at else datetime.utcnow().date(),
+            booked_date=booked_date,
             booking_time=datetime.utcnow().time(),
-            booking_type="pay_at_cafe"
+            booking_type="pay_at_cafe",
+            settlement_status="pending",
+            source_channel=actor["source_channel"],
+            initiated_by_staff_id=actor.get("staff_id"),
+            initiated_by_staff_name=actor.get("staff_name"),
+            initiated_by_staff_role=actor.get("staff_role"),
+            base_amount=_price,
+            meals_amount=0.0,
+            controller_amount=0.0,
+            waive_off_amount=0.0,
         )
         db.session.add(transaction)
         db.session.flush()
@@ -5163,7 +5225,7 @@ def accept_pay_at_cafe_booking():
                 gamer_email=user.contact_info.email,
                 cafe_name=vendor.cafe_name if vendor else "Gaming Cafe",
                 booking_date=datetime.utcnow().strftime("%Y-%m-%d"),
-                booked_for_date=booking.created_at.strftime("%Y-%m-%d") if booking.created_at else datetime.utcnow().strftime("%Y-%m-%d"),
+                booked_for_date=booked_date.strftime("%Y-%m-%d"),
                 booking_details=[{
                     "booking_id": booking.id,
                     "slot_time": f"{slot_obj.start_time} - {slot_obj.end_time}" if slot_obj else "N/A"
@@ -5223,6 +5285,7 @@ def reject_pay_at_cafe_booking():
         user = User.query.filter_by(id=booking.user_id).first()
         slot_obj = Slot.query.filter_by(id=booking.slot_id).first()
         vendor = Vendor.query.filter_by(id=vendor_id).first()
+        booked_date = resolve_booking_booked_date(booking)
 
         # Reject the booking - change status to cancelled
         booking.status = 'cancelled'
@@ -5230,7 +5293,7 @@ def reject_pay_at_cafe_booking():
         
         # Release the slot using existing service
         try:
-            BookingService.release_slot(booking.slot_id, booking_id, booking.created_at.strftime('%Y-%m-%d') if booking.created_at else datetime.utcnow().strftime('%Y-%m-%d'))
+            BookingService.release_slot(booking.slot_id, booking_id, booked_date.strftime('%Y-%m-%d'))
             current_app.logger.info(f"Slot {booking.slot_id} released for cancelled booking {booking_id}")
         except Exception as e:
             current_app.logger.error(f"Failed to release slot for booking {booking_id}: {e}")
@@ -5649,10 +5712,10 @@ def settle_pending_booking_transactions(booking_id):
         if not booking:
             return jsonify({"success": False, "message": "Booking not found"}), 404
 
-        include_types = body.get("booking_types") or ["extra", "additional_meals"]
+        include_types = body.get("booking_types") or ["extra", "additional_meals", "pay_at_cafe"]
         include_types = [str(x).strip().lower() for x in include_types if str(x).strip()]
         if not include_types:
-            include_types = ["extra", "additional_meals"]
+            include_types = ["extra", "additional_meals", "pay_at_cafe"]
 
         actor = resolve_transaction_actor(request)
         payment_use_case = normalize_payment_use_case(mode, actor["source_channel"])
