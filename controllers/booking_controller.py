@@ -136,7 +136,7 @@ def _json_text_equals(column, key: str, value: str):
     """
     Dialect-safe JSON text comparison (SQLAlchemy 2.0 removed .astext).
     """
-    return cast(column[key], String) == str(value)
+    return func.replace(cast(column[key], String), '"', '') == str(value)
 
 
 def get_effective_price_for_schedule(vendor_id: int, available_game, booking_date, slot_obj=None) -> float:
