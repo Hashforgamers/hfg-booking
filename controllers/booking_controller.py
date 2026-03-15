@@ -58,7 +58,7 @@ from sqlalchemy.orm import joinedload
 from sqlalchemy import and_, or_, cast, String
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy import func, distinct
-from services.mail_service import booking_mail, reject_booking_mail, extra_booking_time_mail
+from services.mail_service import booking_mail, reject_booking_mail, extra_booking_time_mail, vendor_booking_notification_mail
 
 from models.hashWallet import HashWallet
 from models.hashWalletTransaction import HashWalletTransaction
@@ -1459,6 +1459,19 @@ def _send_booking_mail_async(app, mail_jobs):
         _ASYNC_EXECUTOR.submit(_runner)
 
 
+def _send_vendor_booking_mail_async(app, mail_jobs):
+    def _runner():
+        with app.app_context():
+            for kwargs in mail_jobs:
+                try:
+                    vendor_booking_notification_mail(**kwargs)
+                except Exception as exc:
+                    current_app.logger.exception("vendor_booking_notification_mail failed: %s", exc)
+
+    if mail_jobs:
+        _ASYNC_EXECUTOR.submit(_runner)
+
+
 @booking_blueprint.route('/create_order', methods=['POST'])
 def create_order():
     data = request.get_json()
@@ -1850,6 +1863,19 @@ def confirm_booking():
         pass_used_id   = None
         user_id        = None
 
+        def _payment_label(mode_value: str) -> str:
+            if mode_value == "wallet":
+                return "Hash Wallet"
+            if mode_value == "payment_gateway":
+                return "Online Payment"
+            if mode_value == "hour_pass":
+                return f"Hour Pass{f' ({pass_type_name})' if pass_type_name else ''}"
+            if mode_value == "date_pass":
+                return f"Pass{f' ({pass_type_name})' if pass_type_name else ''}"
+            if mode_value == "free":
+                return "Free"
+            return str(mode_value or "unknown").replace("_", " ").title()
+
         for booking_id in booking_ids:
             booking = Booking.query.filter_by(id=booking_id).first()
             if not booking or booking.status == 'confirmed':
@@ -2175,6 +2201,7 @@ def confirm_booking():
         total_amount_paid = 0.0
         total_hours_deducted = Decimal('0')
         mail_jobs = []
+        vendor_mail_jobs = {}
         voucher_used = False
 
         booking_objects = (
@@ -2230,6 +2257,14 @@ def confirm_booking():
         vendor_ids = {b.game.vendor_id for b in booking_objects if b.game is not None}
         vendors = Vendor.query.filter(Vendor.id.in_(vendor_ids)).all() if vendor_ids else []
         vendor_map = {v.id: v for v in vendors}
+        vendor_contacts = (
+            ContactInfo.query
+            .filter(ContactInfo.parent_type == "vendor")
+            .filter(ContactInfo.parent_id.in_(vendor_ids))
+            .all()
+            if vendor_ids else []
+        )
+        vendor_contact_map = {vc.parent_id: vc for vc in vendor_contacts if vc and vc.email}
 
         game_ids = {b.game.id for b in booking_objects if b.game is not None}
         now_ist = datetime.now(IST)
@@ -2492,6 +2527,8 @@ def confirm_booking():
                 else:
                     payment_mode_used = "payment_gateway"
 
+            # payment label available via _payment_label
+
             # Confirm booking
             booking.status = 'confirmed'
             booking.updated_at = datetime.utcnow()
@@ -2639,6 +2676,31 @@ def confirm_booking():
                     "price_paid": amount_payable
                 })
 
+            # Notify vendor for app-confirmed bookings
+            vendor_contact = vendor_contact_map.get(vendor.id) if vendor else None
+            if vendor_contact and vendor_contact.email:
+                job = vendor_mail_jobs.get(vendor.id)
+                if not job:
+                    job = {
+                        "vendor_email": vendor_contact.email,
+                        "cafe_name": vendor.cafe_name if vendor else "Gaming Cafe",
+                        "booking_date": datetime.utcnow().strftime("%Y-%m-%d"),
+                        "booked_for_date": str(book_date),
+                        "payment_type": _payment_label(payment_mode_used),
+                        "booking_details": [],
+                        "total_amount_paid": 0.0,
+                    }
+                if job["payment_type"] != _payment_label(payment_mode_used):
+                    job["payment_type"] = "Mixed"
+                job["booking_details"].append({
+                    "booking_id": booking.id,
+                    "slot_time": f"{slot_obj.start_time} - {slot_obj.end_time}",
+                    "gamer_name": user.name,
+                    "amount_paid": float(amount_payable or 0.0),
+                })
+                job["total_amount_paid"] = float(job.get("total_amount_paid") or 0.0) + float(amount_payable or 0.0)
+                vendor_mail_jobs[vendor.id] = job
+
             confirmed_ids.append(booking.id)
 
         if squad_enabled and squad_console_group in {"ps", "xbox"} and extra_controller_fare_total > 0 and booking_objects:
@@ -2679,8 +2741,41 @@ def confirm_booking():
                 db.session.add(controller_transaction)
                 total_amount_paid += float(extra_controller_fare_total or 0.0)
 
+                vendor_contact = vendor_contact_map.get(controller_vendor.id) if controller_vendor else None
+                if vendor_contact and vendor_contact.email:
+                    slot_obj = controller_booking.slot or Slot.query.filter_by(id=controller_booking.slot_id).first()
+                    slot_time_label = (
+                        f"{slot_obj.start_time} - {slot_obj.end_time}" if slot_obj else "N/A"
+                    )
+                    job = vendor_mail_jobs.get(controller_vendor.id)
+                    if not job:
+                        job = {
+                            "vendor_email": vendor_contact.email,
+                            "cafe_name": controller_vendor.cafe_name if controller_vendor else "Gaming Cafe",
+                            "booking_date": datetime.utcnow().strftime("%Y-%m-%d"),
+                            "booked_for_date": str(book_date),
+                            "payment_type": _payment_label(controller_payment_mode),
+                            "booking_details": [],
+                            "total_amount_paid": 0.0,
+                        }
+                    if job["payment_type"] != _payment_label(controller_payment_mode):
+                        job["payment_type"] = "Mixed"
+                    job["booking_details"].append({
+                        "booking_id": controller_booking.id,
+                        "slot_time": slot_time_label,
+                        "gamer_name": controller_user.name,
+                        "amount_paid": float(extra_controller_fare_total or 0.0),
+                    })
+                    job["total_amount_paid"] = float(job.get("total_amount_paid") or 0.0) + float(extra_controller_fare_total or 0.0)
+                    vendor_mail_jobs[controller_vendor.id] = job
+
         db.session.commit()
         _send_booking_mail_async(current_app._get_current_object(), mail_jobs)
+        if vendor_mail_jobs:
+            _send_vendor_booking_mail_async(
+                current_app._get_current_object(),
+                list(vendor_mail_jobs.values()),
+            )
         
         response = {
             'message': 'Bookings confirmed successfully',

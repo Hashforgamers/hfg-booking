@@ -345,3 +345,83 @@ def extra_booking_time_mail(
 </html>
 """
     )
+
+
+# ==========================================
+# ✅ VENDOR BOOKING CONFIRMATION NOTIFICATION
+# ==========================================
+def vendor_booking_notification_mail(
+    vendor_email,
+    cafe_name,
+    booking_date,
+    booked_for_date,
+    payment_type,
+    booking_details,
+    total_amount_paid,
+):
+    """
+    Notify vendor when a booking is confirmed from the Hash app.
+    booking_details: list of {booking_id, slot_time, gamer_name, amount_paid}
+    """
+    booking_rows = "".join(
+        f"""
+        <tr>
+            <td style="padding:10px;border-bottom:1px solid #2a2a2a;">#{b['booking_id']}</td>
+            <td style="padding:10px;border-bottom:1px solid #2a2a2a;">{b.get('gamer_name') or 'Guest'}</td>
+            <td style="padding:10px;border-bottom:1px solid #2a2a2a;">{b['slot_time']}</td>
+            <td style="padding:10px;text-align:right;border-bottom:1px solid #2a2a2a;">₹{float(b.get('amount_paid') or 0):.2f}</td>
+        </tr>
+        """
+        for b in booking_details
+    )
+
+    send_email(
+        subject=f"✅ New Booking Confirmed – {cafe_name}",
+        recipients=[vendor_email],
+        body="A booking was confirmed from the Hash app.",
+        html=f"""
+<!DOCTYPE html>
+<html>
+<body style="font-family:'Segoe UI',sans-serif;background-color:#0d0d0d;margin:0;padding:0;">
+<div style="max-width:640px;margin:auto;background-color:#141414;border-radius:8px;overflow:hidden;">
+
+    <div style="padding:26px;text-align:center;background-color:#000000;">
+        <h2 style="color:#ffffff;margin:0;">✅ Booking Confirmed</h2>
+        <p style="color:#bbbbbb;margin:8px 0 0;">Hash App Booking Notification</p>
+    </div>
+
+    <div style="padding:28px;color:#ffffff;">
+        <p>Hello <strong>{cafe_name}</strong>,</p>
+        <p>A booking has been confirmed from the Hash App.</p>
+
+        <table style="width:100%;margin-top:18px;">
+            <tr><td style="color:#bbbbbb;">Confirmation Date</td><td>{booking_date}</td></tr>
+            <tr><td style="color:#bbbbbb;">Booked For</td><td>{booked_for_date}</td></tr>
+            <tr><td style="color:#bbbbbb;">Payment Type</td><td>{payment_type}</td></tr>
+            <tr><td style="color:#bbbbbb;">Total Paid</td><td style="color:#00ff88;">₹{float(total_amount_paid or 0):.2f}</td></tr>
+        </table>
+
+        <h3 style="margin-top:26px;color:#00ff88;">🕒 Booking Details</h3>
+        <table style="width:100%;background-color:#1c1c1c;border:1px solid #2a2a2a;">
+            <tr>
+                <th style="padding:10px;text-align:left;">Booking ID</th>
+                <th style="padding:10px;text-align:left;">Customer</th>
+                <th style="padding:10px;text-align:left;">Slot Time</th>
+                <th style="padding:10px;text-align:right;">Amount</th>
+            </tr>
+            {booking_rows}
+        </table>
+
+        <p style="margin-top:22px;">Please prepare the slot for the customer.</p>
+        <p>— Team Hash</p>
+    </div>
+
+    <div style="padding:16px;text-align:center;color:#666;font-size:12px;background:#222;">
+        © 2025 Hash Platform. All rights reserved.
+    </div>
+
+</div>
+</body>
+</html>
+"""
+    )
