@@ -5359,7 +5359,7 @@ def accept_pay_at_cafe_booking():
                         console_id=None,
                         status="confirmed",
                         booking_status="upcoming",
-                        squad_details=booking_row.squad_details or {},
+                        squad_details=updated_details,
                     )
                 )
 
