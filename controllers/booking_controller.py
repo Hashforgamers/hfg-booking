@@ -5185,6 +5185,7 @@ def accept_pay_at_cafe_booking():
         db.session.flush()
 
         accepted_booking_ids = []
+        event_payloads = []
         for booking_row in bookings_to_accept:
             available_game = AvailableGame.query.filter_by(id=booking_row.game_id).first()
             if not available_game or available_game.vendor_id != vendor_id:
@@ -5237,6 +5238,27 @@ def accept_pay_at_cafe_booking():
 
             accepted_booking_ids.append(booking_row.id)
 
+            if slot_obj and available_game and user:
+                event_payloads.append(
+                    build_booking_event_payload(
+                        vendor_id=vendor_id,
+                        booking_id=booking_row.id,
+                        slot_id=booking_row.slot_id,
+                        user_id=booking_row.user_id,
+                        username=user.name,
+                        game_id=booking_row.game_id,
+                        game_name=available_game.game_name,
+                        date_value=booked_date,
+                        slot_price=available_game.single_slot_price,
+                        start_time=slot_obj.start_time,
+                        end_time=slot_obj.end_time,
+                        console_id=None,
+                        status="confirmed",
+                        booking_status="upcoming",
+                        squad_details=booking_row.squad_details or {},
+                    )
+                )
+
             # Send booking confirmation email
             if user and user.contact_info and slot_obj:
                 booking_mail(
@@ -5275,6 +5297,23 @@ def accept_pay_at_cafe_booking():
 
         # Commit all changes
         db.session.commit()
+
+        # Emit booking events so dashboards update upcoming list in real time
+        socketio = current_app.extensions.get('socketio')
+        for payload in event_payloads:
+            try:
+                emit_booking_event(
+                    socketio,
+                    event="booking",
+                    data=payload,
+                    vendor_id=vendor_id,
+                )
+            except Exception as emit_error:
+                current_app.logger.warning(
+                    "pay_at_cafe.accept emit failed booking_id=%s err=%s",
+                    payload.get("booking_id") if isinstance(payload, dict) else None,
+                    emit_error,
+                )
         
         return jsonify({
             "success": True,
