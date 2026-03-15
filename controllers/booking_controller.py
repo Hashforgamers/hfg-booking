@@ -55,7 +55,7 @@ DEFAULT_SQUAD_PRICING_POLICY = {
 
 from sqlalchemy.sql import text
 from sqlalchemy.orm import joinedload
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, or_, cast, String
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy import func, distinct
 from services.mail_service import booking_mail, reject_booking_mail, extra_booking_time_mail
@@ -130,6 +130,13 @@ def get_effective_price(vendor_id: int, available_game) -> float:
     if current_offer is not None:
         return float(current_offer.offered_price)
     return float(available_game.single_slot_price)
+
+
+def _json_text_equals(column, key: str, value: str):
+    """
+    Dialect-safe JSON text comparison (SQLAlchemy 2.0 removed .astext).
+    """
+    return cast(column[key], String) == str(value)
 
 
 def get_effective_price_for_schedule(vendor_id: int, available_game, booking_date, slot_obj=None) -> float:
@@ -5166,7 +5173,7 @@ def accept_pay_at_cafe_booking():
             bookings_to_accept = (
                 Booking.query
                 .filter(Booking.status == 'pending_acceptance')
-                .filter(Booking.squad_details["batch_id"].astext == str(batch_id))
+                .filter(_json_text_equals(Booking.squad_details, "batch_id", batch_id))
                 .all()
             )
         else:
@@ -5368,7 +5375,7 @@ def reject_pay_at_cafe_booking():
             bookings_to_reject = (
                 Booking.query
                 .filter(Booking.status == 'pending_acceptance')
-                .filter(Booking.squad_details["batch_id"].astext == str(batch_id))
+                .filter(_json_text_equals(Booking.squad_details, "batch_id", batch_id))
                 .all()
             )
         else:
