@@ -5623,6 +5623,11 @@ def add_meals_to_booking(booking_id):
         # keep transaction pending and settle at end of session from Extra Payment overlay.
         settle_on_release = bool(data.get("settle_on_release", True))
         requested_mode = str(data.get("mode_of_payment") or "pending").strip().lower()
+        if not settle_on_release and requested_mode in {"", "pending"}:
+            return jsonify({
+                "success": False,
+                "message": "mode_of_payment is required when settle_on_release is false"
+            }), 400
         mode_for_transaction = "pending" if settle_on_release else requested_mode
         payment_use_case = (
             "pay_at_cafe"
@@ -5671,6 +5676,28 @@ def add_meals_to_booking(booking_id):
         # Commit database changes first
         db.session.commit()
         current_app.logger.info(f"✅ Database changes committed for booking {booking_id}")
+
+        # Emit a payment update event for realtime dashboards.
+        socketio = current_app.extensions.get('socketio')
+        if socketio:
+            payload = {
+                "vendorId": int(vendor_id),
+                "bookingId": int(booking_id),
+                "slotId": int(booking.slot_id) if booking.slot_id else None,
+                "userId": int(booking.user_id) if booking.user_id else None,
+                "username": user.name if user else None,
+                "game_id": int(booking.game_id) if booking.game_id else None,
+                "date": resolve_booking_booked_date(booking).isoformat(),
+                "event": "meals_added",
+                "settle_on_release": bool(settle_on_release),
+                "payment_use_case": payment_use_case,
+                "settlement_status": settlement_status,
+                "amount_added": float(total_meals_cost),
+            }
+            try:
+                socketio.emit("booking_payment_update", payload, to=f"vendor_{int(vendor_id)}")
+            except TypeError:
+                socketio.emit("booking_payment_update", payload, room=f"vendor_{int(vendor_id)}")
         
         email_sent_to = None
         # ✅ NEW: Send email notification with meal details using dedicated function
