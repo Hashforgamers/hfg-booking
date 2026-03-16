@@ -30,7 +30,8 @@ def booking_mail(
     price_paid,
     extra_meals=None,
     extra_controller_fare=0,
-    waive_off_amount=0
+    waive_off_amount=0,
+    app_fee_amount=0
 ):
     """
     Send booking confirmation email with optional meals
@@ -98,6 +99,9 @@ def booking_mail(
         </tr>
         """
 
+    app_fee_amount = float(app_fee_amount or 0)
+    net_amount = max(float(price_paid or 0) - app_fee_amount, 0.0)
+
     send_email(
         subject="🎮 Booking Confirmed – Hash Gaming Café",
         recipients=[gamer_email],
@@ -123,7 +127,9 @@ def booking_mail(
             <tr><td style="color:#bbbbbb;">Email</td><td>{gamer_email}</td></tr>
             <tr><td style="color:#bbbbbb;">Booking Date</td><td>{booking_date}</td></tr>
             <tr><td style="color:#bbbbbb;">Booked For</td><td>{booked_for_date}</td></tr>
-            <tr><td style="color:#bbbbbb;">Price Paid</td><td style="color:#00ff88;">₹{price_paid:.2f}</td></tr>
+            <tr><td style="color:#bbbbbb;">Total Paid</td><td style="color:#00ff88;">₹{float(price_paid or 0):.2f}</td></tr>
+            {f'<tr><td style="color:#bbbbbb;">Platform Fee</td><td style="color:#ffcc66;">₹{app_fee_amount:.2f}</td></tr>' if app_fee_amount > 0 else ''}
+            {f'<tr><td style="color:#bbbbbb;">Net to Cafe</td><td style="color:#8af2b2;">₹{net_amount:.2f}</td></tr>' if app_fee_amount > 0 else ''}
         </table>
 
         <h3 style="margin-top:30px;color:#00ff88;">🕒 Slot Details</h3>
@@ -165,7 +171,9 @@ def meals_added_mail(
     added_meals,
     meals_total,
     updated_booking_total,
-    booking_date=None
+    booking_date=None,
+    app_fee_amount=0,
+    net_total=None
 ):
     """
     Send notification email when meals are added to an existing active booking
@@ -180,6 +188,9 @@ def meals_added_mail(
             <td style="padding:12px;text-align:right;border-bottom:1px solid #2a3d2a;">₹{meal.get('total_price', 0):.2f}</td>
         </tr>
         """
+
+    app_fee_amount = float(app_fee_amount or 0)
+    resolved_net_total = float(net_total) if net_total is not None else max(float(updated_booking_total or 0) - app_fee_amount, 0.0)
 
     send_email(
         subject=f"🍽️ Meals Added to Your Booking #{booking_id} – Hash Gaming Café",
@@ -231,6 +242,8 @@ def meals_added_mail(
         <div style="background-color:#0d1a0d;border:2px solid #00ff88;padding:20px;margin:25px 0;border-radius:8px;text-align:center;">
             <p style="margin:0;color:#bbbbbb;font-size:14px;">Updated Booking Total</p>
             <p style="margin:10px 0 0 0;color:#00ff88;font-size:28px;font-weight:bold;">₹{updated_booking_total:.2f}</p>
+            {f'<p style="margin:8px 0 0 0;color:#ffcc66;font-size:13px;">Platform Fee: ₹{app_fee_amount:.2f}</p>' if app_fee_amount > 0 else ''}
+            {f'<p style="margin:4px 0 0 0;color:#8af2b2;font-size:13px;">Net to Cafe: ₹{resolved_net_total:.2f}</p>' if app_fee_amount > 0 else ''}
         </div>
 
         <div style="background-color:#1a1a1a;border-left:4px solid #ffaa00;padding:15px;margin:20px 0;border-radius:4px;">
@@ -306,7 +319,8 @@ def extra_booking_time_mail(
     console_type,
     console_number,
     amount,
-    mode_of_payment
+    mode_of_payment,
+    app_fee_amount=0
 ):
     """
     Send extra playtime receipt email
@@ -333,6 +347,8 @@ def extra_booking_time_mail(
             <tr><td style="padding:8px 0;color:#bbbbbb;">Slot</td><td style="text-align:right;">{slot_time}</td></tr>
             <tr><td style="padding:8px 0;color:#bbbbbb;">Console</td><td style="text-align:right;">{console_type} #{console_number}</td></tr>
             <tr><td style="padding:8px 0;color:#bbbbbb;">Amount</td><td style="text-align:right;color:#00ff88;font-weight:bold;">₹{amount}</td></tr>
+            {f'<tr><td style="padding:8px 0;color:#bbbbbb;">Platform Fee</td><td style="text-align:right;color:#ffcc66;">₹{float(app_fee_amount or 0):.2f}</td></tr>' if float(app_fee_amount or 0) > 0 else ''}
+            {f'<tr><td style="padding:8px 0;color:#bbbbbb;">Net to Cafe</td><td style="text-align:right;color:#8af2b2;">₹{max(float(amount or 0) - float(app_fee_amount or 0), 0.0):.2f}</td></tr>' if float(app_fee_amount or 0) > 0 else ''}
             <tr><td style="padding:8px 0;color:#bbbbbb;">Payment Mode</td><td style="text-align:right;">{mode_of_payment}</td></tr>
         </table>
 
@@ -358,6 +374,8 @@ def vendor_booking_notification_mail(
     payment_type,
     booking_details,
     total_amount_paid,
+    total_app_fee=0,
+    net_total_paid=None,
 ):
     """
     Notify vendor when a booking is confirmed from the Hash app.
@@ -374,6 +392,9 @@ def vendor_booking_notification_mail(
         """
         for b in booking_details
     )
+
+    total_app_fee = float(total_app_fee or 0)
+    resolved_net_total = float(net_total_paid) if net_total_paid is not None else max(float(total_amount_paid or 0) - total_app_fee, 0.0)
 
     send_email(
         subject=f"✅ New Booking Confirmed – {cafe_name}",
@@ -399,6 +420,8 @@ def vendor_booking_notification_mail(
             <tr><td style="color:#bbbbbb;">Booked For</td><td>{booked_for_date}</td></tr>
             <tr><td style="color:#bbbbbb;">Payment Type</td><td>{payment_type}</td></tr>
             <tr><td style="color:#bbbbbb;">Total Paid</td><td style="color:#00ff88;">₹{float(total_amount_paid or 0):.2f}</td></tr>
+            {f'<tr><td style="color:#bbbbbb;">Platform Fee</td><td style="color:#ffcc66;">₹{total_app_fee:.2f}</td></tr>' if total_app_fee > 0 else ''}
+            {f'<tr><td style="color:#bbbbbb;">Net to Cafe</td><td style="color:#8af2b2;">₹{resolved_net_total:.2f}</td></tr>' if total_app_fee > 0 else ''}
         </table>
 
         <h3 style="margin-top:26px;color:#00ff88;">🕒 Booking Details</h3>

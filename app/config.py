@@ -36,3 +36,7 @@ class Config:
 
     ENCRYPT_PRIVATE_KEY = load_key_from_file(os.getenv("ENCRYPT_PRIVATE_KEY_PATH", ""))
     ENCRYPT_PUBLIC_KEY = load_key_from_file(os.getenv("ENCRYPT_PUBLIC_KEY_PATH", ""))
+
+    # Optional platform fee (app fee) defaults to 0
+    APP_FEE_PERCENT = float(os.getenv("APP_FEE_PERCENT", "2") or 0)
+    APP_FEE_FLAT = float(os.getenv("APP_FEE_FLAT", "0") or 0)

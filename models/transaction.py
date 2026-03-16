@@ -31,6 +31,7 @@ class Transaction(db.Model):
     meals_amount = Column(Float, nullable=False, default=0)
     controller_amount = Column(Float, nullable=False, default=0)
     waive_off_amount = Column(Float, nullable=False, default=0)
+    app_fee_amount = Column(Float, nullable=False, default=0)
 
     # GST audit fields
     taxable_amount = Column(Float, nullable=False, default=0)

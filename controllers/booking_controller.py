@@ -56,6 +56,7 @@ DEFAULT_SQUAD_PRICING_POLICY = {
 from sqlalchemy.sql import text
 from sqlalchemy.orm import joinedload
 from sqlalchemy import and_, or_, cast, String
+import sqlalchemy as sa
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy import func, distinct
 from services.mail_service import booking_mail, reject_booking_mail, extra_booking_time_mail, vendor_booking_notification_mail
@@ -137,6 +138,116 @@ def _json_text_equals(column, key: str, value: str):
     Dialect-safe JSON text comparison (SQLAlchemy 2.0 removed .astext).
     """
     return func.replace(cast(column[key], String), '"', '') == str(value)
+
+
+def _parse_json_details(raw_value):
+    if raw_value is None:
+        return {}
+    if isinstance(raw_value, dict):
+        return raw_value
+    if isinstance(raw_value, str):
+        try:
+            parsed = json.loads(raw_value)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def resolve_app_fee_amount(amount: float, payload=None) -> float:
+    """
+    Resolve app fee (platform fee) for transparency.
+    Priority: explicit app_fee_amount > app_fee_percent > config defaults.
+    """
+    try:
+        amount_val = max(float(amount or 0.0), 0.0)
+    except (TypeError, ValueError):
+        amount_val = 0.0
+
+    data = payload or {}
+    explicit_amount_present = ("app_fee_amount" in data) or ("appFeeAmount" in data)
+    explicit_percent_present = ("app_fee_percent" in data) or ("appFeePercent" in data)
+
+    fee_amount = data.get("app_fee_amount") if "app_fee_amount" in data else data.get("appFeeAmount")
+    fee_percent = data.get("app_fee_percent") if "app_fee_percent" in data else data.get("appFeePercent")
+
+    if explicit_amount_present:
+        try:
+            resolved = float(fee_amount or 0)
+        except (TypeError, ValueError):
+            resolved = 0.0
+        return max(resolved, 0.0)
+
+    if explicit_percent_present:
+        try:
+            percent_val = float(fee_percent or 0)
+        except (TypeError, ValueError):
+            percent_val = 0.0
+        return round(amount_val * percent_val / 100.0, 2) if percent_val > 0 else 0.0
+
+    # Config defaults (apply flat only if > 0, otherwise percent)
+    config_percent = float(current_app.config.get("APP_FEE_PERCENT", 0) or 0)
+    config_flat = float(current_app.config.get("APP_FEE_FLAT", 0) or 0)
+    if config_flat > 0:
+        return round(config_flat, 2)
+    if config_percent > 0:
+        return round(amount_val * config_percent / 100.0, 2)
+
+    return 0.0
+
+
+def _resolve_pay_at_cafe_batch(bookings_query, batch_id, booking, vendor_id, action_label):
+    """
+    Resolve pay-at-cafe squad bookings by batch_id with a safe fallback that
+    avoids JSON-operator incompatibilities across dialects.
+    """
+    if not batch_id:
+        return [booking]
+
+    try:
+        bookings = (
+            bookings_query
+            .filter(_json_text_equals(Booking.squad_details, "batch_id", batch_id))
+            .all()
+        )
+        if bookings:
+            return bookings
+    except Exception as err:
+        current_app.logger.warning(
+            "Pay-at-cafe %s batch SQL filter failed vendor_id=%s batch_id=%s err=%s",
+            action_label,
+            vendor_id,
+            batch_id,
+            err,
+        )
+
+    # Fallback: filter in Python for maximum compatibility
+    try:
+        pending = bookings_query.all()
+        filtered = [
+            b for b in pending
+            if _parse_json_details(b.squad_details).get("batch_id") == batch_id
+        ]
+        if filtered:
+            current_app.logger.info(
+                "Pay-at-cafe %s batch fallback matched vendor_id=%s batch_id=%s count=%s",
+                action_label,
+                vendor_id,
+                batch_id,
+                len(filtered),
+            )
+            return filtered
+    except Exception as err:
+        current_app.logger.warning(
+            "Pay-at-cafe %s batch fallback failed vendor_id=%s batch_id=%s err=%s",
+            action_label,
+            vendor_id,
+            batch_id,
+            err,
+        )
+
+    # Final fallback: single booking
+    return [booking]
 
 
 def get_effective_price_for_schedule(vendor_id: int, available_game, booking_date, slot_obj=None) -> float:
@@ -1143,6 +1254,7 @@ def booking_pricing_preview():
             + float(extra_controller_fare or 0.0),
             0.0
         )
+        app_fee_amount = resolve_app_fee_amount(final_amount, data)
 
         if squad_enabled:
             normalized_squad_details["discount_per_slot"] = round(
@@ -1173,6 +1285,7 @@ def booking_pricing_preview():
                 "meals_total": round(float(total_meals_cost or 0.0), 2),
                 "extra_controller_qty": int(requested_extra_controller_qty),
                 "extra_controller_total": round(float(extra_controller_fare or 0.0), 2),
+                "app_fee_amount": round(float(app_fee_amount or 0.0), 2),
                 "final_amount": round(float(final_amount or 0.0), 2),
             },
             "meal_breakdown": meal_breakdown,
@@ -1272,6 +1385,7 @@ def booking_pricing_estimate():
                 extra_controller_fare = float(computed_controller_fare or 0.0)
 
         estimated_final_amount = max((slot_base_price - squad_discount_amount) + extra_controller_fare, 0.0)
+        app_fee_amount = resolve_app_fee_amount(estimated_final_amount, payload)
 
         if squad_enabled:
             normalized_squad_details["discount_per_slot"] = round(float(squad_discount_amount or 0.0), 2)
@@ -1298,6 +1412,7 @@ def booking_pricing_estimate():
                 "squad_discount_amount": round(squad_discount_amount, 2),
                 "extra_controller_qty": int(extra_controller_qty),
                 "extra_controller_total": round(extra_controller_fare, 2),
+                "app_fee_amount": round(float(app_fee_amount or 0.0), 2),
                 "estimated_final_amount": round(estimated_final_amount, 2),
             },
         }), 200
@@ -1421,6 +1536,7 @@ def compute_booking_financial_summary(booking_id: int):
                     "meals_amount": float(tx.meals_amount or 0),
                     "controller_amount": float(tx.controller_amount or 0),
                     "waive_off_amount": float(tx.waive_off_amount or 0),
+                    "app_fee_amount": float(getattr(tx, "app_fee_amount", 0) or 0),
                     "taxable_amount": float(tx.taxable_amount or 0),
                     "gst_rate": float(tx.gst_rate or 0),
                     "cgst_amount": float(tx.cgst_amount or 0),
@@ -1431,6 +1547,15 @@ def compute_booking_financial_summary(booking_id: int):
                 "created_at": tx.created_at.isoformat() if tx.created_at else None,
             } for tx in txns
         ],
+        "total_app_fee": round(sum(float(getattr(tx, "app_fee_amount", 0) or 0) for tx in txns), 2),
+        "net_total": round(
+            max(
+                sum(_line_total(tx) for tx in txns)
+                - sum(float(getattr(tx, "app_fee_amount", 0) or 0) for tx in txns),
+                0.0,
+            ),
+            2,
+        ),
     }
 
 
@@ -2534,6 +2659,10 @@ def confirm_booking():
             booking.updated_at = datetime.utcnow()
             booking.access_code_id = access_code_entry.id
 
+            app_fee_amount = resolve_app_fee_amount(amount_payable, data)
+            payment_use_case = normalize_payment_use_case(payment_mode_used, "app")
+            settlement_status = resolve_settlement_status(payment_use_case)
+
             # Create transaction
             transaction = Transaction(
                 booking_id=booking.id,
@@ -2544,10 +2673,17 @@ def confirm_booking():
                 discounted_amount=discount_amount,
                 amount=amount_payable,
                 mode_of_payment=payment_mode_used,
+                payment_use_case=payment_use_case,
+                settlement_status=settlement_status,
                 booking_date=datetime.utcnow().date(),
                 booked_date=book_date,
                 booking_time=datetime.utcnow().time(),
-                reference_id=payment_id if payment_mode_used == "payment_gateway" else None
+                reference_id=payment_id if payment_mode_used == "payment_gateway" else None,
+                base_amount=float(slot_price or 0.0),
+                meals_amount=float(extras_total_per_booking or 0.0),
+                controller_amount=0.0,
+                waive_off_amount=float(discount_amount or 0.0),
+                app_fee_amount=float(app_fee_amount or 0.0),
             )
             db.session.add(transaction)
             db.session.flush()
@@ -2673,7 +2809,9 @@ def confirm_booking():
                         "booking_id": booking.id,
                         "slot_time": f"{slot_obj.start_time} - {slot_obj.end_time}"
                     }],
-                    "price_paid": amount_payable
+                    "price_paid": amount_payable,
+                    "app_fee_amount": float(app_fee_amount or 0.0),
+                    "net_total": max(float(amount_payable or 0.0) - float(app_fee_amount or 0.0), 0.0),
                 })
 
             # Notify vendor for app-confirmed bookings
@@ -2689,6 +2827,8 @@ def confirm_booking():
                         "payment_type": _payment_label(payment_mode_used),
                         "booking_details": [],
                         "total_amount_paid": 0.0,
+                        "total_app_fee": 0.0,
+                        "net_total_paid": 0.0,
                     }
                 if job["payment_type"] != _payment_label(payment_mode_used):
                     job["payment_type"] = "Mixed"
@@ -2697,8 +2837,11 @@ def confirm_booking():
                     "slot_time": f"{slot_obj.start_time} - {slot_obj.end_time}",
                     "gamer_name": user.name,
                     "amount_paid": float(amount_payable or 0.0),
+                    "app_fee_amount": float(app_fee_amount or 0.0),
                 })
                 job["total_amount_paid"] = float(job.get("total_amount_paid") or 0.0) + float(amount_payable or 0.0)
+                job["total_app_fee"] = float(job.get("total_app_fee") or 0.0) + float(app_fee_amount or 0.0)
+                job["net_total_paid"] = float(job.get("net_total_paid") or 0.0) + max(float(amount_payable or 0.0) - float(app_fee_amount or 0.0), 0.0)
                 vendor_mail_jobs[vendor.id] = job
 
             confirmed_ids.append(booking.id)
@@ -2716,6 +2859,7 @@ def confirm_booking():
                         float(extra_controller_fare_total or 0.0)
                     )
                 controller_payment_mode = "wallet" if payment_mode == "wallet" else "payment_gateway"
+                controller_app_fee = resolve_app_fee_amount(float(extra_controller_fare_total or 0.0), data)
                 controller_transaction = Transaction(
                     booking_id=controller_booking.id,
                     vendor_id=controller_vendor.id,
@@ -2733,6 +2877,7 @@ def confirm_booking():
                     meals_amount=0.0,
                     controller_amount=extra_controller_fare_total,
                     waive_off_amount=0.0,
+                    app_fee_amount=float(controller_app_fee or 0.0),
                     booking_date=datetime.utcnow().date(),
                     booked_date=book_date,
                     booking_time=datetime.utcnow().time(),
@@ -2757,6 +2902,8 @@ def confirm_booking():
                             "payment_type": _payment_label(controller_payment_mode),
                             "booking_details": [],
                             "total_amount_paid": 0.0,
+                            "total_app_fee": 0.0,
+                            "net_total_paid": 0.0,
                         }
                     if job["payment_type"] != _payment_label(controller_payment_mode):
                         job["payment_type"] = "Mixed"
@@ -2765,8 +2912,11 @@ def confirm_booking():
                         "slot_time": slot_time_label,
                         "gamer_name": controller_user.name,
                         "amount_paid": float(extra_controller_fare_total or 0.0),
+                        "app_fee_amount": float(controller_app_fee or 0.0),
                     })
                     job["total_amount_paid"] = float(job.get("total_amount_paid") or 0.0) + float(extra_controller_fare_total or 0.0)
+                    job["total_app_fee"] = float(job.get("total_app_fee") or 0.0) + float(controller_app_fee or 0.0)
+                    job["net_total_paid"] = float(job.get("net_total_paid") or 0.0) + max(float(extra_controller_fare_total or 0.0) - float(controller_app_fee or 0.0), 0.0)
                     vendor_mail_jobs[controller_vendor.id] = job
 
         db.session.commit()
@@ -2945,7 +3095,14 @@ def direct_booking():
         
         _price = get_effective_price(available_game.vendor_id, available_game)
         # ✅ Store individual transaction details for each booking
+        slot_lookup = {
+            int(slot.id): slot
+            for slot in db.session.query(Slot).filter(Slot.id.in_([b.slot_id for b in bookings])).all()
+        }
+        event_payloads = []
+        inserted_rows = 0
         for booking in bookings:
+            app_fee_amount = resolve_app_fee_amount(_price, data)
             transaction = Transaction(
                 booking_id=booking.id,  # Linking each booking
                 vendor_id=vendor_id,
@@ -2957,12 +3114,83 @@ def direct_booking():
                 amount=_price,
                 discounted_amount=0,
                 mode_of_payment=payment_method,
+                payment_use_case=normalize_payment_use_case(payment_method, "dashboard"),
                 booking_type="direct",
-                settlement_status="pending" if payment_status != "paid" else "completed"
+                settlement_status="pending" if payment_status != "paid" else "completed",
+                base_amount=_price,
+                meals_amount=0.0,
+                controller_amount=0.0,
+                waive_off_amount=0.0,
+                app_fee_amount=float(app_fee_amount or 0.0),
             )
             db.session.add(transaction)
+            db.session.flush()
 
-        db.session.commit()  # ✅ Commit transactions
+            # Insert into vendor dashboard table so it appears in Upcoming
+            try:
+                slot_obj = slot_lookup.get(int(booking.slot_id))
+                dashboard_table = f"VENDOR_{vendor_id}_DASHBOARD"
+                book_status = "upcoming"
+                db.session.execute(text(f"""
+                    INSERT INTO {dashboard_table}
+                    (username, user_id, start_time, end_time, date, book_id, game_id, game_name, console_id, book_status)
+                    VALUES (:username, :user_id, :start_time, :end_time, :date, :book_id, :game_id, :game_name, :console_id, :book_status)
+                """), {
+                    "username": user_name,
+                    "user_id": user_id,
+                    "start_time": slot_obj.start_time if slot_obj else None,
+                    "end_time": slot_obj.end_time if slot_obj else None,
+                    "date": datetime.strptime(booked_date, "%Y-%m-%d").date(),
+                    "book_id": booking.id,
+                    "game_id": booking.game_id,
+                    "game_name": available_game.game_name,
+                    "console_id": -1,
+                    "book_status": book_status
+                })
+                inserted_rows += 1
+            except Exception as insert_err:
+                current_app.logger.warning(
+                    "Direct booking dashboard insert failed booking_id=%s err=%s",
+                    booking.id,
+                    insert_err
+                )
+
+            # Prepare websocket payload (emit after commit)
+            try:
+                slot_obj = slot_lookup.get(int(booking.slot_id))
+                event_payloads.append(
+                    build_booking_event_payload(
+                        vendor_id=vendor_id,
+                        booking_id=booking.id,
+                        slot_id=booking.slot_id,
+                        user_id=user_id,
+                        username=user_name,
+                        game_id=booking.game_id,
+                        game_name=available_game.game_name,
+                        date_value=datetime.strptime(booked_date, "%Y-%m-%d").date(),
+                        slot_price=available_game.single_slot_price,
+                        start_time=slot_obj.start_time if slot_obj else None,
+                        end_time=slot_obj.end_time if slot_obj else None,
+                        console_id=None,
+                        status="confirmed",
+                        booking_status="upcoming",
+                        squad_details=booking.squad_details or {}
+                    )
+                )
+            except Exception as payload_err:
+                current_app.logger.warning(
+                    "Direct booking event payload failed booking_id=%s err=%s",
+                    booking.id,
+                    payload_err
+                )
+
+        db.session.commit()  # ✅ Commit transactions + dashboard inserts
+        current_app.logger.info(
+            "Direct booking committed vendor_id=%s bookings=%s dashboard_inserts=%s",
+            vendor_id,
+            [b.id for b in bookings],
+            inserted_rows
+        )
 
         # ✅ Emit socket event
         for booking in bookings:
@@ -2971,6 +3199,17 @@ def direct_booking():
                 'booking_id': booking.id,
                 'status': 'booked'
             })
+        # ✅ Emit booking events for dashboard upcoming updates
+        for payload in event_payloads:
+            try:
+                emit_booking_event(socketio, event="booking", data=payload, vendor_id=vendor_id)
+                socketio.emit("booking_admin", payload, to="dashboard_admin")
+            except Exception as emit_err:
+                current_app.logger.warning(
+                    "Direct booking emit failed booking_id=%s err=%s",
+                    payload.get("booking_id") if isinstance(payload, dict) else None,
+                    emit_err
+                )
 
         return jsonify({
             "message": "Direct booking confirmed successfully",
@@ -3037,7 +3276,8 @@ def reject_booking():
             amount=-booking.transaction.amount,  # Negative amount for refund
             mode_of_payment=booking.transaction.mode_of_payment,
             booking_type=repayment_type,  # refund, credit, reschedule
-            settlement_status="processed" if repayment_type == "refund" else "pending"
+            settlement_status="processed" if repayment_type == "refund" else "pending",
+            app_fee_amount=0.0
         )
 
         db.session.add(new_transaction)
@@ -3841,6 +4081,7 @@ def new_booking(vendor_id):
             discounted_amount = waive_off_per_slot + squad_discount_per_slot
             final_amount = max(original_amount - discounted_amount, 0.0)
             gst = calculate_gst_breakdown(vendor_id, final_amount)
+            app_fee_amount = resolve_app_fee_amount(final_amount, data)
 
             transaction = Transaction(
                 booking_id=booking.id,
@@ -3865,6 +4106,7 @@ def new_booking(vendor_id):
                 meals_amount=slot_meal_cost,
                 controller_amount=0.0,
                 waive_off_amount=discounted_amount,
+                app_fee_amount=float(app_fee_amount or 0.0),
                 taxable_amount=gst["taxable_amount"],
                 gst_rate=gst["gst_rate"],
                 cgst_amount=gst["cgst_amount"],
@@ -3900,6 +4142,7 @@ def new_booking(vendor_id):
         # Handle extra controller fare
         if extra_controller_fare > 0:
             gst = calculate_gst_breakdown(vendor_id, extra_controller_fare)
+            app_fee_amount = resolve_app_fee_amount(extra_controller_fare, data)
             controller_transaction = Transaction(
                 booking_id=bookings[0].id,
                 vendor_id=vendor_id,
@@ -3923,6 +4166,7 @@ def new_booking(vendor_id):
                 meals_amount=0.0,
                 controller_amount=extra_controller_fare,
                 waive_off_amount=0.0,
+                app_fee_amount=float(app_fee_amount or 0.0),
                 taxable_amount=gst["taxable_amount"],
                 gst_rate=gst["gst_rate"],
                 cgst_amount=gst["cgst_amount"],
@@ -4100,6 +4344,7 @@ def new_booking(vendor_id):
                     "total_price": detail['total_price']
                 })
 
+        app_fee_total = resolve_app_fee_amount(total_paid, data)
         booking_mail(
             gamer_name=name,
             gamer_phone=phone,
@@ -4111,7 +4356,9 @@ def new_booking(vendor_id):
             price_paid=total_paid,
             extra_meals=email_meal_details,
             extra_controller_fare=extra_controller_fare,
-            waive_off_amount=waive_off_total
+            waive_off_amount=waive_off_total,
+            app_fee_amount=float(app_fee_total or 0.0),
+            net_total=max(float(total_paid or 0.0) - float(app_fee_total or 0.0), 0.0),
         )
 
         # ✅ ENHANCED SUCCESS LOG with booking mode
@@ -4548,6 +4795,7 @@ def extra_booking():
         original_amount = amount * effective_multiplier
         discounted_amount = waive_off_amount
         final_amount = max(original_amount - discounted_amount, 0.0)
+        app_fee_amount = resolve_app_fee_amount(final_amount, data)
         if credit_account:
             credit_limit_error = validate_monthly_credit_capacity(credit_account, final_amount)
             if credit_limit_error:
@@ -4577,6 +4825,7 @@ def extra_booking():
             meals_amount=0.0,
             controller_amount=0.0,
             waive_off_amount=discounted_amount,
+            app_fee_amount=float(app_fee_amount or 0.0),
             taxable_amount=gst["taxable_amount"],
             gst_rate=gst["gst_rate"],
             cgst_amount=gst["cgst_amount"],
@@ -4640,7 +4889,8 @@ def extra_booking():
             console_type=console_type,
             console_number=console_number,
             amount=final_amount,  # Use final_amount after waive-off
-            mode_of_payment=mode_of_payment
+            mode_of_payment=mode_of_payment,
+            app_fee_amount=float(app_fee_amount or 0.0),
         )
 
         summary = compute_booking_financial_summary(primary_booking.id)
@@ -5153,7 +5403,7 @@ def get_pending_pay_at_cafe_bookings(vendor_id):
                 else:
                     emitted_at_iso = datetime.utcnow().isoformat()
 
-                details = booking.squad_details if isinstance(booking.squad_details, dict) else {}
+                details = _parse_json_details(booking.squad_details)
                 resolved_date = _coerce_date_value(details.get("booked_date") or details.get("book_date"))
                 if not resolved_date:
                     resolved_date = booking.emitted_at.date() if booking.emitted_at else datetime.utcnow().date()
@@ -5170,7 +5420,7 @@ def get_pending_pay_at_cafe_bookings(vendor_id):
                 else:
                     time_slot = "N/A"
 
-                batch_id = details.get("batch_id") if isinstance(details, dict) else None
+                batch_id = details.get("batch_id")
                 key = str(batch_id) if batch_id else f"booking:{booking.bookingId}"
 
                 if key not in notifications_by_key:
@@ -5243,6 +5493,23 @@ def accept_pay_at_cafe_booking():
         vendor_id = data.get('vendor_id')
 
         current_app.logger.info(f"Accept pay at cafe booking: booking_id={booking_id}, vendor_id={vendor_id}")
+        try:
+            dialect = db.engine.dialect
+            current_app.logger.info(
+                "Pay-at-cafe accept env booking_id=%s vendor_id=%s sqlalchemy=%s dialect=%s driver=%s",
+                booking_id,
+                vendor_id,
+                sa.__version__,
+                getattr(dialect, "name", "unknown"),
+                getattr(dialect, "driver", "unknown"),
+            )
+        except Exception as env_err:
+            current_app.logger.warning(
+                "Pay-at-cafe accept env logging failed booking_id=%s vendor_id=%s err=%s",
+                booking_id,
+                vendor_id,
+                env_err,
+            )
 
         # Validation
         if not all([booking_id, vendor_id]):
@@ -5262,17 +5529,28 @@ def accept_pay_at_cafe_booking():
             return jsonify({"success": False, "message": "Unauthorized - This booking doesn't belong to your vendor"}), 403
 
         # Resolve batch scope (squad)
-        details = booking.squad_details if isinstance(booking.squad_details, dict) else {}
-        batch_id = details.get("batch_id") if isinstance(details, dict) else None
-        if batch_id:
-            bookings_to_accept = (
-                Booking.query
-                .filter(Booking.status == 'pending_acceptance')
-                .filter(_json_text_equals(Booking.squad_details, "batch_id", batch_id))
-                .all()
-            )
-        else:
-            bookings_to_accept = [booking]
+        details = _parse_json_details(booking.squad_details)
+        batch_id = details.get("batch_id")
+        base_query = (
+            Booking.query
+            .join(AvailableGame, Booking.game_id == AvailableGame.id)
+            .filter(Booking.status == 'pending_acceptance')
+            .filter(AvailableGame.vendor_id == vendor_id)
+        )
+        bookings_to_accept = _resolve_pay_at_cafe_batch(
+            base_query,
+            batch_id,
+            booking,
+            vendor_id,
+            action_label="accept",
+        )
+        current_app.logger.info(
+            "Pay-at-cafe accept batch resolved booking_id=%s vendor_id=%s batch_id=%s count=%s",
+            booking_id,
+            vendor_id,
+            batch_id,
+            len(bookings_to_accept),
+        )
 
         # Get related objects
         vendor = Vendor.query.filter_by(id=vendor_id).first()
@@ -5301,7 +5579,7 @@ def accept_pay_at_cafe_booking():
             booking_row.updated_at = datetime.utcnow()
             booking_row.access_code_id = access_code_entry.id
 
-            existing_details = booking_row.squad_details if isinstance(booking_row.squad_details, dict) else {}
+            existing_details = _parse_json_details(booking_row.squad_details)
             updated_details = dict(existing_details)
             if booked_date:
                 updated_details["booked_date"] = booked_date.isoformat()
@@ -5310,6 +5588,7 @@ def accept_pay_at_cafe_booking():
             booking_row.squad_details = updated_details
 
             _price = get_effective_price(vendor_id, available_game)
+            app_fee_amount = resolve_app_fee_amount(_price, data)
             transaction = Transaction(
                 booking_id=booking_row.id,
                 vendor_id=vendor_id,
@@ -5333,6 +5612,7 @@ def accept_pay_at_cafe_booking():
                 meals_amount=0.0,
                 controller_amount=0.0,
                 waive_off_amount=0.0,
+                app_fee_amount=float(app_fee_amount or 0.0),
             )
             db.session.add(transaction)
             db.session.flush()
@@ -5376,7 +5656,9 @@ def accept_pay_at_cafe_booking():
                         "booking_id": booking_row.id,
                         "slot_time": f"{slot_obj.start_time} - {slot_obj.end_time}"
                     }],
-                    price_paid=_price
+                    price_paid=_price,
+                    app_fee_amount=float(app_fee_amount or 0.0),
+                    net_total=max(float(_price or 0.0) - float(app_fee_amount or 0.0), 0.0),
                 )
 
         current_app.logger.info(
@@ -5431,7 +5713,12 @@ def accept_pay_at_cafe_booking():
 
     except Exception as e:
         db.session.rollback()
-        current_app.logger.exception(f"Error accepting pay at cafe booking: {e}")
+        current_app.logger.exception(
+            "Error accepting pay at cafe booking booking_id=%s vendor_id=%s error=%s",
+            data.get("booking_id") if isinstance(data, dict) else None,
+            data.get("vendor_id") if isinstance(data, dict) else None,
+            e
+        )
         return jsonify({
             "success": False,
             "message": "Failed to accept booking",
@@ -5466,17 +5753,21 @@ def reject_pay_at_cafe_booking():
         if not available_game or available_game.vendor_id != vendor_id:
             return jsonify({"success": False, "message": "Unauthorized - This booking doesn't belong to your vendor"}), 403
 
-        details = booking.squad_details if isinstance(booking.squad_details, dict) else {}
-        batch_id = details.get("batch_id") if isinstance(details, dict) else None
-        if batch_id:
-            bookings_to_reject = (
-                Booking.query
-                .filter(Booking.status == 'pending_acceptance')
-                .filter(_json_text_equals(Booking.squad_details, "batch_id", batch_id))
-                .all()
-            )
-        else:
-            bookings_to_reject = [booking]
+        details = _parse_json_details(booking.squad_details)
+        batch_id = details.get("batch_id")
+        base_query = (
+            Booking.query
+            .join(AvailableGame, Booking.game_id == AvailableGame.id)
+            .filter(Booking.status == 'pending_acceptance')
+            .filter(AvailableGame.vendor_id == vendor_id)
+        )
+        bookings_to_reject = _resolve_pay_at_cafe_batch(
+            base_query,
+            batch_id,
+            booking,
+            vendor_id,
+            action_label="reject",
+        )
 
         vendor = Vendor.query.filter_by(id=vendor_id).first()
         rejected_booking_ids = []
@@ -5745,6 +6036,7 @@ def add_meals_to_booking(booking_id):
         booking_date = datetime.utcnow().date()
         gst = calculate_gst_breakdown(vendor_id, total_meals_cost)
         
+        app_fee_amount = resolve_app_fee_amount(total_meals_cost, data)
         additional_transaction = Transaction(
             booking_id=booking_id,
             vendor_id=vendor_id,
@@ -5768,6 +6060,7 @@ def add_meals_to_booking(booking_id):
             meals_amount=total_meals_cost,
             controller_amount=0.0,
             waive_off_amount=0.0,
+            app_fee_amount=float(app_fee_amount or 0.0),
             taxable_amount=gst["taxable_amount"],
             gst_rate=gst["gst_rate"],
             cgst_amount=gst["cgst_amount"],
@@ -5846,6 +6139,8 @@ def add_meals_to_booking(booking_id):
                         added_meals=email_meal_details,
                         meals_total=float(total_meals_cost),
                         updated_booking_total=updated_total,
+                        app_fee_amount=float(summary_for_email.get("total_app_fee", 0.0) or 0.0),
+                        net_total=float(summary_for_email.get("net_total", 0.0) or 0.0),
                         booking_date=booking.created_at.strftime('%Y-%m-%d') if booking.created_at else datetime.utcnow().strftime('%Y-%m-%d')
                     )
                     
@@ -6018,6 +6313,7 @@ def settle_pending_booking_transactions(booking_id):
                 meals_amount=0.0,
                 controller_amount=0.0,
                 waive_off_amount=applied_waive_off,
+                app_fee_amount=0.0,
                 taxable_amount=0.0,
                 gst_rate=0.0,
                 cgst_amount=0.0,
@@ -6739,6 +7035,7 @@ def settle_monthly_credit(vendor_id):
             meals_amount=0.0,
             controller_amount=0.0,
             waive_off_amount=0.0,
+            app_fee_amount=0.0,
             taxable_amount=0.0,
             gst_rate=0.0,
             cgst_amount=0.0,
