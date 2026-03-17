@@ -684,6 +684,33 @@ def resolve_booking_booked_date(booking, fallback_date=None):
     return _coerce_date_value(fallback_date) or datetime.utcnow().date()
 
 
+def _default_repayment_type(payment_use_case: str) -> str:
+    normalized = str(payment_use_case or "").strip().lower()
+    if normalized in {"wallet", "hash_wallet", "wallet_credit", "monthly_credit", "pass", "cafe_pass", "global_pass"}:
+        return "credit"
+    if normalized in {"upi", "card", "credit_card", "debit_card", "gateway", "online"}:
+        return "refund"
+    return "refund"
+
+
+def _release_slot_for_booking(booking, vendor_id: int, booked_date):
+    try:
+        if not booking or not booking.slot_id or not vendor_id or not booked_date:
+            return False
+        db.session.execute(
+            text(f"""
+                UPDATE VENDOR_{int(vendor_id)}_SLOT
+                SET available_slot = available_slot + 1, is_available = TRUE
+                WHERE slot_id = :slot_id AND date = :booked_date
+            """),
+            {"slot_id": int(booking.slot_id), "booked_date": booked_date}
+        )
+        return True
+    except Exception as e:
+        current_app.logger.warning("Slot release failed booking_id=%s vendor=%s error=%s", booking.id if booking else None, vendor_id, e)
+        return False
+
+
 def normalize_payment_use_case(payment_type: str, source_channel: str) -> str:
     pt = str(payment_type or "").strip().lower()
     if pt in {"monthly_credit", "credit", "month_end"}:
@@ -3166,9 +3193,12 @@ def get_user_bookings():
 @booking_blueprint.route('/bookings/<int:booking_id>', methods=['DELETE'])
 def cancel_booking(booking_id):
     try:
-        success = BookingService.cancel_booking(booking_id)
-        socketio.emit('booking_updated', {'booking_id': booking_id, 'status': 'canceled'})
-        return jsonify({"message": success["message"]})
+        result = cancel_bookings_with_refund(
+            booking_ids=[booking_id],
+            repayment_type="none",
+            reason="Cancelled by client",
+        )
+        return jsonify(result)
     except ValueError:
         return jsonify({"message": "Booking not found"}), 404
 
@@ -4666,6 +4696,166 @@ def new_booking(vendor_id):
             "message": "Failed to process booking", 
             "error": str(e)
         }), 500
+
+
+def cancel_bookings_with_refund(booking_ids, repayment_type=None, reason=None):
+    if not booking_ids:
+        raise ValueError("booking_id or booking_ids required")
+
+    actor = resolve_transaction_actor(request)
+    cancelled_ids = []
+    refund_transactions = []
+    refund_total = 0.0
+    skipped_ids = []
+
+    booking_rows = (
+        Booking.query
+        .filter(Booking.id.in_([int(bid) for bid in booking_ids if bid]))
+        .all()
+    )
+    if not booking_rows:
+        raise ValueError("Booking not found")
+
+    for booking in booking_rows:
+        status = str(booking.status or "").strip().lower()
+        if status in {"cancelled", "canceled", "rejected", "completed", "discarded"}:
+            skipped_ids.append(int(booking.id))
+            continue
+
+        available_game = AvailableGame.query.get(booking.game_id)
+        vendor_id = (
+            int(available_game.vendor_id)
+            if available_game else
+            int(getattr(booking.transaction, "vendor_id", 0) or 0)
+        )
+        booked_date = resolve_booking_booked_date(booking)
+
+        _release_slot_for_booking(booking, vendor_id, booked_date)
+
+        booking.status = "cancelled"
+        booking.updated_at = datetime.utcnow()
+        cancelled_ids.append(int(booking.id))
+
+        # Determine if a refund/credit is required
+        tx = (
+            db.session.query(Transaction)
+            .filter(Transaction.booking_id == booking.id)
+            .order_by(Transaction.id.asc())
+            .first()
+        )
+        if tx and float(tx.amount or 0) > 0:
+            payment_use_case = str(tx.payment_use_case or tx.mode_of_payment or "").strip().lower()
+            settlement_status = str(tx.settlement_status or "").strip().lower()
+            is_pay_at_cafe = payment_use_case == "pay_at_cafe" or settlement_status in {"pending", "unpaid", "due"}
+
+            if not is_pay_at_cafe and repayment_type != "none":
+                chosen_repayment = repayment_type or _default_repayment_type(payment_use_case)
+                refund_amount = float(tx.amount or 0)
+                refund_total += refund_amount
+                refund_tx = Transaction(
+                    booking_id=booking.id,
+                    vendor_id=tx.vendor_id,
+                    user_id=booking.user_id,
+                    booked_date=booked_date,
+                    booking_date=datetime.utcnow().date(),
+                    booking_time=datetime.utcnow().time(),
+                    user_name=f"{tx.user_name} {chosen_repayment.upper()}-{tx.id}",
+                    original_amount=-refund_amount,
+                    discounted_amount=0,
+                    amount=-refund_amount,
+                    mode_of_payment=tx.mode_of_payment,
+                    payment_use_case=tx.payment_use_case,
+                    booking_type=chosen_repayment,
+                    settlement_status="processed" if chosen_repayment == "refund" else "pending",
+                    source_channel=actor["source_channel"],
+                    initiated_by_staff_id=actor["staff_id"],
+                    initiated_by_staff_name=actor["staff_name"],
+                    initiated_by_staff_role=actor["staff_role"],
+                    app_fee_amount=0.0,
+                )
+                db.session.add(refund_tx)
+                refund_transactions.append(refund_tx)
+
+    db.session.commit()
+
+    socketio = current_app.extensions.get('socketio')
+    for booking in booking_rows:
+        if booking.id not in cancelled_ids:
+            continue
+        vendor_id = (
+            int(AvailableGame.query.get(booking.game_id).vendor_id)
+            if booking.game_id else None
+        )
+        try:
+            payload = {
+                "booking_id": booking.id,
+                "slot_id": booking.slot_id,
+                "vendor_id": vendor_id,
+                "user_id": booking.user_id,
+                "game_id": booking.game_id,
+                "status": "cancelled",
+                "booking_status": "cancelled",
+                "date": resolve_booking_booked_date(booking).isoformat(),
+            }
+            emit_booking_event(socketio, event="booking", data=payload, vendor_id=vendor_id)
+        except Exception:
+            current_app.logger.warning("Failed emitting booking cancel event booking_id=%s", booking.id)
+
+        if socketio:
+            try:
+                socketio.emit(
+                    "booking_payment_update",
+                    {
+                        "vendorId": vendor_id,
+                        "bookingId": booking.id,
+                        "event": "booking_cancelled",
+                        "repayment_type": repayment_type or "none",
+                        "refund_total": float(refund_total or 0),
+                    },
+                    to=f"vendor_{int(vendor_id)}" if vendor_id else None,
+                )
+            except TypeError:
+                socketio.emit(
+                    "booking_payment_update",
+                    {
+                        "vendorId": vendor_id,
+                        "bookingId": booking.id,
+                        "event": "booking_cancelled",
+                        "repayment_type": repayment_type or "none",
+                        "refund_total": float(refund_total or 0),
+                    },
+                    room=f"vendor_{int(vendor_id)}" if vendor_id else None,
+                )
+
+    return {
+        "success": True,
+        "message": "Booking cancelled",
+        "cancelled_ids": cancelled_ids,
+        "skipped_ids": skipped_ids,
+        "refund_total": float(refund_total or 0),
+        "repayment_type": repayment_type or "none",
+        "reason": reason,
+    }
+
+
+@booking_blueprint.route('/bookings/cancel', methods=['POST'])
+def cancel_bookings_route():
+    try:
+        data = request.get_json(silent=True) or {}
+        booking_ids = data.get("booking_ids") or []
+        booking_id = data.get("booking_id")
+        if booking_id:
+            booking_ids = booking_ids or [booking_id]
+        repayment_type = data.get("repayment_type")
+        reason = data.get("reason")
+        result = cancel_bookings_with_refund(booking_ids, repayment_type=repayment_type, reason=reason)
+        return jsonify(result), 200
+    except ValueError as e:
+        return jsonify({"success": False, "message": str(e)}), 404
+    except Exception as e:
+        current_app.logger.exception("Failed to cancel booking")
+        db.session.rollback()
+        return jsonify({"success": False, "message": "Failed to cancel booking", "error": str(e)}), 500
 
 
 
