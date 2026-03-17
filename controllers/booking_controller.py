@@ -4204,17 +4204,16 @@ def new_booking(vendor_id):
             if squad_discount_applicable else 0.0
         )
 
-        if not slot_map:
-            slot_map = {
-                int(s.id): s
-                for s in Slot.query.filter(Slot.id.in_([b.slot_id for b in bookings])).all()
-            }
+        runtime_slot_map = {
+            int(s.id): s
+            for s in Slot.query.filter(Slot.id.in_([b.slot_id for b in bookings])).all()
+        }
         slot_pricing = {}
         total_unit_price = 0.0
         total_base_before_discount = 0.0
         total_discount = 0.0
         for booking in bookings:
-            slot_obj = slot_map.get(int(booking.slot_id))
+            slot_obj = runtime_slot_map.get(int(booking.slot_id))
             unit_price = float(get_effective_price_for_schedule(vendor_id, available_game, booked_date_obj, slot_obj) or 0.0)
             total_unit_price += unit_price
             base_slot_price = unit_price * (squad_player_multiplier if is_pc_squad else 1)
