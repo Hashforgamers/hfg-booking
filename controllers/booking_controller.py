@@ -521,6 +521,8 @@ def _coerce_date_value(raw_value):
         if not text_value:
             return None
         try:
+            if len(text_value) == 8 and text_value.isdigit():
+                return datetime.strptime(text_value, "%Y%m%d").date()
             if "T" in text_value:
                 return datetime.fromisoformat(text_value).date()
             return datetime.strptime(text_value, "%Y-%m-%d").date()
@@ -3553,6 +3555,11 @@ def new_booking(vendor_id):
             return jsonify({"message": "extraControllerQty must be a valid integer"}), 400
         selected_meals = data.get("selectedMeals", [])
         squad_payload = data.get("squadDetails") or {}
+
+        booked_date_obj = _coerce_date_value(booked_date)
+        if not booked_date_obj:
+            return jsonify({"message": "Invalid bookedDate format. Use YYYY-MM-DD or YYYYMMDD."}), 400
+        booked_date_str = booked_date_obj.strftime("%Y-%m-%d")
         
         # ✅ NEW: Get booking mode from frontend
         booking_mode = data.get("bookingMode", "regular")
@@ -3934,7 +3941,7 @@ def new_booking(vendor_id):
                     game_id=available_game.id,
                     user_id=user.id,
                     socketio=socketio,
-                    book_date=datetime.strptime(booked_date, '%Y-%m-%d').date(),
+                    book_date=booked_date_obj,
                     is_pay_at_cafe=(payment_type == 'Cash'),
                     booking_mode=booking_mode,  # ✅ PASS BOOKING MODE HERE
                     squad_details=normalized_squad_details if squad_enabled else None,
@@ -4087,7 +4094,7 @@ def new_booking(vendor_id):
                 booking_id=booking.id,
                 vendor_id=vendor_id,
                 user_id=user.id,
-                booked_date=datetime.strptime(booked_date, "%Y-%m-%d").date(),
+                booked_date=booked_date_obj,
                 booking_date=datetime.utcnow().date(),
                 booking_time=datetime.utcnow().time(),
                 user_name=user.name,
@@ -4120,7 +4127,7 @@ def new_booking(vendor_id):
 
             if credit_account and final_amount > 0:
                 due_date = compute_credit_due_date(
-                    datetime.strptime(booked_date, "%Y-%m-%d").date(),
+                    booked_date_obj,
                     credit_account.billing_cycle_day
                 )
                 db.session.add(
@@ -4130,7 +4137,7 @@ def new_booking(vendor_id):
                         entry_type="charge",
                         amount=final_amount,
                         description=f"Booking charge #{booking.id}",
-                        booked_date=datetime.strptime(booked_date, "%Y-%m-%d").date(),
+                        booked_date=booked_date_obj,
                         due_date=due_date,
                         source_channel=actor["source_channel"],
                         staff_id=actor["staff_id"],
@@ -4147,7 +4154,7 @@ def new_booking(vendor_id):
                 booking_id=bookings[0].id,
                 vendor_id=vendor_id,
                 user_id=user.id,
-                booked_date=datetime.strptime(booked_date, "%Y-%m-%d").date(),
+                booked_date=booked_date_obj,
                 booking_date=datetime.utcnow().date(),
                 booking_time=datetime.utcnow().time(),
                 user_name=user.name,
@@ -4180,7 +4187,7 @@ def new_booking(vendor_id):
 
             if credit_account:
                 due_date = compute_credit_due_date(
-                    datetime.strptime(booked_date, "%Y-%m-%d").date(),
+                    booked_date_obj,
                     credit_account.billing_cycle_day
                 )
                 db.session.add(
@@ -4190,7 +4197,7 @@ def new_booking(vendor_id):
                         entry_type="charge",
                         amount=extra_controller_fare,
                         description=f"Extra controller charge #{bookings[0].id}",
-                        booked_date=datetime.strptime(booked_date, "%Y-%m-%d").date(),
+                        booked_date=booked_date_obj,
                         due_date=due_date,
                         source_channel=actor["source_channel"],
                         staff_id=actor["staff_id"],
@@ -4201,7 +4208,7 @@ def new_booking(vendor_id):
 
         # Resolve runtime lifecycle and console assignment.
         # If slot is live in IST, assign console now and start as current.
-        booked_for_date_obj = datetime.strptime(booked_date, "%Y-%m-%d").date()
+        booked_for_date_obj = booked_date_obj
         slot_map = {
             int(s.id): s
             for s in Slot.query.filter(Slot.id.in_([b.slot_id for b in bookings])).all()
@@ -4351,7 +4358,7 @@ def new_booking(vendor_id):
             gamer_email=email,
             cafe_name=cafe_name,
             booking_date=datetime.utcnow().strftime("%Y-%m-%d"),
-            booked_for_date=booked_date,
+            booked_for_date=booked_date_str,
             booking_details=booking_details,
             price_paid=total_paid,
             extra_meals=email_meal_details,
@@ -6583,13 +6590,11 @@ def get_slot_bookings(vendor_id):
                 'message': 'Invalid slot_ids format'
             }), 400
         
-        # Parse date
-        try:
-            booking_date = datetime.strptime(date_param, '%Y-%m-%d').date()
-        except ValueError:
+        booking_date = _coerce_date_value(date_param)
+        if not booking_date:
             return jsonify({
                 'success': False,
-                'message': 'Invalid date format. Use YYYY-MM-DD'
+                'message': 'Invalid date format. Use YYYY-MM-DD or YYYYMMDD'
             }), 400
         
         current_app.logger.info(
