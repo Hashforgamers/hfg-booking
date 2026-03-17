@@ -31,7 +31,8 @@ def booking_mail(
     extra_meals=None,
     extra_controller_fare=0,
     waive_off_amount=0,
-    app_fee_amount=0
+    app_fee_amount=0,
+    net_total=None
 ):
     """
     Send booking confirmation email with optional meals
@@ -100,7 +101,7 @@ def booking_mail(
         """
 
     app_fee_amount = float(app_fee_amount or 0)
-    net_amount = max(float(price_paid or 0) - app_fee_amount, 0.0)
+    net_amount = float(net_total) if net_total is not None else max(float(price_paid or 0) - app_fee_amount, 0.0)
 
     send_email(
         subject="🎮 Booking Confirmed – Hash Gaming Café",

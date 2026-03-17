@@ -250,6 +250,129 @@ def _resolve_pay_at_cafe_batch(bookings_query, batch_id, booking, vendor_id, act
     return [booking]
 
 
+def _pricing_log_enabled() -> bool:
+    try:
+        return bool(current_app.config.get("LOG_BOOKING_PRICING"))
+    except Exception:
+        return False
+
+
+def _log_pricing_event(event: str, **fields):
+    if not _pricing_log_enabled():
+        return
+    safe_fields = {k: v for k, v in fields.items() if v is not None}
+    try:
+        payload = json.dumps(safe_fields, default=str, ensure_ascii=True)
+    except Exception:
+        payload = str(safe_fields)
+    current_app.logger.info("pricing.%s %s", event, payload)
+
+
+def _compute_pay_at_cafe_pricing(vendor_id: int, available_game, squad_details: dict, booking_date=None, slot_obj=None):
+    """
+    Resolve pay-at-cafe pricing with squad support.
+    Returns dict: base_amount, discounted_amount, final_amount, controller_amount, controller_qty,
+    player_count, pricing_mode, console_group, discount_percent.
+    """
+    base_price = None
+    if booking_date is not None:
+        try:
+            base_price = float(get_effective_price_for_schedule(vendor_id, available_game, booking_date, slot_obj) or 0.0)
+        except Exception as pricing_err:
+            current_app.logger.warning(
+                "Pay-at-cafe schedule pricing failed vendor_id=%s game_id=%s date=%s err=%s",
+                vendor_id, getattr(available_game, "id", None), booking_date, pricing_err
+            )
+            base_price = None
+    if base_price is None:
+        base_price = float(get_effective_price(vendor_id, available_game) or 0.0)
+    details = squad_details if isinstance(squad_details, dict) else {}
+    if not details.get("enabled"):
+        return {
+            "base_amount": base_price,
+            "discounted_amount": 0.0,
+            "final_amount": base_price,
+            "controller_amount": 0.0,
+            "controller_qty": 0,
+            "player_count": 1,
+            "pricing_mode": "solo_only",
+            "console_group": _resolve_console_group(getattr(available_game, "game_name", "") or ""),
+            "discount_percent": 0.0,
+        }
+
+    console_group = str(
+        details.get("console_group") or _resolve_console_group(getattr(available_game, "game_name", "") or "")
+    ).lower()
+    pricing_mode = str(
+        details.get("pricing_mode") or _resolve_squad_pricing_mode(getattr(available_game, "game_name", "") or "")
+    ).lower()
+    try:
+        player_count = int(details.get("player_count") or details.get("playerCount") or 1)
+    except (TypeError, ValueError):
+        player_count = 1
+    player_count = max(player_count, 1)
+
+    discount_percent = float(
+        details.get("discount_percent")
+        or _resolve_squad_discount_percent(
+            getattr(available_game, "game_name", "") or "",
+            player_count,
+            policy=_load_squad_pricing_policy(vendor_id),
+        )
+        or 0.0
+    )
+
+    controller_qty = int(details.get("suggested_extra_controller_qty") or details.get("suggestedExtraControllerQty") or 0)
+    if pricing_mode == "controller_pricing":
+        controller_qty = max(controller_qty, player_count - 1)
+    controller_amount = 0.0
+
+    if console_group == "pc":
+        base_amount = base_price * player_count
+        discount_amount = (base_amount * discount_percent / 100.0) if pricing_mode == "squad_discount" else 0.0
+        final_amount = max(base_amount - discount_amount, 0.0)
+        return {
+            "base_amount": base_amount,
+            "discounted_amount": discount_amount,
+            "final_amount": final_amount,
+            "controller_amount": 0.0,
+            "controller_qty": 0,
+            "player_count": player_count,
+            "pricing_mode": pricing_mode,
+            "console_group": console_group,
+            "discount_percent": discount_percent,
+        }
+
+    if console_group in {"ps", "xbox"} and pricing_mode == "controller_pricing" and controller_qty > 0:
+        computed_controller_fare = calculate_extra_controller_fare(
+            vendor_id=vendor_id,
+            available_game_id=available_game.id,
+            quantity=controller_qty,
+        )
+        if computed_controller_fare is None:
+            current_app.logger.warning(
+                "Pay-at-cafe controller pricing missing vendor_id=%s game_id=%s qty=%s",
+                vendor_id, available_game.id, controller_qty
+            )
+            controller_amount = 0.0
+        else:
+            controller_amount = float(computed_controller_fare or 0.0)
+
+    base_amount = base_price
+    final_amount = max(base_amount + controller_amount, 0.0)
+    return {
+        "base_amount": base_amount,
+        "discounted_amount": 0.0,
+        "final_amount": final_amount,
+        "controller_amount": controller_amount,
+        "controller_qty": max(controller_qty, 0),
+        "player_count": player_count,
+        "pricing_mode": pricing_mode,
+        "console_group": console_group,
+        "discount_percent": discount_percent,
+    }
+
+
 def get_effective_price_for_schedule(vendor_id: int, available_game, booking_date, slot_obj=None) -> float:
     """
     Returns offered price for the selected booking date/slot window if an active pricing
@@ -305,6 +428,16 @@ def get_effective_price_for_schedule(vendor_id: int, available_game, booking_dat
 
     current_offer = query.order_by(ConsolePricingOffer.offered_price.asc()).first()
     if current_offer is not None:
+        _log_pricing_event(
+            "schedule_offer",
+            vendor_id=vendor_id,
+            game_id=getattr(available_game, "id", None),
+            booking_date=booking_date,
+            slot_start=slot_start,
+            slot_end=slot_end,
+            offer_id=current_offer.id,
+            offered_price=float(current_offer.offered_price or 0.0),
+        )
         return float(current_offer.offered_price)
     return float(available_game.single_slot_price or 0.0)
 
@@ -563,6 +696,8 @@ def normalize_payment_use_case(payment_type: str, source_channel: str) -> str:
         return "card"
     if pt in {"pass", "date_pass", "hour_pass"}:
         return "pass"
+    if pt in {"free", "zero", "no_charge"}:
+        return "free"
     if pt in {"wallet", "hash_wallet"}:
         return "hash_wallet"
     if pt in {"gateway", "payment_gateway", "paid", "online"}:
@@ -593,7 +728,7 @@ def resolve_settlement_status(payment_use_case: str) -> str:
         return "pending"
     if payment_use_case == "monthly_credit":
         return "pending"
-    if payment_use_case in {"cash", "upi", "card", "payment_gateway", "hash_wallet", "pass"}:
+    if payment_use_case in {"cash", "upi", "card", "payment_gateway", "hash_wallet", "pass", "free"}:
         return "completed"
     return "pending"
 
@@ -977,13 +1112,9 @@ def booking_pricing_preview():
             except (TypeError, ValueError):
                 return jsonify({"success": False, "message": "slot_id contains invalid values"}), 400
 
-        try:
-            if "T" in str(book_date_str):
-                book_date = datetime.fromisoformat(str(book_date_str)).date()
-            else:
-                book_date = datetime.strptime(str(book_date_str), "%Y-%m-%d").date()
-        except ValueError:
-            return jsonify({"success": False, "message": "Invalid book_date format"}), 400
+        book_date = _coerce_date_value(book_date_str)
+        if not book_date:
+            return jsonify({"success": False, "message": "Invalid book_date format. Use YYYY-MM-DD or YYYYMMDD."}), 400
 
         available_game = _resolve_available_game_for_vendor(
             vendor_id=vendor_id,
@@ -1311,6 +1442,13 @@ def booking_pricing_estimate():
         vendor_id = query.get("vendor_id", payload.get("vendor_id"))
         game_id = query.get("game_id", payload.get("game_id"))
         console_type = query.get("consoleType") or query.get("console_type") or payload.get("consoleType") or payload.get("console_type")
+        book_date_param = (
+            query.get("book_date")
+            or query.get("booking_date")
+            or payload.get("book_date")
+            or payload.get("booking_date")
+        )
+        book_date = _coerce_date_value(book_date_param) if book_date_param else None
         squad_payload = payload.get("squadDetails") or payload.get("squad_details") or {}
         if not squad_payload:
             squad_enabled_raw = query.get("squadEnabled", query.get("enabled", payload.get("squadEnabled", payload.get("enabled"))))
@@ -1358,7 +1496,10 @@ def booking_pricing_estimate():
         ).strip().lower()
         is_pc_squad = bool(squad_enabled and console_group == "pc")
         squad_player_count = int(normalized_squad_details.get("player_count") or normalized_squad_details.get("playerCount") or 1)
-        effective_price = get_effective_price(vendor_id, available_game)
+        effective_price = (
+            get_effective_price_for_schedule(vendor_id, available_game, book_date)
+            if book_date else get_effective_price(vendor_id, available_game)
+        )
 
         slot_unit_price = float(effective_price or 0.0)
         slot_base_price = slot_unit_price * (squad_player_count if is_pc_squad else 1)
@@ -1400,7 +1541,7 @@ def booking_pricing_estimate():
             "matched_game_id": int(available_game.id),
             "matched_game_name": available_game.game_name,
             "estimate_scope": "per_slot",
-            "price_basis": "current_effective_price",
+            "price_basis": "scheduled_effective_price" if book_date else "current_effective_price",
             "squad_details": normalized_squad_details if squad_enabled else {
                 "enabled": False,
                 "player_count": 1,
@@ -1705,6 +1846,10 @@ def create_booking():
         log.warning("bookings.post.validation_failed cid=%s", cid)
         return jsonify({"message": "slot_id, game_id, user_id, and book_date are required"}), 400
 
+    book_date_obj = _coerce_date_value(book_date)
+    if not book_date_obj:
+        return jsonify({"message": "Invalid book_date format. Use YYYY-MM-DD or YYYYMMDD."}), 400
+
     try:
         socketio = current_app.extensions.get('socketio')
         scheduler = current_app.extensions.get('scheduler')
@@ -1749,7 +1894,7 @@ def create_booking():
                     SELECT available_slot, is_available
                     FROM VENDOR_{vendor_id}_SLOT
                     WHERE slot_id = :slot_id AND date = :book_date
-                """), {"slot_id": slot_id, "book_date": book_date}).fetchone()
+                """), {"slot_id": slot_id, "book_date": book_date_obj}).fetchone()
 
                 log.info("bookings.post.slot_check.result cid=%s slot_id=%s has_entry=%s entry=%s",
                          cid, slot_id, bool(slot_entry), (tuple(slot_entry) if slot_entry else None))
@@ -1766,7 +1911,7 @@ def create_booking():
                     game_id=game_id,
                     user_id=user_id,
                     socketio=socketio,
-                    book_date=book_date,
+                    book_date=book_date_obj,
                     is_pay_at_cafe=is_pay_at_cafe,
                     squad_details=normalized_squad_details if squad_enabled else None,
                     slot_units=slot_units,
@@ -1789,7 +1934,7 @@ def create_booking():
                         BookingService.release_slot,
                         slot_id,
                         booking.id,
-                        book_date
+                        book_date_obj
                     )
                     log.info("bookings.post.release_scheduled cid=%s slot_id=%s booking_id=%s delay_sec=%s",
                              cid, slot_id, booking.id, 360)
@@ -1845,15 +1990,14 @@ def release_slot():
                 errors.append({"index": index, "error": "slot_id, booking_id, and book_date are required"})
                 continue
 
-            # Validate date format
-            try:
-                datetime.strptime(book_date, '%Y-%m-%d')
-            except ValueError:
-                errors.append({"index": index, "error": "book_date must be in YYYY-MM-DD format"})
+            # Validate date format (accept YYYY-MM-DD or YYYYMMDD)
+            book_date_obj = _coerce_date_value(book_date)
+            if not book_date_obj:
+                errors.append({"index": index, "error": "book_date must be in YYYY-MM-DD or YYYYMMDD format"})
                 continue
 
             try:
-                BookingService.release_slot(slot_id, booking_id, book_date)
+                BookingService.release_slot(slot_id, booking_id, book_date_obj.strftime("%Y-%m-%d"))
                 success_count += 1
             except Exception as e:
                 errors.append({"index": index, "error": f"Failed to release slot: {str(e)}"})
@@ -1949,14 +2093,10 @@ def confirm_booking():
         if use_pass and not user_pass_id:
             return jsonify({'message': 'user_pass_id is required when use_pass=true'}), 400
 
-        # Parse book_date
-        try:
-            if 'T' in book_date_str:
-                book_date = datetime.fromisoformat(book_date_str).date()
-            else:
-                book_date = datetime.strptime(book_date_str, '%Y-%m-%d').date()
-        except ValueError:
-            return jsonify({"message": "Invalid book_date format"}), 400
+        # Parse book_date (accept YYYY-MM-DD, YYYYMMDD, or ISO)
+        book_date = _coerce_date_value(book_date_str)
+        if not book_date:
+            return jsonify({"message": "Invalid book_date format. Use YYYY-MM-DD or YYYYMMDD."}), 400
 
         # Setup Razorpay client
         RAZORPAY_KEY_ID = current_app.config.get("RAZORPAY_KEY_ID")
@@ -2019,6 +2159,10 @@ def confirm_booking():
             if not all([available_game, vendor, slot_obj, user]):
                 current_app.logger.warning(f"Booking {booking_id} missing related data")
                 continue
+
+            slot_unit_price = float(
+                get_effective_price_for_schedule(vendor.id, available_game, book_date, slot_obj) or 0.0
+            )
 
             # Pass logic
             active_pass = None
@@ -2274,14 +2418,10 @@ def confirm_booking():
             # Will auto-select best available pass
             pass
 
-        # Parse book_date
-        try:
-            if 'T' in book_date_str:
-                book_date = datetime.fromisoformat(book_date_str).date()
-            else:
-                book_date = datetime.strptime(book_date_str, '%Y-%m-%d').date()
-        except ValueError:
-            return jsonify({"message": "Invalid book_date format"}), 400
+        # Parse book_date (accept YYYY-MM-DD, YYYYMMDD, or ISO)
+        book_date = _coerce_date_value(book_date_str)
+        if not book_date:
+            return jsonify({"message": "Invalid book_date format. Use YYYY-MM-DD or YYYYMMDD."}), 400
 
         if isinstance(booking_ids, int):
             booking_ids = [booking_ids]
@@ -2577,7 +2717,7 @@ def confirm_booking():
                     pass_type_name = user_hour_pass.cafe_pass.name
                     
                     # Slot is free with pass
-                    slot_price = effective_price_by_game.get(available_game.id, float(available_game.single_slot_price))
+                    slot_price = slot_unit_price
                     discount_amount = slot_price
                     amount_payable = 0  # Free slot
                     
@@ -2607,17 +2747,18 @@ def confirm_booking():
                     return jsonify({"message": "Invalid or expired date-based pass"}), 400
                 pass_used_id = active_pass.id
                 pass_type_name = active_pass.cafe_pass.pass_type.name if active_pass.cafe_pass.pass_type else None
-                slot_price = effective_price_by_game.get(available_game.id, float(available_game.single_slot_price))
+                slot_price = slot_unit_price
                 discount_amount = slot_price
                 amount_payable = 0
 
             # NO PASS - REGULAR PAYMENT
             else:
-                slot_price = base_slot_price_for_squad_by_game.get(
-                    available_game.id,
-                    effective_price_by_game.get(available_game.id, float(available_game.single_slot_price or 0.0))
+                slot_price = slot_unit_price * (squad_player_count if is_pc_squad_booking else 1)
+                discount_amount = (
+                    (slot_price * float(persisted_squad_details.get("discount_percent") or 0.0) / 100.0)
+                    if is_pc_squad_booking and str(persisted_squad_details.get("pricing_mode") or "") == "squad_discount"
+                    else 0.0
                 )
-                discount_amount = float(squad_discount_per_slot_by_game.get(available_game.id, 0.0))
                 amount_payable = max(slot_price - discount_amount, 0.0)
 
             # Add per-slot share of extras
@@ -2653,6 +2794,19 @@ def confirm_booking():
                     return jsonify({"message": "Payment not verified"}), 400
                 else:
                     payment_mode_used = "payment_gateway"
+
+            _log_pricing_event(
+                "app_confirm_booking_line",
+                vendor_id=vendor.id,
+                booking_id=booking.id,
+                slot_id=booking.slot_id,
+                book_date=book_date,
+                unit_price=slot_unit_price,
+                discount_amount=discount_amount,
+                extras_total=extras_total_per_booking,
+                amount_payable=amount_payable,
+                payment_mode=payment_mode_used,
+            )
 
             # payment label available via _payment_label
 
@@ -2785,7 +2939,7 @@ def confirm_booking():
                     game_id=booking.game_id,
                     game_name=available_game.game_name,
                     date_value=book_date,
-                    slot_price=available_game.single_slot_price,
+                    slot_price=slot_unit_price,
                     start_time=slot_obj.start_time,
                     end_time=slot_obj.end_time,
                     console_id=None,
@@ -3039,6 +3193,10 @@ def direct_booking():
     if not user_id or not game_id or not booked_date or not selected_slots:
         return jsonify({"message": "user_id, game_id, booked_date, and selected_slots are required"}), 400
 
+    booked_date_obj = _coerce_date_value(booked_date)
+    if not booked_date_obj:
+        return jsonify({"message": "Invalid booked_date format. Use YYYY-MM-DD or YYYYMMDD."}), 400
+
     try:
         socketio = current_app.extensions['socketio']
         available_game = db.session.query(AvailableGame).filter(AvailableGame.id == game_id).first()
@@ -3056,7 +3214,7 @@ def direct_booking():
                 WHERE slot_id IN (SELECT id FROM slots WHERE start_time IN :selected_slots)
                 AND date = :booked_date
             """),
-            {"selected_slots": tuple(selected_slots), "booked_date": booked_date}
+            {"selected_slots": tuple(selected_slots), "booked_date": booked_date_obj}
         ).fetchall()
 
         # ✅ Check if all slots are available
@@ -3090,12 +3248,11 @@ def direct_booking():
                     WHERE slot_id = :slot_id
                     AND date = :booked_date;
                 """),
-                {"slot_id": slot_id, "booked_date": booked_date}
+                {"slot_id": slot_id, "booked_date": booked_date_obj}
             )
 
         db.session.commit()  # ✅ Commit only after all bookings succeed
         
-        _price = get_effective_price(available_game.vendor_id, available_game)
         # ✅ Store individual transaction details for each booking
         slot_lookup = {
             int(slot.id): slot
@@ -3103,23 +3260,26 @@ def direct_booking():
         }
         event_payloads = []
         inserted_rows = 0
+        total_amount_paid = 0.0
         for booking in bookings:
-            app_fee_amount = resolve_app_fee_amount(_price, data)
+            slot_obj = slot_lookup.get(int(booking.slot_id))
+            unit_price = float(get_effective_price_for_schedule(vendor_id, available_game, booked_date_obj, slot_obj) or 0.0)
+            app_fee_amount = resolve_app_fee_amount(unit_price, data)
             transaction = Transaction(
                 booking_id=booking.id,  # Linking each booking
                 vendor_id=vendor_id,
                 user_id=user_id,
-                booked_date=datetime.strptime(booked_date, "%Y-%m-%d").date(),
+                booked_date=booked_date_obj,
                 booking_time=datetime.utcnow().time(),
                 user_name=user_name,
-                original_amount=_price,
-                amount=_price,
+                original_amount=unit_price,
+                amount=unit_price,
                 discounted_amount=0,
                 mode_of_payment=payment_method,
                 payment_use_case=normalize_payment_use_case(payment_method, "dashboard"),
                 booking_type="direct",
                 settlement_status="pending" if payment_status != "paid" else "completed",
-                base_amount=_price,
+                base_amount=unit_price,
                 meals_amount=0.0,
                 controller_amount=0.0,
                 waive_off_amount=0.0,
@@ -3127,6 +3287,7 @@ def direct_booking():
             )
             db.session.add(transaction)
             db.session.flush()
+            total_amount_paid += float(unit_price or 0.0)
 
             # Insert into vendor dashboard table so it appears in Upcoming
             try:
@@ -3142,7 +3303,7 @@ def direct_booking():
                     "user_id": user_id,
                     "start_time": slot_obj.start_time if slot_obj else None,
                     "end_time": slot_obj.end_time if slot_obj else None,
-                    "date": datetime.strptime(booked_date, "%Y-%m-%d").date(),
+                    "date": booked_date_obj,
                     "book_id": booking.id,
                     "game_id": booking.game_id,
                     "game_name": available_game.game_name,
@@ -3169,8 +3330,8 @@ def direct_booking():
                         username=user_name,
                         game_id=booking.game_id,
                         game_name=available_game.game_name,
-                        date_value=datetime.strptime(booked_date, "%Y-%m-%d").date(),
-                        slot_price=available_game.single_slot_price,
+                        date_value=booked_date_obj,
+                        slot_price=unit_price,
                         start_time=slot_obj.start_time if slot_obj else None,
                         end_time=slot_obj.end_time if slot_obj else None,
                         console_id=None,
@@ -3192,6 +3353,14 @@ def direct_booking():
             vendor_id,
             [b.id for b in bookings],
             inserted_rows
+        )
+        _log_pricing_event(
+            "direct_booking_totals",
+            vendor_id=vendor_id,
+            booked_date=booked_date_obj,
+            booking_count=len(bookings),
+            total_paid=round(float(total_amount_paid or 0.0), 2),
+            payment_method=payment_method,
         )
 
         # ✅ Emit socket event
@@ -4021,7 +4190,6 @@ def new_booking(vendor_id):
         transactions = []
         waive_off_per_slot = waive_off_total / len(bookings) if bookings else 0.0
         meals_cost_per_slot = total_meals_cost / len(bookings) if bookings and total_meals_cost > 0 else 0.0
-        effective_price = get_effective_price(vendor_id, available_game)
         console_group_for_pricing = str(normalized_squad_details.get("console_group", _resolve_console_group(available_game.game_name or "")))
         is_pc_squad = bool(squad_enabled and console_group_for_pricing == "pc")
         squad_player_multiplier = int(normalized_squad_details.get("player_count", 1)) if is_pc_squad else 1
@@ -4035,20 +4203,49 @@ def new_booking(vendor_id):
             )
             if squad_discount_applicable else 0.0
         )
-        base_slot_price_for_squad = effective_price * squad_player_multiplier
-        squad_discount_per_slot = (base_slot_price_for_squad * squad_discount_percent / 100.0) if squad_discount_applicable else 0.0
-        squad_discount_total = squad_discount_per_slot * len(bookings) if squad_discount_applicable else 0.0
 
-        if squad_enabled:
-            normalized_squad_details["discount_per_slot"] = round(squad_discount_per_slot, 2)
-            normalized_squad_details["total_discount"] = round(squad_discount_total, 2)
+        if not slot_map:
+            slot_map = {
+                int(s.id): s
+                for s in Slot.query.filter(Slot.id.in_([b.slot_id for b in bookings])).all()
+            }
+        slot_pricing = {}
+        total_unit_price = 0.0
+        total_base_before_discount = 0.0
+        total_discount = 0.0
+        for booking in bookings:
+            slot_obj = slot_map.get(int(booking.slot_id))
+            unit_price = float(get_effective_price_for_schedule(vendor_id, available_game, booked_date_obj, slot_obj) or 0.0)
+            total_unit_price += unit_price
+            base_slot_price = unit_price * (squad_player_multiplier if is_pc_squad else 1)
+            slot_discount = (
+                (base_slot_price * squad_discount_percent / 100.0)
+                if squad_discount_applicable else 0.0
+            )
+            total_base_before_discount += base_slot_price
+            total_discount += slot_discount
+            slot_pricing[int(booking.id)] = {
+                "unit_price": unit_price,
+                "base_slot_price": base_slot_price,
+                "slot_discount": slot_discount,
+            }
+
+        squad_discount_total = total_discount
+
+        if squad_enabled and bookings:
+            avg_unit_price = total_unit_price / len(bookings)
+            avg_base_price = total_base_before_discount / len(bookings)
+            normalized_squad_details["discount_per_slot"] = round(
+                (total_discount / len(bookings)) if squad_discount_applicable else 0.0, 2
+            )
+            normalized_squad_details["total_discount"] = round(total_discount, 2)
             normalized_squad_details["slot_base_multiplier"] = int(squad_player_multiplier)
             normalized_squad_details["applied_extra_controller_qty"] = int(extra_controller_qty)
-            normalized_squad_details["slot_unit_price"] = round(effective_price, 2)
-            normalized_squad_details["slot_price_for_squad"] = round(base_slot_price_for_squad, 2)
-            normalized_squad_details["slot_base_total_before_discount"] = round(base_slot_price_for_squad * len(bookings), 2)
+            normalized_squad_details["slot_unit_price"] = round(avg_unit_price, 2)
+            normalized_squad_details["slot_price_for_squad"] = round(avg_base_price, 2)
+            normalized_squad_details["slot_base_total_before_discount"] = round(total_base_before_discount, 2)
             normalized_squad_details["slot_base_total_after_discount"] = round(
-                max((base_slot_price_for_squad * len(bookings)) - squad_discount_total, 0.0), 2
+                max(total_base_before_discount - total_discount, 0.0), 2
             )
 
         actor = resolve_transaction_actor(request)
@@ -4067,10 +4264,12 @@ def new_booking(vendor_id):
                     "message": "Monthly credit account not configured for this customer."
                 }), 400
             projected_credit_charge = 0.0
-            for _ in bookings:
+            for booking in bookings:
+                pricing = slot_pricing.get(int(booking.id)) or {}
+                base_slot_price = float(pricing.get("base_slot_price") or 0.0)
+                slot_discount = float(pricing.get("slot_discount") or 0.0)
                 projected_credit_charge += max(
-                    ((base_slot_price_for_squad if is_pc_squad else effective_price) + meals_cost_per_slot)
-                    - (waive_off_per_slot + squad_discount_per_slot),
+                    (base_slot_price + meals_cost_per_slot) - (waive_off_per_slot + slot_discount),
                     0.0,
                 )
             projected_credit_charge += max(float(extra_controller_fare or 0.0), 0.0)
@@ -4081,11 +4280,13 @@ def new_booking(vendor_id):
         for booking in bookings:
             if squad_enabled:
                 booking.squad_details = normalized_squad_details
-            base_slot_price = base_slot_price_for_squad if is_pc_squad else effective_price
+            pricing = slot_pricing.get(int(booking.id)) or {}
+            base_slot_price = float(pricing.get("base_slot_price") or 0.0)
+            slot_discount = float(pricing.get("slot_discount") or 0.0)
             slot_meal_cost = meals_cost_per_slot
             
             original_amount = base_slot_price + slot_meal_cost
-            discounted_amount = waive_off_per_slot + squad_discount_per_slot
+            discounted_amount = waive_off_per_slot + slot_discount
             final_amount = max(original_amount - discounted_amount, 0.0)
             gst = calculate_gst_breakdown(vendor_id, final_amount)
             app_fee_amount = resolve_app_fee_amount(final_amount, data)
@@ -4332,10 +4533,25 @@ def new_booking(vendor_id):
             })
 
         # Calculate total amount paid
-        total_base_cost = base_slot_price_for_squad * len(bookings) if squad_enabled else effective_price * len(bookings)
+        total_base_cost = total_base_before_discount
         total_paid = max(
             total_base_cost + total_meals_cost + extra_controller_fare - waive_off_total - squad_discount_total,
             0.0
+        )
+
+        _log_pricing_event(
+            "dashboard_new_booking_totals",
+            vendor_id=vendor_id,
+            booking_date=booked_date_obj,
+            booking_count=len(bookings),
+            total_base=total_base_cost,
+            total_discount=squad_discount_total,
+            total_meals=total_meals_cost,
+            extra_controller=extra_controller_fare,
+            waive_off=waive_off_total,
+            total_paid=total_paid,
+            payment_type=payment_type,
+            booking_mode=booking_mode,
         )
 
         # Send booking confirmation email
@@ -4352,21 +4568,25 @@ def new_booking(vendor_id):
                 })
 
         app_fee_total = resolve_app_fee_amount(total_paid, data)
-        booking_mail(
-            gamer_name=name,
-            gamer_phone=phone,
-            gamer_email=email,
-            cafe_name=cafe_name,
-            booking_date=datetime.utcnow().strftime("%Y-%m-%d"),
-            booked_for_date=booked_date_str,
-            booking_details=booking_details,
-            price_paid=total_paid,
-            extra_meals=email_meal_details,
-            extra_controller_fare=extra_controller_fare,
-            waive_off_amount=waive_off_total,
-            app_fee_amount=float(app_fee_total or 0.0),
-            net_total=max(float(total_paid or 0.0) - float(app_fee_total or 0.0), 0.0),
-        )
+        try:
+            booking_mail(
+                gamer_name=name,
+                gamer_phone=phone,
+                gamer_email=email,
+                cafe_name=cafe_name,
+                booking_date=datetime.utcnow().strftime("%Y-%m-%d"),
+                booked_for_date=booked_date_str,
+                booking_details=booking_details,
+                price_paid=total_paid,
+                extra_meals=email_meal_details,
+                extra_controller_fare=extra_controller_fare,
+                waive_off_amount=waive_off_total,
+                app_fee_amount=float(app_fee_total or 0.0),
+                net_total=max(float(total_paid or 0.0) - float(app_fee_total or 0.0), 0.0),
+            )
+        except Exception as mail_error:
+            current_app.logger.exception("booking_mail failed for vendor=%s booking_ids=%s err=%s",
+                                         vendor_id, [b.id for b in bookings], mail_error)
 
         # ✅ ENHANCED SUCCESS LOG with booking mode
         current_app.logger.info(
@@ -5402,6 +5622,15 @@ def get_pending_pay_at_cafe_bookings(vendor_id):
              Booking.status == 'pending_acceptance'
          ).order_by(Booking.created_at.desc()).all()
 
+        game_ids = {row.game_id for row in pending_bookings if row and row.game_id}
+        slot_ids = {row.slotId for row in pending_bookings if row and row.slotId}
+        game_map = {
+            int(g.id): g for g in AvailableGame.query.filter(AvailableGame.id.in_(game_ids)).all()
+        } if game_ids else {}
+        slot_map = {
+            int(s.id): s for s in Slot.query.filter(Slot.id.in_(slot_ids)).all()
+        } if slot_ids else {}
+
         notifications_by_key = {}
         for booking in pending_bookings:
             try:
@@ -5415,6 +5644,20 @@ def get_pending_pay_at_cafe_bookings(vendor_id):
                 if not resolved_date:
                     resolved_date = booking.emitted_at.date() if booking.emitted_at else datetime.utcnow().date()
                 booking_date = resolved_date.strftime('%Y-%m-%d')
+
+                available_game_obj = game_map.get(int(booking.game_id)) if booking.game_id else None
+                slot_obj = slot_map.get(int(booking.slotId)) if booking.slotId else None
+                if available_game_obj:
+                    pricing = _compute_pay_at_cafe_pricing(
+                        vendor_id,
+                        available_game_obj,
+                        details,
+                        booking_date=resolved_date,
+                        slot_obj=slot_obj,
+                    )
+                    unit_total = float(pricing.get("final_amount") or 0.0)
+                else:
+                    unit_total = float(booking.single_slot_price or 0.0)
                 
                 # Format time slot
                 if booking.start_time and booking.end_time:
@@ -5462,14 +5705,14 @@ def get_pending_pay_at_cafe_bookings(vendor_id):
                         "booking_ids": [booking.bookingId],
                         "slot_ids": [booking.slotId],
                         "slot_count": 1,
-                        "total_amount": float(booking.single_slot_price or 0),
+                        "total_amount": round(unit_total, 2),
                     }
                 else:
                     existing = notifications_by_key[key]
                     existing["booking_ids"].append(booking.bookingId)
                     existing["slot_ids"].append(booking.slotId)
                     existing["slot_count"] = len(existing["booking_ids"])
-                    existing["total_amount"] = round(float(existing["total_amount"]) + float(booking.single_slot_price or 0), 2)
+                    existing["total_amount"] = round(float(existing["total_amount"]) + unit_total, 2)
 
             except Exception as item_error:
                 current_app.logger.error(f"Error processing booking {booking.bookingId}: {item_error}")
@@ -5594,16 +5837,48 @@ def accept_pay_at_cafe_booking():
             updated_details["settlement_status"] = "pending"
             booking_row.squad_details = updated_details
 
-            _price = get_effective_price(vendor_id, available_game)
-            app_fee_amount = resolve_app_fee_amount(_price, data)
+            pricing = _compute_pay_at_cafe_pricing(
+                vendor_id,
+                available_game,
+                updated_details,
+                booking_date=booked_date,
+                slot_obj=slot_obj,
+            )
+            base_amount = float(pricing.get("base_amount") or 0.0)
+            discount_amount = float(pricing.get("discounted_amount") or 0.0)
+            final_amount = float(pricing.get("final_amount") or 0.0)
+            controller_amount = float(pricing.get("controller_amount") or 0.0)
+            controller_qty = int(pricing.get("controller_qty") or 0)
+            app_fee_amount = resolve_app_fee_amount(final_amount, data)
+
+            updated_details["pricing_mode"] = pricing.get("pricing_mode")
+            updated_details["console_group"] = pricing.get("console_group")
+            updated_details["discount_percent"] = float(pricing.get("discount_percent") or 0.0)
+            updated_details["slot_base_total_before_discount"] = round(base_amount, 2)
+            updated_details["total_discount"] = round(discount_amount, 2)
+            updated_details["slot_base_total_after_discount"] = round(max(base_amount - discount_amount, 0.0), 2)
+            updated_details["applied_extra_controller_qty"] = controller_qty
+            if controller_amount > 0:
+                updated_details["controller_amount"] = round(controller_amount, 2)
+
+            _log_pricing_event(
+                "pay_at_cafe_accept_line",
+                vendor_id=vendor_id,
+                booking_id=booking_row.id,
+                booked_date=booked_date,
+                base_amount=base_amount,
+                discount_amount=discount_amount,
+                controller_amount=controller_amount,
+                final_amount=final_amount,
+            )
             transaction = Transaction(
                 booking_id=booking_row.id,
                 vendor_id=vendor_id,
                 user_id=booking_row.user_id,
                 user_name=user.name if user else "Unknown",
-                original_amount=_price,
-                amount=_price,
-                discounted_amount=0,
+                original_amount=base_amount + controller_amount,
+                amount=final_amount,
+                discounted_amount=discount_amount,
                 mode_of_payment="pay_at_cafe",
                 payment_use_case="pay_at_cafe",
                 booking_date=datetime.utcnow().date(),
@@ -5615,10 +5890,10 @@ def accept_pay_at_cafe_booking():
                 initiated_by_staff_id=actor.get("staff_id"),
                 initiated_by_staff_name=actor.get("staff_name"),
                 initiated_by_staff_role=actor.get("staff_role"),
-                base_amount=_price,
+                base_amount=base_amount,
                 meals_amount=0.0,
-                controller_amount=0.0,
-                waive_off_amount=0.0,
+                controller_amount=controller_amount,
+                waive_off_amount=discount_amount,
                 app_fee_amount=float(app_fee_amount or 0.0),
             )
             db.session.add(transaction)
@@ -5663,9 +5938,9 @@ def accept_pay_at_cafe_booking():
                         "booking_id": booking_row.id,
                         "slot_time": f"{slot_obj.start_time} - {slot_obj.end_time}"
                     }],
-                    price_paid=_price,
+                    price_paid=final_amount,
                     app_fee_amount=float(app_fee_amount or 0.0),
-                    net_total=max(float(_price or 0.0) - float(app_fee_amount or 0.0), 0.0),
+                    net_total=max(float(final_amount or 0.0) - float(app_fee_amount or 0.0), 0.0),
                 )
 
         current_app.logger.info(
@@ -6484,7 +6759,19 @@ def kiosk_book_next_slot(vendor_id):
         #single_price = int(price_row.single_slot_price) if price_row and price_row.single_slot_price else None
         
         available_game_obj = AvailableGame.query.filter_by(id=game_id).first()
-        single_price = int(get_effective_price(vendor_id, available_game_obj)) if available_game_obj else None
+        single_price = (
+            int(get_effective_price_for_schedule(vendor_id, available_game_obj, booked_date, slot_row))
+            if available_game_obj else None
+        )
+
+        _log_pricing_event(
+            "kiosk_extension_pricing",
+            vendor_id=vendor_id,
+            booking_date=booked_date,
+            slot_id=slot_id,
+            game_id=game_id,
+            unit_price=single_price,
+        )
 
         # --- 6) Insert into vendor dashboard ---
         db.session.execute(text(f"""
@@ -6836,7 +7123,8 @@ def credit_unused_slots_to_wallet(vendor_id):
             if slot_minutes <= 0:
                 continue
 
-            slot_amount = float(get_effective_price(vendor_id, game))
+            booked_date = resolve_booking_booked_date(booking)
+            slot_amount = float(get_effective_price_for_schedule(vendor_id, game, booked_date, slot))
             account.balance_minutes = int(account.balance_minutes or 0) + slot_minutes
             account.balance_amount = float(account.balance_amount or 0) + slot_amount
             credited_minutes += slot_minutes
