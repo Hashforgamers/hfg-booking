@@ -51,17 +51,22 @@ class BookingService:
         if not booking:
             raise ValueError("Booking does not exist.")
 
-        # Free up the slot for the game
-        game = AvailableGame.query.get(booking.game_id)
-        game.total_slot += 1
-        db.session.add(game)
+        # Release slot availability (if applicable)
+        try:
+            from controllers.booking_controller import resolve_booking_booked_date, _release_slot_for_booking
+            available_game = AvailableGame.query.get(booking.game_id)
+            vendor_id = int(available_game.vendor_id) if available_game else None
+            booked_date = resolve_booking_booked_date(booking)
+            _release_slot_for_booking(booking, vendor_id, booked_date)
+        except Exception:
+            current_app.logger.warning("BookingService.cancel_booking: slot release failed booking_id=%s", booking_id)
 
-        db.session.delete(booking)
+        booking.status = "cancelled"
         db.session.commit()
 
         # Emit real-time cancellation event
-        socketio.emit('booking_updated', {'booking_id': booking_id, 'status': 'canceled'})
-        return {"message": "Booking canceled successfully."}
+        socketio.emit('booking_updated', {'booking_id': booking_id, 'status': 'cancelled'})
+        return {"message": "Booking cancelled successfully."}
 
     @staticmethod
     def verifyPayment(payment_id):
