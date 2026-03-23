@@ -268,6 +268,174 @@ def _log_pricing_event(event: str, **fields):
     current_app.logger.info("pricing.%s %s", event, payload)
 
 
+DEFAULT_VENDOR_BOOKING_FIELD_CONFIG = {
+    "name": {"visible": True, "required": True},
+    "phone": {"visible": True, "required": True},
+    "email": {"visible": True, "required": False},
+}
+_VENDOR_BOOKING_FIELD_PREF_TABLE_READY = False
+
+
+def _to_bool(value, default=False):
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(default)
+
+
+def _ensure_vendor_booking_field_preferences_table():
+    global _VENDOR_BOOKING_FIELD_PREF_TABLE_READY
+    if _VENDOR_BOOKING_FIELD_PREF_TABLE_READY:
+        return
+    try:
+        db.session.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS vendor_booking_field_preferences (
+                    vendor_id INTEGER PRIMARY KEY REFERENCES vendors(id) ON DELETE CASCADE,
+                    require_name BOOLEAN NOT NULL DEFAULT TRUE,
+                    show_phone BOOLEAN NOT NULL DEFAULT TRUE,
+                    require_phone BOOLEAN NOT NULL DEFAULT TRUE,
+                    show_email BOOLEAN NOT NULL DEFAULT TRUE,
+                    require_email BOOLEAN NOT NULL DEFAULT FALSE,
+                    updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+        )
+        db.session.commit()
+        _VENDOR_BOOKING_FIELD_PREF_TABLE_READY = True
+    except Exception:
+        db.session.rollback()
+        raise
+
+
+def _normalize_vendor_booking_field_config(payload):
+    incoming = payload or {}
+
+    show_phone = _to_bool(incoming.get("show_phone", True), True)
+    show_email = _to_bool(incoming.get("show_email", True), True)
+    require_phone = _to_bool(incoming.get("require_phone", True), True)
+    require_email = _to_bool(incoming.get("require_email", False), False)
+
+    # Required contact field must be visible.
+    if require_phone:
+        show_phone = True
+    if require_email:
+        show_email = True
+
+    # Desk workflow preference: optional email should not clutter booking form.
+    if not require_email:
+        show_email = False
+
+    if not show_phone and not show_email:
+        return None, "At least one contact field (phone/email) must stay visible"
+
+    # If hidden, it cannot remain required.
+    if not show_phone:
+        require_phone = False
+    if not show_email:
+        require_email = False
+
+    if not require_phone and not require_email:
+        return None, "At least one contact field (phone/email) must be required"
+
+    return {
+        "name": {"visible": True, "required": True},
+        "phone": {"visible": bool(show_phone), "required": bool(require_phone)},
+        "email": {"visible": bool(show_email), "required": bool(require_email)},
+    }, None
+
+
+def _load_vendor_booking_field_config(vendor_id: int):
+    default_config = {
+        "name": dict(DEFAULT_VENDOR_BOOKING_FIELD_CONFIG["name"]),
+        "phone": dict(DEFAULT_VENDOR_BOOKING_FIELD_CONFIG["phone"]),
+        "email": dict(DEFAULT_VENDOR_BOOKING_FIELD_CONFIG["email"]),
+    }
+    try:
+        _ensure_vendor_booking_field_preferences_table()
+        row = db.session.execute(
+            text(
+                """
+                SELECT
+                    require_name,
+                    show_phone,
+                    require_phone,
+                    show_email,
+                    require_email
+                FROM vendor_booking_field_preferences
+                WHERE vendor_id = :vendor_id
+                """
+            ),
+            {"vendor_id": int(vendor_id)},
+        ).fetchone()
+
+        if not row:
+            return default_config
+
+        mapping = row._mapping if hasattr(row, "_mapping") else {}
+        normalized, err = _normalize_vendor_booking_field_config(
+            {
+                "show_phone": mapping.get("show_phone"),
+                "require_phone": mapping.get("require_phone"),
+                "show_email": mapping.get("show_email"),
+                "require_email": mapping.get("require_email"),
+            }
+        )
+        if err:
+            current_app.logger.warning(
+                "Invalid vendor booking field config detected vendor_id=%s err=%s",
+                vendor_id,
+                err,
+            )
+            return default_config
+        return normalized
+    except Exception as err:
+        db.session.rollback()
+        current_app.logger.warning(
+            "Failed to load vendor booking field config vendor_id=%s err=%s",
+            vendor_id,
+            err,
+        )
+        return default_config
+
+
+def _save_vendor_booking_field_config(vendor_id: int, config: dict):
+    _ensure_vendor_booking_field_preferences_table()
+    db.session.execute(
+        text(
+            """
+            INSERT INTO vendor_booking_field_preferences
+                (vendor_id, require_name, show_phone, require_phone, show_email, require_email, updated_at)
+            VALUES
+                (:vendor_id, TRUE, :show_phone, :require_phone, :show_email, :require_email, NOW())
+            ON CONFLICT (vendor_id)
+            DO UPDATE SET
+                require_name = EXCLUDED.require_name,
+                show_phone = EXCLUDED.show_phone,
+                require_phone = EXCLUDED.require_phone,
+                show_email = EXCLUDED.show_email,
+                require_email = EXCLUDED.require_email,
+                updated_at = NOW()
+            """
+        ),
+        {
+            "vendor_id": int(vendor_id),
+            "show_phone": bool(config["phone"]["visible"]),
+            "require_phone": bool(config["phone"]["required"]),
+            "show_email": bool(config["email"]["visible"]),
+            "require_email": bool(config["email"]["required"]),
+        },
+    )
+    db.session.commit()
+
+
 def _compute_pay_at_cafe_pricing(vendor_id: int, available_game, squad_details: dict, booking_date=None, slot_obj=None):
     """
     Resolve pay-at-cafe pricing with squad support.
@@ -3736,9 +3904,9 @@ def new_booking(vendor_id):
         data = request.json
 
         console_type = data.get("consoleType")
-        name = data.get("name")
-        email = data.get("email")
-        phone = data.get("phone")
+        name = str(data.get("name") or "").strip()
+        email = str(data.get("email") or "").strip().lower()
+        phone = str(data.get("phone") or "").strip()
         booked_date = data.get("bookedDate")
         slot_ids = data.get("slotId")
         payment_type = data.get("paymentType")
@@ -3759,6 +3927,17 @@ def new_booking(vendor_id):
         if not booked_date_obj:
             return jsonify({"message": "Invalid bookedDate format. Use YYYY-MM-DD or YYYYMMDD."}), 400
         booked_date_str = booked_date_obj.strftime("%Y-%m-%d")
+
+        field_config = _load_vendor_booking_field_config(vendor_id)
+        phone_visible = bool(field_config.get("phone", {}).get("visible", True))
+        email_visible = bool(field_config.get("email", {}).get("visible", True))
+        phone_required = bool(field_config.get("phone", {}).get("required", True))
+        email_required = bool(field_config.get("email", {}).get("required", False))
+
+        if not phone_visible:
+            phone = ""
+        if not email_visible:
+            email = ""
         
         # ✅ NEW: Get booking mode from frontend
         booking_mode = data.get("bookingMode", "regular")
@@ -3823,8 +4002,14 @@ def new_booking(vendor_id):
         )
 
         # Validate required fields
-        if not all([name, phone, booked_date, slot_ids, payment_type]):
+        if not all([name, booked_date, slot_ids, payment_type]):
             return jsonify({"message": "Missing required fields"}), 400
+        if phone_required and not phone:
+            return jsonify({"message": "Phone number is required"}), 400
+        if email_required and not email:
+            return jsonify({"message": "Email is required"}), 400
+        if not phone and not email:
+            return jsonify({"message": "Either phone or email is required"}), 400
 
         # ✅ Validate console type
         if not console_type:
@@ -4058,19 +4243,36 @@ def new_booking(vendor_id):
                 current_app.logger.info(f"Added meal: {menu_item.name} x {quantity} = ₹{item_total}")
 
         # Find or create user
-        user = (
-            db.session.query(User)
-            .join(ContactInfo)
-            .filter(and_(User.id == user_id, ContactInfo.parent_type == 'user'))
-            .first()
-            if user_id
-            else db.session.query(User)
-            .join(ContactInfo)
-            .filter(and_(ContactInfo.email == email, ContactInfo.parent_type == 'user'))
-            .first()
-        )
+        user = None
+        if user_id:
+            user = User.query.filter_by(id=user_id).first()
+        else:
+            contact_filters = []
+            if email:
+                contact_filters.append(func.lower(ContactInfo.email) == email.lower())
+            if phone:
+                contact_filters.append(ContactInfo.phone == phone)
+            if contact_filters:
+                existing_contact = (
+                    ContactInfo.query
+                    .filter(ContactInfo.parent_type == "user")
+                    .filter(or_(*contact_filters))
+                    .order_by(ContactInfo.id.desc())
+                    .first()
+                )
+                if existing_contact and existing_contact.parent_id:
+                    user = User.query.filter_by(id=existing_contact.parent_id).first()
 
         if not user:
+            safe_phone = "".join(ch for ch in phone if ch.isdigit())[-10:] if phone else ""
+            if not safe_phone:
+                safe_phone = str(random.randint(1000000000, 9999999999))
+
+            if not email:
+                email = f"noemail_{safe_phone}@hash.local"
+            if not phone:
+                phone = safe_phone
+
             user = User(
                 fid=generate_fid(),
                 avatar_path="Not defined",
@@ -4082,13 +4284,21 @@ def new_booking(vendor_id):
             contact_info = ContactInfo(
                 phone=phone,
                 email=email,
-                parent_id=user.id,
                 parent_type="user"
             )
             user.contact_info = contact_info
             db.session.add(user)
             db.session.flush()
             current_app.logger.info(f"Created new user: {name}")
+        elif not getattr(user, "contact_info", None):
+            fallback_phone = phone or str(random.randint(1000000000, 9999999999))
+            fallback_email = email or f"noemail_{''.join(ch for ch in fallback_phone if ch.isdigit())[-10:]}@hash.local"
+            user.contact_info = ContactInfo(
+                phone=fallback_phone,
+                email=fallback_email,
+                parent_type="user"
+            )
+            db.session.add(user.contact_info)
 
         squad_member_bindings = []
         if squad_enabled:
@@ -5395,6 +5605,81 @@ def get_all_booking(vendor_id, date):
         current_app.logger.error(f"Failed to fetch bookings: {str(e)}")
         return jsonify({"message": "Failed to fetch bookings", "error": str(e)}), 500
 
+
+@booking_blueprint.route('/vendor/<int:vendor_id>/booking-field-config', methods=['GET', 'PUT'])
+def vendor_booking_field_config(vendor_id):
+    if request.method == 'GET':
+        config = _load_vendor_booking_field_config(vendor_id)
+        return jsonify({"success": True, "vendor_id": vendor_id, "config": config}), 200
+
+    payload = request.get_json(silent=True) or {}
+    normalized, error = _normalize_vendor_booking_field_config(payload)
+    if error:
+        return jsonify({"success": False, "message": error}), 400
+
+    try:
+        _save_vendor_booking_field_config(vendor_id, normalized)
+        return jsonify({"success": True, "vendor_id": vendor_id, "config": normalized}), 200
+    except Exception as err:
+        db.session.rollback()
+        current_app.logger.error(
+            "Failed to save vendor booking field config vendor_id=%s err=%s",
+            vendor_id,
+            err,
+        )
+        return jsonify({"success": False, "message": "Failed to save booking field config"}), 500
+
+
+def _collect_vendor_user_ids(vendor_id_int: int):
+    user_ids = set()
+
+    # 1) Primary booking users for this vendor branch.
+    tx_user_ids = (
+        db.session.query(Transaction.user_id)
+        .filter(
+            Transaction.vendor_id == vendor_id_int,
+            Transaction.user_id.isnot(None),
+        )
+        .distinct()
+        .all()
+    )
+    user_ids.update([row[0] for row in tx_user_ids if row and row[0]])
+
+    # 2) Dashboard table (legacy compatibility).
+    table_name = f"VENDOR_{vendor_id_int}_DASHBOARD"
+    try:
+        user_id_query = text(f"SELECT DISTINCT user_id FROM {table_name}")
+        result = db.session.execute(user_id_query)
+        user_ids.update([row[0] for row in result if row and row[0]])
+    except Exception:
+        db.session.rollback()
+
+    # 3) Monthly credit account users.
+    credit_user_ids = (
+        db.session.query(MonthlyCreditAccount.user_id)
+        .filter(MonthlyCreditAccount.vendor_id == vendor_id_int)
+        .distinct()
+        .all()
+    )
+    user_ids.update([row[0] for row in credit_user_ids if row and row[0]])
+
+    # 4) Squad member mapped users.
+    squad_user_ids = (
+        db.session.query(BookingSquadMember.member_user_id)
+        .join(Booking, Booking.id == BookingSquadMember.booking_id)
+        .join(Transaction, Transaction.booking_id == Booking.id)
+        .filter(
+            Transaction.vendor_id == vendor_id_int,
+            BookingSquadMember.member_user_id.isnot(None),
+        )
+        .distinct()
+        .all()
+    )
+    user_ids.update([row[0] for row in squad_user_ids if row and row[0]])
+
+    return user_ids
+
+
 @booking_blueprint.route('/vendor/<string:vendor_id>/users', methods=['GET', 'POST'])
 def get_user_details(vendor_id):
     try:
@@ -5484,56 +5769,141 @@ def get_user_details(vendor_id):
                 }
             }), 201
 
-        table_name = f"VENDOR_{vendor_id}_DASHBOARD"
         vendor_id_int = int(vendor_id)
-        user_ids = set()
-
-        # Step 1: Get user_ids from vendor bookings table (if it exists)
+        query_text = str(request.args.get("q") or "").strip()
+        field = str(request.args.get("field") or "all").strip().lower()
+        booked_only = _to_bool(request.args.get("booked_only"), False)
+        limit = request.args.get("limit", 12)
         try:
-            user_id_query = text(f"SELECT DISTINCT user_id FROM {table_name}")
-            result = db.session.execute(user_id_query)
-            user_ids.update([row[0] for row in result if row[0]])
-        except Exception:
-            # Dashboard table might not exist for new vendors yet.
-            db.session.rollback()
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = 12
+        limit = max(1, min(limit, 25))
+        if field not in {"all", "name", "phone", "email"}:
+            field = "all"
 
-        # Step 2: Include users from monthly credit accounts so newly onboarded
-        # credit customers appear in selector even before first booking.
-        credit_user_ids = (
-            db.session.query(MonthlyCreditAccount.user_id)
-            .filter(MonthlyCreditAccount.vendor_id == vendor_id_int)
-            .distinct()
-            .all()
-        )
-        user_ids.update([row[0] for row in credit_user_ids if row[0]])
+        # Fast search mode for typeahead (branch-only when booked_only=true).
+        if query_text or "field" in request.args or "booked_only" in request.args:
+            if booked_only:
+                recent_branch_users = (
+                    db.session.query(
+                        User.id.label("id"),
+                        User.name.label("name"),
+                        ContactInfo.email.label("email"),
+                        ContactInfo.phone.label("phone"),
+                        func.max(Transaction.created_at).label("last_seen"),
+                    )
+                    .join(
+                        Transaction,
+                        and_(
+                            Transaction.user_id == User.id,
+                            Transaction.vendor_id == vendor_id_int,
+                        ),
+                    )
+                    .outerjoin(
+                        ContactInfo,
+                        and_(
+                            ContactInfo.parent_id == User.id,
+                            ContactInfo.parent_type == "user",
+                        ),
+                    )
+                    .group_by(User.id, User.name, ContactInfo.email, ContactInfo.phone)
+                )
 
-        # Step 3: Include squad member user IDs mapped to this vendor's bookings.
-        # Without this, users created through squad member rows won't appear
-        # in the quick selector until they become a primary booking user.
-        squad_user_ids = (
-            db.session.query(BookingSquadMember.member_user_id)
-            .join(Booking, Booking.id == BookingSquadMember.booking_id)
-            .join(Transaction, Transaction.booking_id == Booking.id)
-            .filter(
-                Transaction.vendor_id == vendor_id_int,
-                BookingSquadMember.member_user_id.isnot(None),
+                if query_text:
+                    token = f"%{query_text.lower()}%"
+                    if field == "name":
+                        recent_branch_users = recent_branch_users.filter(func.lower(User.name).like(token))
+                    elif field == "phone":
+                        recent_branch_users = recent_branch_users.filter(func.lower(func.coalesce(ContactInfo.phone, "")).like(token))
+                    elif field == "email":
+                        recent_branch_users = recent_branch_users.filter(func.lower(func.coalesce(ContactInfo.email, "")).like(token))
+                    else:
+                        recent_branch_users = recent_branch_users.filter(
+                            or_(
+                                func.lower(User.name).like(token),
+                                func.lower(func.coalesce(ContactInfo.phone, "")).like(token),
+                                func.lower(func.coalesce(ContactInfo.email, "")).like(token),
+                            )
+                        )
+
+                rows = (
+                    recent_branch_users
+                    .order_by(func.max(Transaction.created_at).desc(), User.id.desc())
+                    .limit(limit)
+                    .all()
+                )
+                return jsonify([
+                    {
+                        "id": row.id,
+                        "name": row.name,
+                        "email": row.email,
+                        "phone": row.phone,
+                    }
+                    for row in rows
+                ]), 200
+
+            # Non-booked-only search mode still remains vendor-scoped via known user IDs.
+            user_ids = _collect_vendor_user_ids(vendor_id_int)
+            if not user_ids:
+                return jsonify([]), 200
+
+            query = (
+                db.session.query(
+                    User.id.label("id"),
+                    User.name.label("name"),
+                    ContactInfo.email.label("email"),
+                    ContactInfo.phone.label("phone"),
+                )
+                .outerjoin(
+                    ContactInfo,
+                    and_(ContactInfo.parent_id == User.id, ContactInfo.parent_type == "user"),
+                )
+                .filter(User.id.in_(list(user_ids)))
             )
-            .distinct()
-            .all()
-        )
-        user_ids.update([row[0] for row in squad_user_ids if row[0]])
+            if query_text:
+                token = f"%{query_text.lower()}%"
+                if field == "name":
+                    query = query.filter(func.lower(User.name).like(token))
+                elif field == "phone":
+                    query = query.filter(func.lower(func.coalesce(ContactInfo.phone, "")).like(token))
+                elif field == "email":
+                    query = query.filter(func.lower(func.coalesce(ContactInfo.email, "")).like(token))
+                else:
+                    query = query.filter(
+                        or_(
+                            func.lower(User.name).like(token),
+                            func.lower(func.coalesce(ContactInfo.phone, "")).like(token),
+                            func.lower(func.coalesce(ContactInfo.email, "")).like(token),
+                        )
+                    )
+            rows = query.order_by(User.id.desc()).limit(limit).all()
+            return jsonify([
+                {
+                    "id": row.id,
+                    "name": row.name,
+                    "email": row.email,
+                    "phone": row.phone,
+                }
+                for row in rows
+            ]), 200
 
+        # Default full list mode (legacy behavior)
+        user_ids = _collect_vendor_user_ids(vendor_id_int)
         if not user_ids:
             return jsonify([]), 200
 
-        # Step 4: Fetch User and ContactInfo
-        users = User.query.filter(User.id.in_(list(user_ids))).all()
+        users = (
+            db.session.query(User)
+            .filter(User.id.in_(list(user_ids)))
+            .order_by(User.id.desc())
+            .all()
+        )
 
         user_list = []
         for user in users:
             contact = ContactInfo.query.filter_by(parent_id=user.id, parent_type="user").first()
-            
-            user_data = {
+            user_list.append({
                 "id": user.id,
                 "name": user.name,
                 "game_username": user.game_username,
@@ -5542,8 +5912,7 @@ def get_user_details(vendor_id):
                 "dob": user.dob.isoformat() if user.dob else None,
                 "email": contact.email if contact else None,
                 "phone": contact.phone if contact else None
-            }
-            user_list.append(user_data)
+            })
 
         return jsonify(user_list), 200
 
