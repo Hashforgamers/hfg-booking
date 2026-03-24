@@ -5606,8 +5606,13 @@ def get_all_booking(vendor_id, date):
         return jsonify({"message": "Failed to fetch bookings", "error": str(e)}), 500
 
 
-@booking_blueprint.route('/vendor/<int:vendor_id>/booking-field-config', methods=['GET', 'PUT'])
+@booking_blueprint.route('/vendor/<int:vendor_id>/booking-field-config', methods=['GET', 'PUT', 'OPTIONS'])
+@booking_blueprint.route('/vendor/<int:vendor_id>/booking-field-confg', methods=['GET', 'PUT', 'OPTIONS'])
 def vendor_booking_field_config(vendor_id):
+    if request.method == 'OPTIONS':
+        # Keep explicit OPTIONS handler to avoid browser preflight failures.
+        return jsonify({"success": True}), 200
+
     if request.method == 'GET':
         config = _load_vendor_booking_field_config(vendor_id)
         return jsonify({"success": True, "vendor_id": vendor_id, "config": config}), 200
@@ -5811,7 +5816,7 @@ def get_user_details(vendor_id):
                 )
 
                 if query_text:
-                    token = f"%{query_text.lower()}%"
+                    token = f"{query_text.lower()}%"
                     if field == "name":
                         recent_branch_users = recent_branch_users.filter(func.lower(User.name).like(token))
                     elif field == "phone":
@@ -5862,7 +5867,7 @@ def get_user_details(vendor_id):
                 .filter(User.id.in_(list(user_ids)))
             )
             if query_text:
-                token = f"%{query_text.lower()}%"
+                token = f"{query_text.lower()}%"
                 if field == "name":
                     query = query.filter(func.lower(User.name).like(token))
                 elif field == "phone":
