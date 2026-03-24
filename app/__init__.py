@@ -1,4 +1,4 @@
-from flask import Flask
+from flask import Flask, make_response
 from flask_cors import CORS
 from flask_socketio import SocketIO
 from db.extensions import db, migrate, mail
@@ -35,10 +35,11 @@ def create_app():
     # Allow all origins for API routes
     CORS(
         app,
-        resources={r"/api/*": {
+        resources={r"/*": {
             "origins": "*",
-            "allow_headers": ["Content-Type", "Authorization", "X-Client-Source"],
-            "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+            "allow_headers": "*",
+            "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+            "expose_headers": ["Content-Type", "Authorization"],
             "supports_credentials": False
         }}
     )
@@ -47,6 +48,27 @@ def create_app():
     app.register_blueprint(slot_blueprint, url_prefix="/api")
     app.register_blueprint(game_blueprint, url_prefix="/api")
     app.register_blueprint(pass_blueprint, url_prefix='/api')
+
+    @app.after_request
+    def force_cors_headers(response):
+        # Safety net: keep CORS headers present even on error paths/timeouts from Flask handlers.
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, X-Client-Source, X-Requested-With"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+        response.headers["Access-Control-Expose-Headers"] = "Content-Type, Authorization"
+        response.headers["Access-Control-Max-Age"] = "86400"
+        return response
+
+    # Global preflight fallback so browser OPTIONS never hard-fails with 404.
+    @app.route("/api", methods=["OPTIONS"])
+    @app.route("/api/<path:_path>", methods=["OPTIONS"])
+    def api_preflight(_path=None):
+        response = make_response("", 204)
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, X-Client-Source, X-Requested-With"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+        response.headers["Access-Control-Max-Age"] = "86400"
+        return response
 
     debug_mode = os.getenv("DEBUG_MODE", "false").lower() == "true"
     log_level = logging.DEBUG if debug_mode else logging.WARNING

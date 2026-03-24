@@ -832,6 +832,116 @@ def _coerce_date_value(raw_value):
     return None
 
 
+def _normalize_slot_ids(raw_slot_ids):
+    if raw_slot_ids is None:
+        return [], []
+
+    if isinstance(raw_slot_ids, (str, int)):
+        raw_slot_ids = [raw_slot_ids]
+
+    if not isinstance(raw_slot_ids, list):
+        return [], [raw_slot_ids]
+
+    normalized = []
+    invalid = []
+    seen = set()
+
+    for raw_id in raw_slot_ids:
+        try:
+            slot_id = int(raw_id)
+            if slot_id <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            invalid.append(raw_id)
+            continue
+
+        if slot_id in seen:
+            continue
+        seen.add(slot_id)
+        normalized.append(slot_id)
+
+    return normalized, invalid
+
+
+def _ensure_vendor_slot_rows_for_date(vendor_id, game_id, booked_date_obj, slot_ids):
+    """
+    Self-heal missing VENDOR_<id>_SLOT rows for selected date/slots so direct booking
+    doesn't fail only because a date row was not pre-generated.
+    """
+    if not vendor_id or not game_id or not booked_date_obj or not slot_ids:
+        return
+
+    table_name = f"VENDOR_{int(vendor_id)}_SLOT"
+    game = AvailableGame.query.filter_by(id=int(game_id), vendor_id=int(vendor_id)).first()
+    fallback_available = max(int(getattr(game, "total_slot", 0) or 0), 1)
+
+    valid_slot_ids = [
+        int(row[0])
+        for row in (
+            db.session.query(Slot.id)
+            .filter(
+                Slot.id.in_([int(sid) for sid in slot_ids]),
+                Slot.gaming_type_id == int(game_id),
+            )
+            .all()
+        )
+    ]
+
+    for slot_id in valid_slot_ids:
+        db.session.execute(
+            text(
+                f"""
+                INSERT INTO {table_name} (vendor_id, date, slot_id, is_available, available_slot)
+                SELECT :vendor_id, :booked_date, :slot_id, TRUE, :available_slot
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM {table_name}
+                    WHERE vendor_id = :vendor_id
+                      AND date = :booked_date
+                      AND slot_id = :slot_id
+                )
+                """
+            ),
+            {
+                "vendor_id": int(vendor_id),
+                "booked_date": booked_date_obj,
+                "slot_id": int(slot_id),
+                "available_slot": fallback_available,
+            },
+        )
+
+
+def _precheck_slot_booking_eligibility(vendor_id, slot_id, booked_date_obj, required_units):
+    """
+    Returns None when slot is eligible; otherwise returns a user-safe reason string.
+    """
+    table_name = f"VENDOR_{int(vendor_id)}_SLOT"
+    row = db.session.execute(
+        text(
+            f"""
+            SELECT available_slot, is_available
+            FROM {table_name}
+            WHERE slot_id = :slot_id AND date = :booked_date
+            """
+        ),
+        {"slot_id": int(slot_id), "booked_date": booked_date_obj},
+    ).fetchone()
+
+    if not row:
+        return "Slot row not found for selected date."
+
+    available_slot = int(row[0] or 0)
+    is_available = bool(row[1])
+
+    if available_slot < int(required_units or 1):
+        return f"Slot capacity not available (required {int(required_units or 1)}, available {available_slot})."
+
+    if not is_available and available_slot <= 0:
+        return "Slot is marked unavailable."
+
+    return None
+
+
 def resolve_booking_booked_date(booking, fallback_date=None):
     if not booking:
         return _coerce_date_value(fallback_date) or datetime.utcnow().date()
@@ -3972,15 +4082,15 @@ def new_booking(vendor_id):
     """
     try:
         current_app.logger.info("New Booking Triggered")
-        data = request.json
+        data = request.get_json(silent=True) or {}
 
         console_type = data.get("consoleType")
         name = str(data.get("name") or "").strip()
         email = str(data.get("email") or "").strip().lower()
         phone = str(data.get("phone") or "").strip()
         booked_date = data.get("bookedDate")
-        slot_ids = data.get("slotId")
-        payment_type = data.get("paymentType")
+        slot_ids, invalid_slot_ids = _normalize_slot_ids(data.get("slotId"))
+        payment_type = str(data.get("paymentType") or "").strip()
         console_id = data.get("consoleId")
         is_rapid_booking = data.get("isRapidBooking")
         booking_type = data.get("bookingType") or "direct"
@@ -3998,6 +4108,15 @@ def new_booking(vendor_id):
         if not booked_date_obj:
             return jsonify({"message": "Invalid bookedDate format. Use YYYY-MM-DD or YYYYMMDD."}), 400
         booked_date_str = booked_date_obj.strftime("%Y-%m-%d")
+
+        if invalid_slot_ids:
+            return jsonify({
+                "success": False,
+                "message": "slotId contains invalid values",
+                "invalid_slot_ids": invalid_slot_ids,
+            }), 400
+        if not slot_ids:
+            return jsonify({"success": False, "message": "At least one valid slotId is required"}), 400
 
         field_config = _load_vendor_booking_field_config(vendor_id)
         phone_visible = bool(field_config.get("phone", {}).get("visible", True))
@@ -4063,7 +4182,8 @@ def new_booking(vendor_id):
             "suggested_extra_controller_qty": max(suggested_extra_controller_qty, 0),
             "members": normalized_squad_members,
         }
-        if payment_type == 'Cash' and squad_enabled and not normalized_squad_details.get("batch_id"):
+        is_pay_at_cafe = str(payment_type or "").strip().lower() == "cash"
+        if is_pay_at_cafe and squad_enabled and not normalized_squad_details.get("batch_id"):
             normalized_squad_details["batch_id"] = str(uuid.uuid4())
 
         # ✅ Log received data with booking mode
@@ -4073,7 +4193,7 @@ def new_booking(vendor_id):
         )
 
         # Validate required fields
-        if not all([name, booked_date, slot_ids, payment_type]):
+        if not all([name, booked_date_obj, slot_ids, payment_type]):
             return jsonify({"message": "Missing required fields"}), 400
         if phone_required and not phone:
             return jsonify({"message": "Phone number is required"}), 400
@@ -4194,6 +4314,50 @@ def new_booking(vendor_id):
             current_app.logger.error(f"❌ No games found for vendor {vendor_id}")
             return jsonify({"message": "Game not found for this vendor"}), 404
 
+        # Slot IDs are source-of-truth for selected console/game in booking grid.
+        # Validate that all requested slots belong to this vendor and one game type.
+        requested_slot_rows = (
+            db.session.query(Slot.id, Slot.gaming_type_id)
+            .join(AvailableGame, AvailableGame.id == Slot.gaming_type_id)
+            .filter(
+                Slot.id.in_(slot_ids),
+                AvailableGame.vendor_id == int(vendor_id),
+            )
+            .all()
+        )
+        slot_game_by_id = {int(row[0]): int(row[1]) for row in requested_slot_rows}
+        missing_slot_ids = [sid for sid in slot_ids if sid not in slot_game_by_id]
+        if missing_slot_ids:
+            return jsonify({
+                "success": False,
+                "message": "One or more selected slots are invalid for this vendor",
+                "invalid_slot_ids": missing_slot_ids,
+            }), 400
+
+        unique_game_ids = sorted({gid for gid in slot_game_by_id.values()})
+        if len(unique_game_ids) > 1:
+            return jsonify({
+                "success": False,
+                "message": "Selected slots must belong to the same console/game type",
+                "slot_game_ids": unique_game_ids,
+            }), 400
+
+        slot_scoped_game_id = int(unique_game_ids[0])
+        if int(available_game.id) != slot_scoped_game_id:
+            scoped_game = (
+                db.session.query(AvailableGame)
+                .filter_by(id=slot_scoped_game_id, vendor_id=int(vendor_id))
+                .first()
+            )
+            if scoped_game:
+                current_app.logger.info(
+                    "Overriding matched game from %s to %s based on selected slot_ids=%s",
+                    available_game.id,
+                    scoped_game.id,
+                    slot_ids,
+                )
+                available_game = scoped_game
+
         if extra_controller_qty < 0:
             return jsonify({"message": "extraControllerQty cannot be negative"}), 400
 
@@ -4271,6 +4435,30 @@ def new_booking(vendor_id):
             )
             if computed_controller_fare is not None:
                 extra_controller_fare = computed_controller_fare
+
+        slot_units_required = (
+            int(normalized_squad_details.get("player_count", 1))
+            if squad_enabled and str(normalized_squad_details.get("console_group", "")).lower() == "pc"
+            else 1
+        )
+        slot_units_required = max(slot_units_required, 1)
+
+        # Self-heal missing per-date rows before booking attempts.
+        try:
+            _ensure_vendor_slot_rows_for_date(
+                vendor_id=vendor_id,
+                game_id=available_game.id,
+                booked_date_obj=booked_date_obj,
+                slot_ids=slot_ids,
+            )
+        except Exception as ensure_err:
+            current_app.logger.warning(
+                "Failed to self-heal vendor slot rows vendor_id=%s game_id=%s date=%s err=%s",
+                vendor_id,
+                available_game.id,
+                booked_date_obj,
+                ensure_err,
+            )
 
         # Validate and calculate extra services cost
         total_meals_cost = 0
@@ -4412,9 +4600,24 @@ def new_booking(vendor_id):
         # ✅ MODIFIED: Use BookingService.create_booking with booking_mode
         bookings = []
         failed_slots = []
+        failed_slot_details = []
         
         for slot_id in slot_ids:
             try:
+                precheck_error = _precheck_slot_booking_eligibility(
+                    vendor_id=vendor_id,
+                    slot_id=slot_id,
+                    booked_date_obj=booked_date_obj,
+                    required_units=slot_units_required,
+                )
+                if precheck_error:
+                    failed_slots.append(int(slot_id))
+                    failed_slot_details.append({
+                        "slot_id": int(slot_id),
+                        "reason": precheck_error,
+                    })
+                    continue
+
                 # ✅ Use the service method instead of direct creation
                 booking = BookingService.create_booking(
                     slot_id=slot_id,
@@ -4422,14 +4625,10 @@ def new_booking(vendor_id):
                     user_id=user.id,
                     socketio=socketio,
                     book_date=booked_date_obj,
-                    is_pay_at_cafe=(payment_type == 'Cash'),
+                    is_pay_at_cafe=is_pay_at_cafe,
                     booking_mode=booking_mode,  # ✅ PASS BOOKING MODE HERE
                     squad_details=normalized_squad_details if squad_enabled else None,
-                    slot_units=(
-                        int(normalized_squad_details.get("player_count", 1))
-                        if squad_enabled and str(normalized_squad_details.get("console_group", "")) == "pc"
-                        else 1
-                    )
+                    slot_units=slot_units_required,
                 )
                 
                 bookings.append(booking)
@@ -4440,8 +4639,21 @@ def new_booking(vendor_id):
                 )
                 
             except ValueError as e:
-                current_app.logger.error(f"Failed to book slot {slot_id}: {str(e)}")
-                failed_slots.append(slot_id)
+                reason = str(e) or "Slot booking failed"
+                current_app.logger.error(f"Failed to book slot {slot_id}: {reason}")
+                failed_slots.append(int(slot_id))
+                failed_slot_details.append({
+                    "slot_id": int(slot_id),
+                    "reason": reason,
+                })
+                continue
+            except Exception as e:
+                current_app.logger.exception("Unexpected booking error for slot %s: %s", slot_id, e)
+                failed_slots.append(int(slot_id))
+                failed_slot_details.append({
+                    "slot_id": int(slot_id),
+                    "reason": "Unexpected backend error while creating booking",
+                })
                 continue
 
         # Check if any bookings were created
@@ -4449,7 +4661,8 @@ def new_booking(vendor_id):
             return jsonify({
                 "success": False,
                 "message": "Failed to create any bookings",
-                "failed_slots": failed_slots
+                "failed_slots": failed_slots,
+                "failed_slot_details": failed_slot_details,
             }), 400
 
         # ✅ Since BookingService.create_booking already handles slot decrement,
@@ -4962,6 +5175,7 @@ def new_booking(vendor_id):
         if failed_slots:
             response['partial_success'] = True
             response['failed_slots'] = failed_slots
+            response['failed_slot_details'] = failed_slot_details
             response['message'] = f"Created {len(bookings)} bookings ({booking_mode} mode), {len(failed_slots)} slots failed"
 
         return jsonify(response), 200
@@ -5756,9 +5970,12 @@ def _collect_vendor_user_ids(vendor_id_int: int):
     return user_ids
 
 
-@booking_blueprint.route('/vendor/<string:vendor_id>/users', methods=['GET', 'POST'])
+@booking_blueprint.route('/vendor/<string:vendor_id>/users', methods=['GET', 'POST', 'OPTIONS'])
 def get_user_details(vendor_id):
     try:
+        if request.method == "OPTIONS":
+            return make_response("", 204)
+
         if request.method == 'POST':
             body = request.get_json(silent=True) or {}
 
@@ -5861,20 +6078,38 @@ def get_user_details(vendor_id):
         # Fast search mode for typeahead (branch-only when booked_only=true).
         if query_text or "field" in request.args or "booked_only" in request.args:
             if booked_only:
+                # Fast-path for large vendors: recent transaction user IDs first, then user lookup.
+                recent_user_rows = (
+                    db.session.query(Transaction.user_id)
+                    .filter(
+                        Transaction.vendor_id == vendor_id_int,
+                        Transaction.user_id.isnot(None),
+                    )
+                    .order_by(Transaction.id.desc())
+                    .limit(max(limit * 40, 200))
+                    .all()
+                )
+
+                ordered_user_ids = []
+                seen_user_ids = set()
+                for row in recent_user_rows:
+                    uid = int(row[0]) if row and row[0] else None
+                    if not uid or uid in seen_user_ids:
+                        continue
+                    seen_user_ids.add(uid)
+                    ordered_user_ids.append(uid)
+                    if len(ordered_user_ids) >= max(limit * 8, 80):
+                        break
+
+                if not ordered_user_ids:
+                    return jsonify([]), 200
+
                 recent_branch_users = (
                     db.session.query(
                         User.id.label("id"),
                         User.name.label("name"),
                         ContactInfo.email.label("email"),
                         ContactInfo.phone.label("phone"),
-                        func.max(Transaction.created_at).label("last_seen"),
-                    )
-                    .join(
-                        Transaction,
-                        and_(
-                            Transaction.user_id == User.id,
-                            Transaction.vendor_id == vendor_id_int,
-                        ),
                     )
                     .outerjoin(
                         ContactInfo,
@@ -5883,7 +6118,7 @@ def get_user_details(vendor_id):
                             ContactInfo.parent_type == "user",
                         ),
                     )
-                    .group_by(User.id, User.name, ContactInfo.email, ContactInfo.phone)
+                    .filter(User.id.in_(ordered_user_ids))
                 )
 
                 if query_text:
@@ -5903,12 +6138,9 @@ def get_user_details(vendor_id):
                             )
                         )
 
-                rows = (
-                    recent_branch_users
-                    .order_by(func.max(Transaction.created_at).desc(), User.id.desc())
-                    .limit(limit)
-                    .all()
-                )
+                rows = recent_branch_users.limit(max(limit * 2, limit)).all()
+                row_map = {int(row.id): row for row in rows if row and row.id}
+                sorted_rows = [row_map[uid] for uid in ordered_user_ids if uid in row_map][:limit]
                 return jsonify([
                     {
                         "id": row.id,
@@ -5916,7 +6148,7 @@ def get_user_details(vendor_id):
                         "email": row.email,
                         "phone": row.phone,
                     }
-                    for row in rows
+                    for row in sorted_rows
                 ]), 200
 
             # Non-booked-only search mode still remains vendor-scoped via known user IDs.
