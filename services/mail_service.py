@@ -377,6 +377,8 @@ def vendor_booking_notification_mail(
     total_amount_paid,
     total_app_fee=0,
     net_total_paid=None,
+    notification_type="booking_confirmed",
+    gamer_name=None,
 ):
     """
     Notify vendor when a booking is confirmed from the Hash app.
@@ -397,35 +399,56 @@ def vendor_booking_notification_mail(
     total_app_fee = float(total_app_fee or 0)
     resolved_net_total = float(net_total_paid) if net_total_paid is not None else max(float(total_amount_paid or 0) - total_app_fee, 0.0)
 
+    normalized_type = str(notification_type or "booking_confirmed").strip().lower()
+    is_pending_request = normalized_type in {"booking_requested", "pending", "pending_acceptance"}
+    status_heading = "🆕 New App Booking Request" if is_pending_request else "✅ App Booking Confirmed"
+    status_subtitle = (
+        "Action required: Please accept/reject this request from dashboard."
+        if is_pending_request
+        else "Booking confirmed from Hash App."
+    )
+    amount_label = "Estimated Amount" if is_pending_request else "Total Paid"
+    action_note = (
+        "Please review this request in your Pay-at-Cafe panel and take action."
+        if is_pending_request
+        else "Please prepare the slot for the customer."
+    )
+    customer_row = (
+        f"<tr><td style='color:#bbbbbb;'>Customer</td><td>{gamer_name}</td></tr>"
+        if gamer_name else ""
+    )
+
     send_email(
-        subject=f"✅ New Booking Confirmed – {cafe_name}",
+        subject=f"{status_heading} – {cafe_name}",
         recipients=[vendor_email],
-        body="A booking was confirmed from the Hash app.",
+        body=f"{status_heading}: {cafe_name}",
         html=f"""
 <!DOCTYPE html>
 <html>
-<body style="font-family:'Segoe UI',sans-serif;background-color:#0d0d0d;margin:0;padding:0;">
-<div style="max-width:640px;margin:auto;background-color:#141414;border-radius:8px;overflow:hidden;">
+<body style="font-family:'Segoe UI',sans-serif;background-color:#0b1220;margin:0;padding:0;">
+<div style="max-width:680px;margin:auto;background-color:#121b2e;border-radius:12px;overflow:hidden;border:1px solid #213252;">
 
-    <div style="padding:26px;text-align:center;background-color:#000000;">
-        <h2 style="color:#ffffff;margin:0;">✅ Booking Confirmed</h2>
-        <p style="color:#bbbbbb;margin:8px 0 0;">Hash App Booking Notification</p>
+    <div style="padding:26px;text-align:center;background-color:#0a1426;">
+        <img src="https://res.cloudinary.com/dxjjigepf/image/upload/v1755415904/Adobe_Express_-_file_1_wfe3ad.png" width="78" alt="Hash For Gamers" style="display:block;margin:0 auto 10px;">
+        <h2 style="color:#ffffff;margin:0;">{status_heading}</h2>
+        <p style="color:#9fb2d4;margin:8px 0 0;">{status_subtitle}</p>
     </div>
 
     <div style="padding:28px;color:#ffffff;">
         <p>Hello <strong>{cafe_name}</strong>,</p>
-        <p>A booking has been confirmed from the Hash App.</p>
+        <p>A booking has been created from the Hash App.</p>
 
         <table style="width:100%;margin-top:18px;">
             <tr><td style="color:#bbbbbb;">Confirmation Date</td><td>{booking_date}</td></tr>
             <tr><td style="color:#bbbbbb;">Booked For</td><td>{booked_for_date}</td></tr>
             <tr><td style="color:#bbbbbb;">Payment Type</td><td>{payment_type}</td></tr>
-            <tr><td style="color:#bbbbbb;">Total Paid</td><td style="color:#00ff88;">₹{float(total_amount_paid or 0):.2f}</td></tr>
+            {customer_row}
+            <tr><td style="color:#bbbbbb;">{amount_label}</td><td style="color:#00ff88;">₹{float(total_amount_paid or 0):.2f}</td></tr>
             {f'<tr><td style="color:#bbbbbb;">Platform Fee</td><td style="color:#ffcc66;">₹{total_app_fee:.2f}</td></tr>' if total_app_fee > 0 else ''}
             {f'<tr><td style="color:#bbbbbb;">Net to Cafe</td><td style="color:#8af2b2;">₹{resolved_net_total:.2f}</td></tr>' if total_app_fee > 0 else ''}
         </table>
 
-        <h3 style="margin-top:26px;color:#00ff88;">🕒 Booking Details</h3>
+        <h3 style="margin-top:26px;color:#00ff88;">🕒 Slot Details</h3>
         <table style="width:100%;background-color:#1c1c1c;border:1px solid #2a2a2a;">
             <tr>
                 <th style="padding:10px;text-align:left;">Booking ID</th>
@@ -436,12 +459,12 @@ def vendor_booking_notification_mail(
             {booking_rows}
         </table>
 
-        <p style="margin-top:22px;">Please prepare the slot for the customer.</p>
-        <p>— Team Hash</p>
+        <p style="margin-top:22px;">{action_note}</p>
+        <p>Regards,<br><strong>Hash For Gamers Team</strong></p>
     </div>
 
-    <div style="padding:16px;text-align:center;color:#666;font-size:12px;background:#222;">
-        © 2025 Hash Platform. All rights reserved.
+    <div style="padding:16px;text-align:center;color:#8aa0c6;font-size:12px;background:#0a1426;">
+        © 2026 Hash For Gamers. All rights reserved.
     </div>
 
 </div>

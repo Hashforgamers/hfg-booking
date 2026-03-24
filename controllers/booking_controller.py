@@ -2152,6 +2152,76 @@ def create_booking():
             log.info("bookings.post.none_booked cid=%s", cid)
             return jsonify({"message": "No slots available for booking"}), 400
 
+        # Notify cafe for app-created pay-at-cafe requests immediately.
+        # Confirmed app bookings continue to notify from /bookings/confirm flow.
+        if is_pay_at_cafe:
+            try:
+                vendor_contact = (
+                    ContactInfo.query
+                    .filter(
+                        ContactInfo.parent_type == "vendor",
+                        ContactInfo.parent_id == int(vendor_id),
+                        ContactInfo.email.isnot(None),
+                    )
+                    .first()
+                )
+                if vendor_contact and vendor_contact.email:
+                    vendor_obj = Vendor.query.get(int(vendor_id))
+                    user_obj = User.query.get(int(user_id)) if user_id else None
+                    booked_slot_ids = [
+                        int(item.get("slot_id"))
+                        for item in booking_mappings
+                        if item.get("slot_id") is not None
+                    ]
+                    slot_rows = (
+                        Slot.query.filter(Slot.id.in_(booked_slot_ids)).all()
+                        if booked_slot_ids else []
+                    )
+                    slot_map = {int(s.id): s for s in slot_rows}
+                    booking_details = []
+                    total_estimated = 0.0
+                    for item in booking_mappings:
+                        slot_id_val = int(item.get("slot_id"))
+                        slot_obj = slot_map.get(slot_id_val)
+                        squad_details_for_line = item.get("squad_details") if isinstance(item.get("squad_details"), dict) else {}
+                        line_pricing = _compute_pay_at_cafe_pricing(
+                            int(vendor_id),
+                            available_game,
+                            squad_details_for_line,
+                            booking_date=book_date_obj,
+                            slot_obj=slot_obj,
+                        )
+                        line_amount = float(line_pricing.get("final_amount") or 0.0)
+                        total_estimated += line_amount
+                        slot_label = "N/A"
+                        if slot_obj and slot_obj.start_time and slot_obj.end_time:
+                            slot_label = f"{slot_obj.start_time} - {slot_obj.end_time}"
+                        booking_details.append({
+                            "booking_id": int(item.get("booking_id")),
+                            "gamer_name": (user_obj.name if user_obj else username) or "Guest",
+                            "slot_time": slot_label,
+                            "amount_paid": round(line_amount, 2),
+                        })
+
+                    _send_vendor_booking_mail_async(
+                        current_app._get_current_object(),
+                        [{
+                            "vendor_email": vendor_contact.email,
+                            "cafe_name": (vendor_obj.cafe_name if vendor_obj else available_game.game_name) or "Gaming Cafe",
+                            "booking_date": datetime.utcnow().strftime("%Y-%m-%d"),
+                            "booked_for_date": book_date_obj.strftime("%Y-%m-%d"),
+                            "payment_type": "Pay At Cafe",
+                            "booking_details": booking_details,
+                            "total_amount_paid": round(total_estimated, 2),
+                            "total_app_fee": 0.0,
+                            "net_total_paid": round(total_estimated, 2),
+                            "notification_type": "booking_requested",
+                            "gamer_name": (user_obj.name if user_obj else username) or None,
+                        }]
+                    )
+            except Exception as vendor_mail_err:
+                log.warning("bookings.post.vendor_mail_failed cid=%s err=%s", cid, vendor_mail_err)
+
         log.info("bookings.post.success cid=%s bookings=%s", cid, booking_mappings)
         return jsonify({
             "message": "Slots frozen",
@@ -2579,6 +2649,7 @@ def confirm_booking():
 # controllers/booking_controller.py - UPDATED confirm_booking function
 
 @booking_blueprint.route('/bookings/confirm', methods=['POST'])
+@booking_blueprint.route('/confirm/bookings', methods=['POST'])
 def confirm_booking():
     try:
         data = request.get_json(force=True)
