@@ -6498,6 +6498,8 @@ def get_pending_pay_at_cafe_bookings(vendor_id):
         } if slot_ids else {}
 
         notifications_by_key = {}
+        stale_skipped = []
+        now_ist = datetime.now(IST)
         for booking in pending_bookings:
             try:
                 if booking.emitted_at:
@@ -6513,6 +6515,26 @@ def get_pending_pay_at_cafe_bookings(vendor_id):
 
                 available_game_obj = game_map.get(int(booking.game_id)) if booking.game_id else None
                 slot_obj = slot_map.get(int(booking.slotId)) if booking.slotId else None
+
+                # Guard: old pending_acceptance rows should not keep reappearing in dashboard notifications.
+                slot_end_time = getattr(booking, "end_time", None) or getattr(slot_obj, "end_time", None)
+                if resolved_date and slot_end_time:
+                    slot_end_dt = datetime.combine(resolved_date, slot_end_time)
+                    if slot_end_dt.tzinfo is None:
+                        slot_end_dt_ist = IST.localize(slot_end_dt)
+                    else:
+                        slot_end_dt_ist = slot_end_dt.astimezone(IST)
+                    if slot_end_dt_ist < (now_ist - timedelta(minutes=15)):
+                        stale_skipped.append(booking.bookingId)
+                        continue
+                elif booking.emitted_at:
+                    emitted_at_dt = booking.emitted_at
+                    if emitted_at_dt.tzinfo is None:
+                        emitted_at_dt = pytz.UTC.localize(emitted_at_dt)
+                    if emitted_at_dt.astimezone(IST) < (now_ist - timedelta(hours=24)):
+                        stale_skipped.append(booking.bookingId)
+                        continue
+
                 if available_game_obj:
                     pricing = _compute_pay_at_cafe_pricing(
                         vendor_id,
@@ -6585,12 +6607,18 @@ def get_pending_pay_at_cafe_bookings(vendor_id):
                 continue
 
         notifications = list(notifications_by_key.values())
-        current_app.logger.info(f"Successfully processed {len(notifications)} pending bookings for vendor {vendor_id}")
+        current_app.logger.info(
+            "Successfully processed pending pay-at-cafe notifications vendor=%s active=%s stale_skipped=%s",
+            vendor_id,
+            len(notifications),
+            len(stale_skipped),
+        )
         
         return jsonify({
             'success': True,
             'notifications': notifications,
-            'count': len(notifications)
+            'count': len(notifications),
+            'stale_skipped_count': len(stale_skipped),
         }), 200
 
     except Exception as e:
