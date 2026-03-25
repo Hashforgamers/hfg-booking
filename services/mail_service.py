@@ -1,13 +1,17 @@
 from flask_mail import Message
 from db.extensions import mail
 from flask import current_app
+from services.email_template import build_hfg_email_html
 
 
 def send_email(subject, recipients, body, html=None):
     msg = Message(subject, recipients=recipients)
     msg.body = body
-    if html:
-        msg.html = html
+    msg.html = build_hfg_email_html(
+        subject=subject,
+        content_html=html or f"<p>{body}</p>",
+        preview_text=body,
+    )
 
     try:
         mail.send(msg)
