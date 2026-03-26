@@ -1,28 +1,56 @@
-from flask_mail import Message
-from db.extensions import mail
+import html
+from typing import Iterable
+
 from flask import current_app
+from flask_mail import Message
+
+from db.extensions import mail
 from services.email_template import build_hfg_email_html
 
 
-def send_email(subject, recipients, body, html=None):
-    msg = Message(subject, recipients=recipients)
+def _to_float(value, default=0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _safe(value) -> str:
+    return html.escape(str(value or ""))
+
+
+def _normalize_recipients(recipients: Iterable[str]) -> list[str]:
+    if isinstance(recipients, str):
+        recipients = [recipients]
+    normalized = []
+    for item in recipients or []:
+        email = str(item or "").strip()
+        if email:
+            normalized.append(email)
+    return normalized
+
+
+def send_email(subject, recipients, body, html_fragment=None):
+    recipient_list = _normalize_recipients(recipients)
+    if not recipient_list:
+        current_app.logger.warning("Skipping email '%s' because recipient list is empty", subject)
+        return
+
+    msg = Message(subject, recipients=recipient_list)
     msg.body = body
     msg.html = build_hfg_email_html(
         subject=subject,
-        content_html=html or f"<p>{body}</p>",
+        content_html=html_fragment or f"<p>{_safe(body)}</p>",
         preview_text=body,
     )
 
     try:
         mail.send(msg)
-        current_app.logger.info(f"✅ Mail sent successfully to {recipients}")
-    except Exception as e:
-        current_app.logger.error(f"❌ Failed to send email: {e}")
+        current_app.logger.info("Mail sent successfully to %s", recipient_list)
+    except Exception as exc:
+        current_app.logger.error("Failed to send email '%s' to %s: %s", subject, recipient_list, exc)
 
 
-# =========================
-# BOOKING CONFIRMATION MAIL
-# =========================
 def booking_mail(
     gamer_name,
     gamer_phone,
@@ -36,137 +64,114 @@ def booking_mail(
     extra_controller_fare=0,
     waive_off_amount=0,
     app_fee_amount=0,
-    net_total=None
+    net_total=None,
 ):
-    """
-    Send booking confirmation email with optional meals
-    """
     booking_rows = "".join(
         f"""
         <tr>
-            <td style="padding:10px;border-bottom:1px solid #2a2a2a;">{b['booking_id']}</td>
-            <td style="padding:10px;border-bottom:1px solid #2a2a2a;">{b['slot_time']}</td>
+            <td style=\"padding:10px;border-bottom:1px solid #1e2a44;\">#{_safe(item.get('booking_id'))}</td>
+            <td style=\"padding:10px;border-bottom:1px solid #1e2a44;\">{_safe(item.get('slot_time'))}</td>
         </tr>
         """
-        for b in booking_details
+        for item in (booking_details or [])
     )
 
-    extra_meals_html = ""
+    meals_section = ""
     if extra_meals:
-        rows = ""
-        total_meals_cost = 0
+        meal_rows = []
+        meals_total = 0.0
         for meal in extra_meals:
-            meal_total = meal.get('total_price', 0)
-            total_meals_cost += meal_total
-            rows += f"""
-            <tr>
-                <td style="padding:8px;border-bottom:1px solid #2a3d2a;">{meal['name']}</td>
-                <td style="padding:8px;text-align:center;border-bottom:1px solid #2a3d2a;">{meal.get('quantity', 1)}</td>
-                <td style="padding:8px;text-align:right;border-bottom:1px solid #2a3d2a;">₹{meal.get('unit_price', 0):.2f}</td>
-                <td style="padding:8px;text-align:right;border-bottom:1px solid #2a3d2a;">₹{meal_total:.2f}</td>
-            </tr>
-            """
-        extra_meals_html = f"""
-        <div style="margin-top:25px;background-color:#1f2a1f;border:1px solid #2a3d2a;border-radius:6px;padding:20px;">
-            <h3 style="margin-top:0;color:#00ff88;">🍽️ Meals & Services</h3>
-            <table style="width:100%;border-collapse:collapse;color:#ffffff;">
-                <tr style="background-color:#0d1a0d;">
-                    <th style="padding:8px;text-align:left;">Item</th>
-                    <th style="padding:8px;text-align:center;">Qty</th>
-                    <th style="padding:8px;text-align:right;">Price</th>
-                    <th style="padding:8px;text-align:right;">Total</th>
-                </tr>
-                {rows}
+            qty = _to_float(meal.get("quantity", 1), 1)
+            unit_price = _to_float(meal.get("unit_price", 0))
+            total_price = _to_float(meal.get("total_price", unit_price * qty))
+            meals_total += total_price
+            meal_rows.append(
+                f"""
                 <tr>
-                    <td colspan="3" style="padding:10px;text-align:right;font-weight:bold;color:#00ff88;">Meals Total:</td>
-                    <td style="padding:10px;text-align:right;font-weight:bold;color:#00ff88;">₹{total_meals_cost:.2f}</td>
+                    <td style=\"padding:8px;border-bottom:1px solid #1e2a44;\">{_safe(meal.get('name'))}</td>
+                    <td style=\"padding:8px;text-align:center;border-bottom:1px solid #1e2a44;\">{int(qty)}</td>
+                    <td style=\"padding:8px;text-align:right;border-bottom:1px solid #1e2a44;\">₹{unit_price:.2f}</td>
+                    <td style=\"padding:8px;text-align:right;border-bottom:1px solid #1e2a44;\">₹{total_price:.2f}</td>
+                </tr>
+                """
+            )
+
+        meals_section = f"""
+        <div style=\"margin-top:20px;\">
+            <div style=\"font-size:14px;font-weight:700;color:#22c55e;margin-bottom:8px;\">Meals and Extras</div>
+            <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"border:1px solid #1e2a44;border-radius:8px;overflow:hidden;background:#08142c;\">
+                <tr style=\"background:#050f23;color:#cbd5e1;\">
+                    <th style=\"padding:8px;text-align:left;\">Item</th>
+                    <th style=\"padding:8px;text-align:center;\">Qty</th>
+                    <th style=\"padding:8px;text-align:right;\">Unit</th>
+                    <th style=\"padding:8px;text-align:right;\">Total</th>
+                </tr>
+                {''.join(meal_rows)}
+                <tr>
+                    <td colspan=\"3\" style=\"padding:10px;text-align:right;color:#22c55e;font-weight:700;\">Meals Total</td>
+                    <td style=\"padding:10px;text-align:right;color:#22c55e;font-weight:700;\">₹{meals_total:.2f}</td>
                 </tr>
             </table>
         </div>
         """
 
-    adjustments_html = ""
+    paid_amount = _to_float(price_paid)
+    platform_fee = _to_float(app_fee_amount)
+    net_amount = _to_float(net_total, max(paid_amount - platform_fee, 0.0))
+    extra_controller_fare = _to_float(extra_controller_fare)
+    waive_off_amount = _to_float(waive_off_amount)
+
+    adjustments = ""
     if extra_controller_fare > 0:
-        adjustments_html += f"""
+        adjustments += f"""
         <tr>
-            <td colspan="2" style="padding:10px;color:#00ff88;">
-                Extra Controller Fare: ₹{extra_controller_fare:.2f}
-            </td>
+            <td colspan=\"2\" style=\"padding:10px;color:#22c55e;\">Extra Controller Fare: ₹{extra_controller_fare:.2f}</td>
         </tr>
         """
-
     if waive_off_amount > 0:
-        adjustments_html += f"""
+        adjustments += f"""
         <tr>
-            <td colspan="2" style="padding:10px;color:#ff6666;">
-                Waive Off: -₹{waive_off_amount:.2f}
-            </td>
+            <td colspan=\"2\" style=\"padding:10px;color:#f87171;\">Waive Off: -₹{waive_off_amount:.2f}</td>
         </tr>
         """
 
-    app_fee_amount = float(app_fee_amount or 0)
-    net_amount = float(net_total) if net_total is not None else max(float(price_paid or 0) - app_fee_amount, 0.0)
+    content = f"""
+    <p style=\"margin:0 0 12px 0;\">Hi <strong>{_safe(gamer_name)}</strong>,</p>
+    <p style=\"margin:0 0 16px 0;color:#cbd5e1;\">Your booking at <strong>{_safe(cafe_name)}</strong> is confirmed.</p>
+
+    <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"border:1px solid #1e2a44;border-radius:8px;overflow:hidden;background:#08142c;\">
+      <tr><td style=\"padding:9px;color:#94a3b8;\">Phone</td><td style=\"padding:9px;\">{_safe(gamer_phone)}</td></tr>
+      <tr><td style=\"padding:9px;color:#94a3b8;\">Email</td><td style=\"padding:9px;\">{_safe(gamer_email)}</td></tr>
+      <tr><td style=\"padding:9px;color:#94a3b8;\">Booking Date</td><td style=\"padding:9px;\">{_safe(booking_date)}</td></tr>
+      <tr><td style=\"padding:9px;color:#94a3b8;\">Booked For</td><td style=\"padding:9px;\">{_safe(booked_for_date)}</td></tr>
+      <tr><td style=\"padding:9px;color:#94a3b8;\">Total Paid</td><td style=\"padding:9px;color:#22c55e;font-weight:700;\">₹{paid_amount:.2f}</td></tr>
+      {f'<tr><td style="padding:9px;color:#94a3b8;">Platform Fee</td><td style="padding:9px;color:#facc15;">₹{platform_fee:.2f}</td></tr>' if platform_fee > 0 else ''}
+      {f'<tr><td style="padding:9px;color:#94a3b8;">Net to Cafe</td><td style="padding:9px;color:#86efac;">₹{net_amount:.2f}</td></tr>' if platform_fee > 0 else ''}
+    </table>
+
+    <div style=\"font-size:14px;font-weight:700;color:#22c55e;margin:20px 0 8px;\">Slot Details</div>
+    <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"border:1px solid #1e2a44;border-radius:8px;overflow:hidden;background:#08142c;\">
+      <tr style=\"background:#050f23;color:#cbd5e1;\">
+        <th style=\"padding:10px;text-align:left;\">Booking ID</th>
+        <th style=\"padding:10px;text-align:left;\">Slot Time</th>
+      </tr>
+      {booking_rows}
+      {adjustments}
+    </table>
+
+    {meals_section}
+
+    <p style=\"margin-top:18px;color:#cbd5e1;\">Enjoy your session and have fun.</p>
+    """
 
     send_email(
-        subject="🎮 Booking Confirmed – Hash Gaming Café",
+        subject="Booking Confirmed - Hash For Gamers",
         recipients=[gamer_email],
-        body="Your booking has been confirmed!",
-        html=f"""
-<!DOCTYPE html>
-<html>
-<body style="font-family:'Segoe UI',sans-serif;background-color:#0d0d0d;margin:0;padding:0;">
-<div style="max-width:640px;margin:auto;background-color:#141414;border-radius:8px;overflow:hidden;">
-
-    <div style="padding:30px;text-align:center;background-color:#000000;">
-        <img src="https://res.cloudinary.com/dxjjigepf/image/upload/v1755415904/Adobe_Express_-_file_1_wfe3ad.png" width="80">
-        <h2 style="color:#ffffff;margin:10px 0;">🎮 Booking Confirmed</h2>
-        <p style="color:#bbbbbb;">Built for Cafés, Made for Gamers</p>
-    </div>
-
-    <div style="padding:30px;color:#ffffff;">
-        <p>Hi <strong>{gamer_name}</strong>,</p>
-        <p>Your booking at <strong>{cafe_name}</strong> is confirmed.</p>
-
-        <table style="width:100%;margin-top:20px;">
-            <tr><td style="color:#bbbbbb;">Phone</td><td>{gamer_phone}</td></tr>
-            <tr><td style="color:#bbbbbb;">Email</td><td>{gamer_email}</td></tr>
-            <tr><td style="color:#bbbbbb;">Booking Date</td><td>{booking_date}</td></tr>
-            <tr><td style="color:#bbbbbb;">Booked For</td><td>{booked_for_date}</td></tr>
-            <tr><td style="color:#bbbbbb;">Total Paid</td><td style="color:#00ff88;">₹{float(price_paid or 0):.2f}</td></tr>
-            {f'<tr><td style="color:#bbbbbb;">Platform Fee</td><td style="color:#ffcc66;">₹{app_fee_amount:.2f}</td></tr>' if app_fee_amount > 0 else ''}
-            {f'<tr><td style="color:#bbbbbb;">Net to Cafe</td><td style="color:#8af2b2;">₹{net_amount:.2f}</td></tr>' if app_fee_amount > 0 else ''}
-        </table>
-
-        <h3 style="margin-top:30px;color:#00ff88;">🕒 Slot Details</h3>
-        <table style="width:100%;background-color:#1c1c1c;border:1px solid #2a2a2a;">
-            <tr>
-                <th style="padding:10px;">Booking ID</th>
-                <th style="padding:10px;">Slot Time</th>
-            </tr>
-            {booking_rows}
-            {adjustments_html}
-        </table>
-
-        {extra_meals_html}
-
-        <p style="margin-top:25px;">Enjoy your game! 🎮</p>
-        <p>Cheers,<br><strong>Team Hash</strong></p>
-    </div>
-
-    <div style="padding:20px;text-align:center;color:#666;font-size:12px;background:#222;">
-        © 2025 Hash Platform. All rights reserved.
-    </div>
-
-</div>
-</body>
-</html>
-"""
+        body="Your booking has been confirmed.",
+        html_fragment=content,
     )
 
 
-# ========================================
-# ✅ NEW: MEALS ADDED TO EXISTING BOOKING
-# ========================================
 def meals_added_mail(
     gamer_name,
     gamer_email,
@@ -178,144 +183,89 @@ def meals_added_mail(
     updated_booking_total,
     booking_date=None,
     app_fee_amount=0,
-    net_total=None
+    net_total=None,
 ):
-    """
-    Send notification email when meals are added to an existing active booking
-    """
-    meals_rows = ""
-    for meal in added_meals:
-        meals_rows += f"""
+    meal_rows = ""
+    for meal in (added_meals or []):
+        qty = int(_to_float(meal.get("quantity", 1), 1))
+        unit_price = _to_float(meal.get("unit_price", 0))
+        total_price = _to_float(meal.get("total_price", 0))
+        meal_rows += f"""
         <tr>
-            <td style="padding:12px;border-bottom:1px solid #2a3d2a;">{meal['name']}</td>
-            <td style="padding:12px;text-align:center;border-bottom:1px solid #2a3d2a;">{meal.get('quantity', 1)}</td>
-            <td style="padding:12px;text-align:right;border-bottom:1px solid #2a3d2a;">₹{meal.get('unit_price', 0):.2f}</td>
-            <td style="padding:12px;text-align:right;border-bottom:1px solid #2a3d2a;">₹{meal.get('total_price', 0):.2f}</td>
+          <td style=\"padding:8px;border-bottom:1px solid #1e2a44;\">{_safe(meal.get('name'))}</td>
+          <td style=\"padding:8px;text-align:center;border-bottom:1px solid #1e2a44;\">{qty}</td>
+          <td style=\"padding:8px;text-align:right;border-bottom:1px solid #1e2a44;\">₹{unit_price:.2f}</td>
+          <td style=\"padding:8px;text-align:right;border-bottom:1px solid #1e2a44;\">₹{total_price:.2f}</td>
         </tr>
         """
 
-    app_fee_amount = float(app_fee_amount or 0)
-    resolved_net_total = float(net_total) if net_total is not None else max(float(updated_booking_total or 0) - app_fee_amount, 0.0)
+    app_fee_amount = _to_float(app_fee_amount)
+    updated_booking_total = _to_float(updated_booking_total)
+    resolved_net_total = _to_float(net_total, max(updated_booking_total - app_fee_amount, 0.0))
+    meals_total = _to_float(meals_total)
+
+    content = f"""
+    <p style=\"margin:0 0 12px 0;\">Hi <strong>{_safe(gamer_name)}</strong>,</p>
+    <p style=\"margin:0 0 16px 0;color:#cbd5e1;\">Meals were added to your booking at <strong>{_safe(cafe_name)}</strong>.</p>
+
+    <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"border:1px solid #1e2a44;border-radius:8px;overflow:hidden;background:#08142c;\">
+      <tr><td style=\"padding:9px;color:#94a3b8;\">Booking ID</td><td style=\"padding:9px;\">#{_safe(booking_id)}</td></tr>
+      <tr><td style=\"padding:9px;color:#94a3b8;\">Slot Time</td><td style=\"padding:9px;\">{_safe(slot_time)}</td></tr>
+      {f'<tr><td style="padding:9px;color:#94a3b8;">Date</td><td style="padding:9px;">{_safe(booking_date)}</td></tr>' if booking_date else ''}
+    </table>
+
+    <div style=\"font-size:14px;font-weight:700;color:#22c55e;margin:20px 0 8px;\">Added Items</div>
+    <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"border:1px solid #1e2a44;border-radius:8px;overflow:hidden;background:#08142c;\">
+      <tr style=\"background:#050f23;color:#cbd5e1;\">
+        <th style=\"padding:8px;text-align:left;\">Item</th>
+        <th style=\"padding:8px;text-align:center;\">Qty</th>
+        <th style=\"padding:8px;text-align:right;\">Unit</th>
+        <th style=\"padding:8px;text-align:right;\">Total</th>
+      </tr>
+      {meal_rows}
+      <tr>
+        <td colspan=\"3\" style=\"padding:10px;text-align:right;color:#22c55e;font-weight:700;\">Meals Total</td>
+        <td style=\"padding:10px;text-align:right;color:#22c55e;font-weight:700;\">₹{meals_total:.2f}</td>
+      </tr>
+    </table>
+
+    <div style=\"margin-top:14px;border:1px solid #1e2a44;background:#08142c;border-radius:8px;padding:12px;\">
+      <div style=\"color:#94a3b8;font-size:13px;\">Updated Booking Total</div>
+      <div style=\"margin-top:4px;color:#22c55e;font-size:24px;font-weight:700;\">₹{updated_booking_total:.2f}</div>
+      {f'<div style="margin-top:6px;color:#facc15;">Platform Fee: ₹{app_fee_amount:.2f}</div>' if app_fee_amount > 0 else ''}
+      {f'<div style="margin-top:4px;color:#86efac;">Net to Cafe: ₹{resolved_net_total:.2f}</div>' if app_fee_amount > 0 else ''}
+    </div>
+
+    <p style=\"margin-top:14px;color:#cbd5e1;\">Meal charges will be added to your final bill and settled at the cafe.</p>
+    """
 
     send_email(
-        subject=f"🍽️ Meals Added to Your Booking #{booking_id} – Hash Gaming Café",
+        subject=f"Meals Added to Booking #{booking_id} - Hash For Gamers",
         recipients=[gamer_email],
-        body=f"Meals have been added to your booking #{booking_id}",
-        html=f"""
-<!DOCTYPE html>
-<html>
-<body style="font-family:'Segoe UI',sans-serif;background-color:#0d0d0d;margin:0;padding:0;">
-<div style="max-width:640px;margin:auto;background-color:#141414;border-radius:8px;overflow:hidden;">
-
-    <div style="padding:30px;text-align:center;background: linear-gradient(135deg, #1f2a1f 0%, #0d1a0d 100%);">
-        <img src="https://res.cloudinary.com/dxjjigepf/image/upload/v1755415904/Adobe_Express_-_file_1_wfe3ad.png" width="80">
-        <h2 style="color:#ffffff;margin:10px 0;">🍽️ Meals Added</h2>
-        <p style="color:#bbbbbb;">Your order has been updated</p>
-    </div>
-
-    <div style="padding:30px;color:#ffffff;">
-        <p>Hi <strong>{gamer_name}</strong>,</p>
-        <p>We've added the following meals to your booking at <strong>{cafe_name}</strong>.</p>
-
-        <div style="background-color:#1a1a1a;border-left:4px solid #00ff88;padding:15px;margin:20px 0;border-radius:4px;">
-            <table style="width:100%;color:#ffffff;">
-                <tr><td style="color:#bbbbbb;padding:5px 0;">Booking ID:</td><td style="text-align:right;"><strong>#{booking_id}</strong></td></tr>
-                <tr><td style="color:#bbbbbb;padding:5px 0;">Slot Time:</td><td style="text-align:right;"><strong>{slot_time}</strong></td></tr>
-                {f'<tr><td style="color:#bbbbbb;padding:5px 0;">Date:</td><td style="text-align:right;"><strong>{booking_date}</strong></td></tr>' if booking_date else ''}
-            </table>
-        </div>
-
-        <h3 style="margin-top:30px;color:#00ff88;">🍔 Added Items</h3>
-        <table style="width:100%;background-color:#1c1c1c;border:1px solid #2a3d2a;border-radius:6px;overflow:hidden;">
-            <tr style="background-color:#0d1a0d;">
-                <th style="padding:12px;text-align:left;">Item</th>
-                <th style="padding:12px;text-align:center;">Qty</th>
-                <th style="padding:12px;text-align:right;">Price</th>
-                <th style="padding:12px;text-align:right;">Total</th>
-            </tr>
-            {meals_rows}
-            <tr style="background-color:#1f2a1f;">
-                <td colspan="3" style="padding:15px;text-align:right;font-weight:bold;color:#00ff88;font-size:16px;">
-                    Meals Total:
-                </td>
-                <td style="padding:15px;text-align:right;font-weight:bold;color:#00ff88;font-size:16px;">
-                    ₹{meals_total:.2f}
-                </td>
-            </tr>
-        </table>
-
-        <div style="background-color:#0d1a0d;border:2px solid #00ff88;padding:20px;margin:25px 0;border-radius:8px;text-align:center;">
-            <p style="margin:0;color:#bbbbbb;font-size:14px;">Updated Booking Total</p>
-            <p style="margin:10px 0 0 0;color:#00ff88;font-size:28px;font-weight:bold;">₹{updated_booking_total:.2f}</p>
-            {f'<p style="margin:8px 0 0 0;color:#ffcc66;font-size:13px;">Platform Fee: ₹{app_fee_amount:.2f}</p>' if app_fee_amount > 0 else ''}
-            {f'<p style="margin:4px 0 0 0;color:#8af2b2;font-size:13px;">Net to Cafe: ₹{resolved_net_total:.2f}</p>' if app_fee_amount > 0 else ''}
-        </div>
-
-        <div style="background-color:#1a1a1a;border-left:4px solid #ffaa00;padding:15px;margin:20px 0;border-radius:4px;">
-            <p style="margin:0;color:#ffaa00;font-weight:bold;">💰 Payment Note</p>
-            <p style="margin:10px 0 0 0;color:#bbbbbb;font-size:14px;">
-                The meal charges (₹{meals_total:.2f}) will be added to your final bill. Please settle the amount at the counter.
-            </p>
-        </div>
-
-        <p style="margin-top:25px;">Enjoy your meal and gaming session! 🎮🍕</p>
-        <p>Cheers,<br><strong>Team Hash</strong></p>
-    </div>
-
-    <div style="padding:20px;text-align:center;color:#666;font-size:12px;background:#222;">
-        © 2025 Hash Platform. All rights reserved.
-    </div>
-
-</div>
-</body>
-</html>
-"""
+        body=f"Meals were added to your booking #{booking_id}.",
+        html_fragment=content,
     )
 
 
-# =================
-# REJECTION MAIL
-# =================
 def reject_booking_mail(gamer_name, gamer_email, cafe_name, reason="No reason provided"):
+    content = f"""
+    <p style=\"margin:0 0 12px 0;\">Hi <strong>{_safe(gamer_name)}</strong>,</p>
+    <p style=\"margin:0 0 12px 0;color:#cbd5e1;\">Your booking at <strong>{_safe(cafe_name)}</strong> was not confirmed.</p>
+    <div style=\"border:1px solid #7f1d1d;background:#2b0b10;border-radius:8px;padding:12px;color:#fecaca;\">
+      <div style=\"font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:#fca5a5;margin-bottom:4px;\">Reason</div>
+      {_safe(reason)}
+    </div>
+    <p style=\"margin-top:14px;color:#cbd5e1;\">You can book another slot anytime from the app.</p>
     """
-    Send booking rejection email
-    """
+
     send_email(
-        subject="❌ Booking Not Confirmed – Hash",
+        subject="Booking Not Confirmed - Hash For Gamers",
         recipients=[gamer_email],
         body="Your booking could not be confirmed.",
-        html=f"""
-<!DOCTYPE html>
-<html>
-<body style="font-family:'Segoe UI',sans-serif;background-color:#0d0d0d;">
-<div style="max-width:640px;margin:auto;background:#141414;border-radius:8px;">
-
-    <div style="padding:30px;text-align:center;background:#550000;">
-        <h2 style="color:#ffffff;">❌ Booking Rejected</h2>
-    </div>
-
-    <div style="padding:30px;color:#ffffff;">
-        <p>Hi <strong>{gamer_name}</strong>,</p>
-        <p>Your booking at <strong>{cafe_name}</strong> was not confirmed.</p>
-
-        <div style="background:#2a0000;padding:15px;border-left:4px solid #ff4444;">
-            <strong>Reason:</strong> {reason}
-        </div>
-
-        <p style="margin-top:20px;">We hope to serve you soon.</p>
-        <p>— Team Hash</p>
-    </div>
-
-</div>
-</body>
-</html>
-"""
+        html_fragment=content,
     )
 
 
-# ============================
-# EXTRA TIME PAYMENT RECEIPT
-# ============================
 def extra_booking_time_mail(
     username,
     user_email,
@@ -325,52 +275,34 @@ def extra_booking_time_mail(
     console_number,
     amount,
     mode_of_payment,
-    app_fee_amount=0
+    app_fee_amount=0,
 ):
+    amount = _to_float(amount)
+    app_fee_amount = _to_float(app_fee_amount)
+    net_amount = max(amount - app_fee_amount, 0.0)
+
+    content = f"""
+    <p style=\"margin:0 0 12px 0;\">Hi <strong>{_safe(username)}</strong>,</p>
+    <p style=\"margin:0 0 12px 0;color:#cbd5e1;\">Your extra playtime receipt is ready.</p>
+    <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"border:1px solid #1e2a44;border-radius:8px;overflow:hidden;background:#08142c;\">
+      <tr><td style=\"padding:9px;color:#94a3b8;\">Date</td><td style=\"padding:9px;\">{_safe(booked_date)}</td></tr>
+      <tr><td style=\"padding:9px;color:#94a3b8;\">Slot</td><td style=\"padding:9px;\">{_safe(slot_time)}</td></tr>
+      <tr><td style=\"padding:9px;color:#94a3b8;\">Console</td><td style=\"padding:9px;\">{_safe(console_type)} #{_safe(console_number)}</td></tr>
+      <tr><td style=\"padding:9px;color:#94a3b8;\">Amount</td><td style=\"padding:9px;color:#22c55e;font-weight:700;\">₹{amount:.2f}</td></tr>
+      {f'<tr><td style="padding:9px;color:#94a3b8;">Platform Fee</td><td style="padding:9px;color:#facc15;">₹{app_fee_amount:.2f}</td></tr>' if app_fee_amount > 0 else ''}
+      {f'<tr><td style="padding:9px;color:#94a3b8;">Net to Cafe</td><td style="padding:9px;color:#86efac;">₹{net_amount:.2f}</td></tr>' if app_fee_amount > 0 else ''}
+      <tr><td style=\"padding:9px;color:#94a3b8;\">Payment Mode</td><td style=\"padding:9px;\">{_safe(mode_of_payment)}</td></tr>
+    </table>
     """
-    Send extra playtime receipt email
-    """
+
     send_email(
-        subject="🎮 Extra Playtime Receipt – Hash",
+        subject="Extra Playtime Receipt - Hash For Gamers",
         recipients=[user_email],
-        body="Extra playtime payment receipt",
-        html=f"""
-<!DOCTYPE html>
-<html>
-<body style="font-family:'Segoe UI',sans-serif;background:#0d0d0d;">
-<div style="max-width:640px;margin:auto;background:#141414;border-radius:8px;">
-
-    <div style="padding:30px;text-align:center;background:#000;">
-        <h2 style="color:#ffffff;">🎮 Extra Playtime Receipt</h2>
-    </div>
-
-    <div style="padding:30px;color:#ffffff;">
-        <p>Hi <strong>{username}</strong>,</p>
-
-        <table style="width:100%;">
-            <tr><td style="padding:8px 0;color:#bbbbbb;">Date</td><td style="text-align:right;">{booked_date}</td></tr>
-            <tr><td style="padding:8px 0;color:#bbbbbb;">Slot</td><td style="text-align:right;">{slot_time}</td></tr>
-            <tr><td style="padding:8px 0;color:#bbbbbb;">Console</td><td style="text-align:right;">{console_type} #{console_number}</td></tr>
-            <tr><td style="padding:8px 0;color:#bbbbbb;">Amount</td><td style="text-align:right;color:#00ff88;font-weight:bold;">₹{amount}</td></tr>
-            {f'<tr><td style="padding:8px 0;color:#bbbbbb;">Platform Fee</td><td style="text-align:right;color:#ffcc66;">₹{float(app_fee_amount or 0):.2f}</td></tr>' if float(app_fee_amount or 0) > 0 else ''}
-            {f'<tr><td style="padding:8px 0;color:#bbbbbb;">Net to Cafe</td><td style="text-align:right;color:#8af2b2;">₹{max(float(amount or 0) - float(app_fee_amount or 0), 0.0):.2f}</td></tr>' if float(app_fee_amount or 0) > 0 else ''}
-            <tr><td style="padding:8px 0;color:#bbbbbb;">Payment Mode</td><td style="text-align:right;">{mode_of_payment}</td></tr>
-        </table>
-
-        <p style="margin-top:20px;">Thanks for gaming with us!</p>
-        <p>— Team Hash</p>
-    </div>
-
-</div>
-</body>
-</html>
-"""
+        body="Extra playtime payment receipt.",
+        html_fragment=content,
     )
 
 
-# ==========================================
-# ✅ VENDOR BOOKING CONFIRMATION NOTIFICATION
-# ==========================================
 def vendor_booking_notification_mail(
     vendor_email,
     cafe_name,
@@ -384,95 +316,68 @@ def vendor_booking_notification_mail(
     notification_type="booking_confirmed",
     gamer_name=None,
 ):
-    """
-    Notify vendor when a booking is confirmed from the Hash app.
-    booking_details: list of {booking_id, slot_time, gamer_name, amount_paid}
-    """
     booking_rows = "".join(
         f"""
         <tr>
-            <td style="padding:10px;border-bottom:1px solid #2a2a2a;">#{b['booking_id']}</td>
-            <td style="padding:10px;border-bottom:1px solid #2a2a2a;">{b.get('gamer_name') or 'Guest'}</td>
-            <td style="padding:10px;border-bottom:1px solid #2a2a2a;">{b['slot_time']}</td>
-            <td style="padding:10px;text-align:right;border-bottom:1px solid #2a2a2a;">₹{float(b.get('amount_paid') or 0):.2f}</td>
+          <td style=\"padding:10px;border-bottom:1px solid #1e2a44;\">#{_safe(item.get('booking_id'))}</td>
+          <td style=\"padding:10px;border-bottom:1px solid #1e2a44;\">{_safe(item.get('gamer_name') or 'Guest')}</td>
+          <td style=\"padding:10px;border-bottom:1px solid #1e2a44;\">{_safe(item.get('slot_time'))}</td>
+          <td style=\"padding:10px;text-align:right;border-bottom:1px solid #1e2a44;\">₹{_to_float(item.get('amount_paid')):.2f}</td>
         </tr>
         """
-        for b in booking_details
+        for item in (booking_details or [])
     )
 
-    total_app_fee = float(total_app_fee or 0)
-    resolved_net_total = float(net_total_paid) if net_total_paid is not None else max(float(total_amount_paid or 0) - total_app_fee, 0.0)
+    total_amount_paid = _to_float(total_amount_paid)
+    total_app_fee = _to_float(total_app_fee)
+    resolved_net_total = _to_float(net_total_paid, max(total_amount_paid - total_app_fee, 0.0))
 
     normalized_type = str(notification_type or "booking_confirmed").strip().lower()
     is_pending_request = normalized_type in {"booking_requested", "pending", "pending_acceptance"}
-    status_heading = "🆕 New App Booking Request" if is_pending_request else "✅ App Booking Confirmed"
+    status_heading = "New App Booking Request" if is_pending_request else "App Booking Confirmed"
     status_subtitle = (
-        "Action required: Please accept/reject this request from dashboard."
+        "Action required: please accept or reject this request from dashboard."
         if is_pending_request
-        else "Booking confirmed from Hash App."
+        else "Booking confirmed from Hash app."
     )
     amount_label = "Estimated Amount" if is_pending_request else "Total Paid"
     action_note = (
-        "Please review this request in your Pay-at-Cafe panel and take action."
+        "Please review this request in your Pay at Cafe panel."
         if is_pending_request
         else "Please prepare the slot for the customer."
     )
-    customer_row = (
-        f"<tr><td style='color:#bbbbbb;'>Customer</td><td>{gamer_name}</td></tr>"
-        if gamer_name else ""
-    )
+
+    content = f"""
+    <p style=\"margin:0 0 8px 0;\">Hello <strong>{_safe(cafe_name)}</strong>,</p>
+    <p style=\"margin:0 0 16px 0;color:#cbd5e1;\">{_safe(status_subtitle)}</p>
+
+    <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"border:1px solid #1e2a44;border-radius:8px;overflow:hidden;background:#08142c;\">
+      <tr><td style=\"padding:9px;color:#94a3b8;\">Confirmation Date</td><td style=\"padding:9px;\">{_safe(booking_date)}</td></tr>
+      <tr><td style=\"padding:9px;color:#94a3b8;\">Booked For</td><td style=\"padding:9px;\">{_safe(booked_for_date)}</td></tr>
+      <tr><td style=\"padding:9px;color:#94a3b8;\">Payment Type</td><td style=\"padding:9px;\">{_safe(payment_type)}</td></tr>
+      {f'<tr><td style="padding:9px;color:#94a3b8;">Customer</td><td style="padding:9px;">{_safe(gamer_name)}</td></tr>' if gamer_name else ''}
+      <tr><td style=\"padding:9px;color:#94a3b8;\">{_safe(amount_label)}</td><td style=\"padding:9px;color:#22c55e;font-weight:700;\">₹{total_amount_paid:.2f}</td></tr>
+      {f'<tr><td style="padding:9px;color:#94a3b8;">Platform Fee</td><td style="padding:9px;color:#facc15;">₹{total_app_fee:.2f}</td></tr>' if total_app_fee > 0 else ''}
+      {f'<tr><td style="padding:9px;color:#94a3b8;">Net to Cafe</td><td style="padding:9px;color:#86efac;">₹{resolved_net_total:.2f}</td></tr>' if total_app_fee > 0 else ''}
+    </table>
+
+    <div style=\"font-size:14px;font-weight:700;color:#22c55e;margin:20px 0 8px;\">Slot Details</div>
+    <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"border:1px solid #1e2a44;border-radius:8px;overflow:hidden;background:#08142c;\">
+      <tr style=\"background:#050f23;color:#cbd5e1;\">
+        <th style=\"padding:10px;text-align:left;\">Booking ID</th>
+        <th style=\"padding:10px;text-align:left;\">Customer</th>
+        <th style=\"padding:10px;text-align:left;\">Slot Time</th>
+        <th style=\"padding:10px;text-align:right;\">Amount</th>
+      </tr>
+      {booking_rows}
+    </table>
+
+    <p style=\"margin-top:16px;color:#cbd5e1;\">{_safe(action_note)}</p>
+    """
 
     send_email(
-        subject=f"{status_heading} – {cafe_name}",
+        subject=f"{status_heading} - {str(cafe_name or '').strip()}",
         recipients=[vendor_email],
         body=f"{status_heading}: {cafe_name}",
-        html=f"""
-<!DOCTYPE html>
-<html>
-<body style="font-family:'Segoe UI',sans-serif;background-color:#0b1220;margin:0;padding:0;">
-<div style="max-width:680px;margin:auto;background-color:#121b2e;border-radius:12px;overflow:hidden;border:1px solid #213252;">
-
-    <div style="padding:26px;text-align:center;background-color:#0a1426;">
-        <img src="https://res.cloudinary.com/dxjjigepf/image/upload/v1755415904/Adobe_Express_-_file_1_wfe3ad.png" width="78" alt="Hash For Gamers" style="display:block;margin:0 auto 10px;">
-        <h2 style="color:#ffffff;margin:0;">{status_heading}</h2>
-        <p style="color:#9fb2d4;margin:8px 0 0;">{status_subtitle}</p>
-    </div>
-
-    <div style="padding:28px;color:#ffffff;">
-        <p>Hello <strong>{cafe_name}</strong>,</p>
-        <p>A booking has been created from the Hash App.</p>
-
-        <table style="width:100%;margin-top:18px;">
-            <tr><td style="color:#bbbbbb;">Confirmation Date</td><td>{booking_date}</td></tr>
-            <tr><td style="color:#bbbbbb;">Booked For</td><td>{booked_for_date}</td></tr>
-            <tr><td style="color:#bbbbbb;">Payment Type</td><td>{payment_type}</td></tr>
-            {customer_row}
-            <tr><td style="color:#bbbbbb;">{amount_label}</td><td style="color:#00ff88;">₹{float(total_amount_paid or 0):.2f}</td></tr>
-            {f'<tr><td style="color:#bbbbbb;">Platform Fee</td><td style="color:#ffcc66;">₹{total_app_fee:.2f}</td></tr>' if total_app_fee > 0 else ''}
-            {f'<tr><td style="color:#bbbbbb;">Net to Cafe</td><td style="color:#8af2b2;">₹{resolved_net_total:.2f}</td></tr>' if total_app_fee > 0 else ''}
-        </table>
-
-        <h3 style="margin-top:26px;color:#00ff88;">🕒 Slot Details</h3>
-        <table style="width:100%;background-color:#1c1c1c;border:1px solid #2a2a2a;">
-            <tr>
-                <th style="padding:10px;text-align:left;">Booking ID</th>
-                <th style="padding:10px;text-align:left;">Customer</th>
-                <th style="padding:10px;text-align:left;">Slot Time</th>
-                <th style="padding:10px;text-align:right;">Amount</th>
-            </tr>
-            {booking_rows}
-        </table>
-
-        <p style="margin-top:22px;">{action_note}</p>
-        <p>Regards,<br><strong>Hash For Gamers Team</strong></p>
-    </div>
-
-    <div style="padding:16px;text-align:center;color:#8aa0c6;font-size:12px;background:#0a1426;">
-        © 2026 Hash For Gamers. All rights reserved.
-    </div>
-
-</div>
-</body>
-</html>
-"""
+        html_fragment=content,
     )
