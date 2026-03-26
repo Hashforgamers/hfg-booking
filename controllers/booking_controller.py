@@ -7559,184 +7559,555 @@ def settle_pending_booking_transactions(booking_id):
 
 
 
-@booking_blueprint.route('/kiosk/next-slot/vendor/<int:vendor_id>', methods=['POST'])
-def kiosk_book_next_slot(vendor_id):
-    """
-    Kiosk extension booking for the immediate next slot.
+def _ist_now_naive() -> datetime:
+    return datetime.now(IST).replace(tzinfo=None)
 
-    Expected payload:
-    {
-      "bookingType": "extension",
-      "consoleId": 84,
-      "gameId": 47,
-      "slotId": 841,
-      "userId": 56,
-      "paymentType": "pending"
-    }
+
+def _to_ist_iso(dt_value: datetime):
+    if not dt_value:
+        return None
+    try:
+        if dt_value.tzinfo is None:
+            if hasattr(IST, "localize"):
+                return IST.localize(dt_value).isoformat()
+            return dt_value.replace(tzinfo=IST).isoformat()
+        return dt_value.astimezone(IST).isoformat()
+    except Exception:
+        return dt_value.isoformat()
+
+
+def _slot_window_for_date(slot_date: date, start_time_obj, end_time_obj):
+    start_dt = datetime.combine(slot_date, start_time_obj)
+    end_dt = datetime.combine(slot_date, end_time_obj)
+    if end_dt <= start_dt:
+        end_dt += timedelta(days=1)
+    return start_dt, end_dt
+
+
+def _resolve_current_booking_id_for_console(vendor_id: int, console_id: int, game_id: int = None, user_id: int = None):
+    booking_table = f"VENDOR_{int(vendor_id)}_DASHBOARD"
+    filters = ["console_id = :console_id", "book_status = 'current'"]
+    params = {"console_id": int(console_id)}
+    if game_id is not None:
+        filters.append("game_id = :game_id")
+        params["game_id"] = int(game_id)
+    if user_id is not None:
+        filters.append("user_id = :user_id")
+        params["user_id"] = int(user_id)
+
+    row = db.session.execute(
+        text(
+            f"""
+            SELECT book_id
+            FROM {booking_table}
+            WHERE {' AND '.join(filters)}
+            ORDER BY date DESC, end_time DESC
+            LIMIT 1
+            """
+        ),
+        params,
+    ).fetchone()
+    return int(row.book_id) if row and row.book_id is not None else None
+
+
+def _resolve_booking_id_from_access_code(vendor_id: int, access_code: str, game_id: int = None):
+    if not access_code:
+        return None
+    query = """
+        SELECT b.id AS booking_id
+        FROM access_booking_codes a
+        JOIN bookings b ON b.access_code_id = a.id
+        JOIN available_games ag ON ag.id = b.game_id
+        WHERE a.access_code = :access_code
+          AND ag.vendor_id = :vendor_id
+    """
+    params = {"access_code": str(access_code).strip(), "vendor_id": int(vendor_id)}
+    if game_id is not None:
+        query += " AND b.game_id = :game_id"
+        params["game_id"] = int(game_id)
+    query += " ORDER BY b.id DESC LIMIT 1"
+    row = db.session.execute(text(query), params).fetchone()
+    return int(row.booking_id) if row and row.booking_id is not None else None
+
+
+def _resolve_extension_candidate(vendor_id: int, current_booking_id: int, requested_game_id: int = None):
+    booking = Booking.query.filter_by(id=int(current_booking_id)).first()
+    if not booking:
+        return None, {"code": 404, "message": "Current booking not found"}
+
+    game_id = int(requested_game_id or booking.game_id or 0)
+    if not game_id:
+        return None, {"code": 400, "message": "game_id missing for current booking"}
+
+    current_slot = Slot.query.filter_by(id=int(booking.slot_id), gaming_type_id=int(game_id)).first()
+    if not current_slot:
+        return None, {"code": 404, "message": "Current booking slot not found"}
+
+    available_game = AvailableGame.query.filter_by(id=int(game_id), vendor_id=int(vendor_id)).first()
+    if not available_game:
+        return None, {"code": 404, "message": "Game is not configured for vendor"}
+
+    booked_date = resolve_booking_booked_date(booking)
+    next_slot_date = booked_date + timedelta(days=1) if current_slot.end_time <= current_slot.start_time else booked_date
+
+    next_slot = (
+        Slot.query
+        .filter(
+            Slot.gaming_type_id == int(game_id),
+            Slot.start_time == current_slot.end_time
+        )
+        .order_by(Slot.end_time.asc())
+        .first()
+    )
+    if not next_slot:
+        return None, {"code": 200, "message": "No immediate next slot configured for this game"}
+
+    reason = _precheck_slot_booking_eligibility(
+        vendor_id=int(vendor_id),
+        slot_id=int(next_slot.id),
+        booked_date_obj=next_slot_date,
+        required_units=1,
+    )
+
+    start_dt, end_dt = _slot_window_for_date(next_slot_date, next_slot.start_time, next_slot.end_time)
+    current_start_dt, current_end_dt = _slot_window_for_date(booked_date, current_slot.start_time, current_slot.end_time)
+
+    effective_price = float(
+        get_effective_price_for_schedule(int(vendor_id), available_game, next_slot_date, next_slot) or 0.0
+    )
+    available_slot_row = db.session.execute(
+        text(
+            f"""
+            SELECT available_slot
+            FROM VENDOR_{int(vendor_id)}_SLOT
+            WHERE vendor_id = :vendor_id AND date = :slot_date AND slot_id = :slot_id
+            """
+        ),
+        {"vendor_id": int(vendor_id), "slot_date": next_slot_date, "slot_id": int(next_slot.id)},
+    ).fetchone()
+    available_slots = int(available_slot_row.available_slot) if available_slot_row and available_slot_row.available_slot is not None else 0
+
+    return {
+        "vendor_id": int(vendor_id),
+        "current_booking_id": int(booking.id),
+        "user_id": int(booking.user_id),
+        "game_id": int(game_id),
+        "current_slot_id": int(current_slot.id),
+        "current_slot_date": booked_date,
+        "current_start_dt": current_start_dt,
+        "current_end_dt": current_end_dt,
+        "next_slot_id": int(next_slot.id),
+        "next_slot_date": next_slot_date,
+        "next_start_dt": start_dt,
+        "next_end_dt": end_dt,
+        "price": round(float(effective_price), 2),
+        "available_slots": available_slots,
+        "is_available": reason is None and available_slots > 0,
+        "reason": reason,
+        "available_game_name": available_game.game_name,
+    }, None
+
+
+@booking_blueprint.route('/kiosk/next-slot/check/vendor/<int:vendor_id>', methods=['POST'])
+def kiosk_check_next_slot(vendor_id):
+    """
+    Checks whether immediate next slot can be reserved for session continuation.
     """
     try:
-        body = request.get_json(force=True) or {}
-        console_id = int(body["consoleId"])
-        game_id = int(body["GameId"]) if "GameId" in body else int(body["gameId"])
-        slot_id = int(body["slotId"])
-        user_id = int(body["userId"])
-        payment_type = body.get("paymentType", "pending")
+        body = request.get_json(silent=True) or {}
+        current_booking_id = body.get("current_booking_id") or body.get("currentBookingId") or body.get("booking_id")
+        game_id = body.get("game_id") or body.get("gameId")
+        console_id = body.get("console_id") or body.get("consoleId")
+        user_id = body.get("user_id") or body.get("userId")
+        access_code = body.get("access_code") or body.get("accessCode")
 
-        # --- 0) Validate and prepare booking times ---
-        slot_row = db.session.query(Slot).filter_by(id=slot_id).first()
-        if not slot_row or slot_row.gaming_type_id != game_id:
-            return jsonify({"success": False, "message": "Invalid slot for this game"}), 400
+        if not current_booking_id and console_id:
+            try:
+                current_booking_id = _resolve_current_booking_id_for_console(
+                    vendor_id=int(vendor_id),
+                    console_id=int(console_id),
+                    game_id=int(game_id) if game_id is not None else None,
+                    user_id=int(user_id) if user_id is not None else None,
+                )
+            except Exception:
+                current_booking_id = None
 
-        booked_date = datetime.utcnow().date()
-        start_dt = datetime.combine(booked_date, slot_row.start_time)
-        end_dt = datetime.combine(booked_date, slot_row.end_time)
+        if not current_booking_id and access_code:
+            current_booking_id = _resolve_booking_id_from_access_code(
+                vendor_id=int(vendor_id),
+                access_code=str(access_code),
+                game_id=int(game_id) if game_id is not None else None,
+            )
 
-        vendor_slot_table = f"VENDOR_{vendor_id}_SLOT"
-        console_table = f"VENDOR_{vendor_id}_CONSOLE_AVAILABILITY"
-        booking_table = f"VENDOR_{vendor_id}_DASHBOARD"
+        if not current_booking_id:
+            return jsonify({
+                "success": False,
+                "can_extend": False,
+                "message": "current_booking_id is required (or provide console_id tied to a current session / access_code)"
+            }), 400
 
-        # --- 1) Lock and update slot availability ---
-        row = db.session.execute(text(f"""
-            SELECT is_available, available_slot
-            FROM {vendor_slot_table}
-            WHERE vendor_id = :vid AND date = :dt AND slot_id = :sid
-            FOR UPDATE
-        """), {"vid": vendor_id, "dt": booked_date, "sid": slot_id}).mappings().first()
-
-        if not row:
-            return jsonify({"success": False, "message": "Vendor slot not found"}), 404
-        if not row["is_available"] or int(row["available_slot"]) <= 0:
-            return jsonify({"success": False, "message": "Slot unavailable"}), 409
-
-        db.session.execute(text(f"""
-            UPDATE {vendor_slot_table}
-            SET available_slot = available_slot - 1,
-                is_available = CASE WHEN available_slot - 1 > 0 THEN TRUE ELSE FALSE END
-            WHERE vendor_id = :vid AND date = :dt AND slot_id = :sid
-        """), {"vid": vendor_id, "dt": booked_date, "sid": slot_id})
-
-        # --- 2) Lock and update console availability ---
-        db.session.execute(text(f"""
-            SELECT is_available
-            FROM {console_table}
-            WHERE console_id = :cid AND game_id = :gid
-            FOR UPDATE
-        """), {"cid": console_id, "gid": game_id})
-        
-        db.session.execute(text(f"""
-            UPDATE {console_table}
-            SET is_available = FALSE
-            WHERE console_id = :cid AND game_id = :gid
-        """), {"cid": console_id, "gid": game_id})
-
-        # --- 3) Create booking record ---
-        booking = Booking(
-            slot_id=slot_id,
-            game_id=game_id,
-            user_id=user_id,
-            status="confirmed"
+        candidate, err = _resolve_extension_candidate(
+            vendor_id=int(vendor_id),
+            current_booking_id=int(current_booking_id),
+            requested_game_id=int(game_id) if game_id is not None else None,
         )
-        db.session.add(booking)
-        db.session.flush()
-        new_book_id = booking.id
+        if err and int(err.get("code", 500)) != 200:
+            return jsonify({"success": False, "can_extend": False, "message": err.get("message")}), int(err.get("code", 500))
 
-        # --- 4) Get user name for dashboard ---
-        user = db.session.query(User).filter_by(id=user_id).first()
-        username = user.name if user and user.name else "Unknown"
-
-        # --- 5) Get single slot price (for frontend) ---
-        #price_row = db.session.execute(text("""
-        #   SELECT single_slot_price
-        #     FROM available_games
-        #    WHERE id = :gid
-        #"""), {"gid": game_id}).fetchone()
-        #single_price = int(price_row.single_slot_price) if price_row and price_row.single_slot_price else None
-        
-        available_game_obj = AvailableGame.query.filter_by(id=game_id).first()
-        single_price = (
-            int(get_effective_price_for_schedule(vendor_id, available_game_obj, booked_date, slot_row))
-            if available_game_obj else None
-        )
-
-        _log_pricing_event(
-            "kiosk_extension_pricing",
-            vendor_id=vendor_id,
-            booking_date=booked_date,
-            slot_id=slot_id,
-            game_id=game_id,
-            unit_price=single_price,
-        )
-
-        # --- 6) Insert into vendor dashboard ---
-        db.session.execute(text(f"""
-            INSERT INTO {booking_table}
-                (book_id, game_id, date, start_time, end_time,
-                 book_status, console_id, username, user_id, game_name,
-                 status, extra_pay_status)
-            VALUES
-                (:bid, :gid, :dt, :st, :et, 'upcoming', NULL, :uname, :uid, :gname, TRUE, FALSE)
-        """), {
-            "bid": new_book_id,
-            "gid": game_id,
-            "dt": booked_date,
-            "st": start_dt.time(),
-            "et": end_dt.time(),
-            "uname": username,
-            "uid": user_id,
-            "gname": "pc"
-        })
-
-        # --- 7) Mark booking as current and assign console ---
-        db.session.execute(text(f"""
-            UPDATE {booking_table}
-            SET book_status = 'current', console_id = :cid
-            WHERE book_id = :bid AND game_id = :gid
-        """), {"cid": console_id, "bid": new_book_id, "gid": game_id})
-
-        db.session.commit()
-
-        # --- 8) Socket updates ---
-        socketio = current_app.extensions.get('socketio')
-        room = f"vendor_{vendor_id}"
-
-        socketio.emit("current_slot", {
-            "slot_id": slot_id,
-            "book_id": new_book_id,
-            "start_time": start_dt.isoformat(),
-            "end_time": end_dt.isoformat(),
-            "status": "current",
-            "console_id": console_id,
-            "user_id": user_id,
-            "username": username,
-            "game_id": game_id,
-            "date": booked_date.isoformat(),
-            "single_slot_price": single_price
-        }, room=room)
-
-        remaining_row = db.session.execute(text(f"""
-            SELECT COUNT(*) AS remaining
-            FROM {console_table}
-            WHERE game_id = :gid AND is_available = TRUE
-        """), {"gid": game_id}).fetchone()
-        remaining = int(remaining_row.remaining) if remaining_row else 0
-
-        socketio.emit("console_availability", {
-            "vendorId": vendor_id,
-            "game_id": game_id,
-            "console_id": console_id,
-            "is_available": False,
-            "remaining_available_for_game": remaining
-        }, room=room)
+        if not candidate:
+            return jsonify({
+                "success": True,
+                "can_extend": False,
+                "message": err.get("message") if err else "No next slot found",
+                "candidate": None,
+            }), 200
 
         return jsonify({
             "success": True,
-            "message": "Next slot booked and console assigned successfully",
-            "booking_id": new_book_id,
-            "slot_id": slot_id,
-            "username": username,
-            "start_time": start_dt.isoformat(),
-            "end_time": end_dt.isoformat(),
-            "provisional": True
+            "can_extend": bool(candidate["is_available"]),
+            "message": "Next slot available" if candidate["is_available"] else (candidate["reason"] or "Next slot unavailable"),
+            "current_booking": {
+                "booking_id": candidate["current_booking_id"],
+                "slot_id": candidate["current_slot_id"],
+                "start_time_ist": _to_ist_iso(candidate["current_start_dt"]),
+                "end_time_ist": _to_ist_iso(candidate["current_end_dt"]),
+            },
+            "candidate": {
+                "slot_id": candidate["next_slot_id"],
+                "booked_date": candidate["next_slot_date"].isoformat(),
+                "start_time_ist": _to_ist_iso(candidate["next_start_dt"]),
+                "end_time_ist": _to_ist_iso(candidate["next_end_dt"]),
+                "amount": candidate["price"],
+                "available_slots": int(candidate["available_slots"]),
+                "payment_mode": "pay_at_cafe_pending",
+                "settlement_status": "pending",
+                "reason": candidate["reason"],
+            },
+            "checked_at_ist": _to_ist_iso(_ist_now_naive()),
+        }), 200
+    except Exception as e:
+        current_app.logger.exception("kiosk_check_next_slot error")
+        return jsonify({"success": False, "can_extend": False, "message": "Server error", "error": str(e)}), 500
+
+
+@booking_blueprint.route('/kiosk/next-slot/vendor/<int:vendor_id>', methods=['POST'])
+def kiosk_book_next_slot(vendor_id):
+    """
+    Books the immediate next slot for kiosk continuation.
+    - Charges are recorded as unpaid (settlement_status='pending')
+    - Session can auto-start if slot time already began.
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        console_id = body.get("console_id") or body.get("consoleId")
+        game_id = body.get("game_id") or body.get("gameId") or body.get("GameId")
+        current_booking_id = body.get("current_booking_id") or body.get("currentBookingId") or body.get("booking_id")
+        user_id = body.get("user_id") or body.get("userId")
+        access_code = body.get("access_code") or body.get("accessCode")
+        auto_start = bool(body.get("auto_start") if body.get("auto_start") is not None else body.get("autoStart", True))
+
+        if not console_id:
+            return jsonify({"success": False, "message": "console_id is required"}), 400
+
+        if not current_booking_id:
+            current_booking_id = _resolve_current_booking_id_for_console(
+                vendor_id=int(vendor_id),
+                console_id=int(console_id),
+                game_id=int(game_id) if game_id is not None else None,
+                user_id=int(user_id) if user_id is not None else None,
+            )
+
+        if not current_booking_id and access_code:
+            current_booking_id = _resolve_booking_id_from_access_code(
+                vendor_id=int(vendor_id),
+                access_code=str(access_code),
+                game_id=int(game_id) if game_id is not None else None,
+            )
+
+        if not current_booking_id:
+            return jsonify({
+                "success": False,
+                "message": "Unable to resolve current_booking_id. Pass current_booking_id or ensure console has an active current booking / valid access_code."
+            }), 400
+
+        candidate, err = _resolve_extension_candidate(
+            vendor_id=int(vendor_id),
+            current_booking_id=int(current_booking_id),
+            requested_game_id=int(game_id) if game_id is not None else None,
+        )
+        if err and int(err.get("code", 500)) != 200:
+            return jsonify({"success": False, "message": err.get("message")}), int(err.get("code", 500))
+        if not candidate:
+            return jsonify({"success": False, "message": err.get("message") if err else "No next slot found"}), 409
+
+        requested_slot_id = body.get("slot_id") or body.get("slotId")
+        if requested_slot_id and int(requested_slot_id) != int(candidate["next_slot_id"]):
+            return jsonify({
+                "success": False,
+                "message": "Requested slot does not match immediate next slot candidate",
+                "expected_slot_id": int(candidate["next_slot_id"]),
+            }), 409
+
+        if not candidate["is_available"]:
+            return jsonify({
+                "success": False,
+                "message": candidate["reason"] or "Next slot unavailable",
+                "candidate_slot_id": int(candidate["next_slot_id"]),
+                "available_slots": int(candidate["available_slots"]),
+            }), 409
+
+        vendor_slot_table = f"VENDOR_{int(vendor_id)}_SLOT"
+        booking_table = f"VENDOR_{int(vendor_id)}_DASHBOARD"
+        console_table = f"VENDOR_{int(vendor_id)}_CONSOLE_AVAILABILITY"
+
+        # Lock and decrement slot capacity atomically.
+        slot_row = db.session.execute(
+            text(
+                f"""
+                SELECT is_available, available_slot
+                FROM {vendor_slot_table}
+                WHERE vendor_id = :vendor_id AND date = :slot_date AND slot_id = :slot_id
+                FOR UPDATE
+                """
+            ),
+            {
+                "vendor_id": int(vendor_id),
+                "slot_date": candidate["next_slot_date"],
+                "slot_id": int(candidate["next_slot_id"]),
+            },
+        ).mappings().first()
+
+        if not slot_row:
+            return jsonify({"success": False, "message": "Vendor slot row not found for next slot"}), 404
+        if not bool(slot_row["is_available"]) or int(slot_row["available_slot"] or 0) <= 0:
+            db.session.rollback()
+            return jsonify({"success": False, "message": "Next slot became unavailable. Please refresh and retry."}), 409
+
+        db.session.execute(
+            text(
+                f"""
+                UPDATE {vendor_slot_table}
+                SET available_slot = available_slot - 1,
+                    is_available = CASE WHEN available_slot - 1 > 0 THEN TRUE ELSE FALSE END
+                WHERE vendor_id = :vendor_id AND date = :slot_date AND slot_id = :slot_id
+                """
+            ),
+            {
+                "vendor_id": int(vendor_id),
+                "slot_date": candidate["next_slot_date"],
+                "slot_id": int(candidate["next_slot_id"]),
+            },
+        )
+
+        primary_booking = Booking.query.filter_by(id=int(candidate["current_booking_id"])).first()
+        if not primary_booking:
+            db.session.rollback()
+            return jsonify({"success": False, "message": "Current booking not found"}), 404
+
+        resolved_user_id = int(user_id) if user_id is not None else int(candidate["user_id"])
+        user = User.query.filter_by(id=resolved_user_id).first()
+        username = user.name if user and user.name else "Guest"
+
+        now_ist = _ist_now_naive()
+        can_start_now = now_ist >= (candidate["next_start_dt"] - timedelta(seconds=15))
+        should_start_now = bool(auto_start and can_start_now)
+
+        continuation_details = {}
+        if isinstance(primary_booking.squad_details, dict):
+            continuation_details = dict(primary_booking.squad_details)
+        continuation_details.update({
+            "continuation_of_booking_id": int(primary_booking.id),
+            "continuation_created_at": datetime.utcnow().isoformat(),
+            "continuation_console_id": int(console_id),
+            "continuation_source": "kiosk",
+            "continuation_auto_started": bool(should_start_now),
+        })
+
+        new_booking = Booking(
+            slot_id=int(candidate["next_slot_id"]),
+            game_id=int(candidate["game_id"]),
+            user_id=int(resolved_user_id),
+            status="checked_in" if should_start_now else "confirmed",
+            squad_details=continuation_details,
+        )
+        db.session.add(new_booking)
+        db.session.flush()
+
+        final_amount = round(float(candidate["price"]), 2)
+        app_fee_amount = resolve_app_fee_amount(final_amount, body)
+        gst = calculate_gst_breakdown(int(vendor_id), final_amount)
+        tx_mode = str(body.get("paymentType") or body.get("modeOfPayment") or "cash").strip().lower() or "cash"
+
+        transaction = Transaction(
+            booking_id=int(new_booking.id),
+            vendor_id=int(vendor_id),
+            user_id=int(resolved_user_id),
+            booked_date=candidate["next_slot_date"],
+            booking_date=datetime.utcnow().date(),
+            booking_time=datetime.utcnow().time(),
+            user_name=username,
+            amount=float(final_amount),
+            original_amount=float(final_amount),
+            discounted_amount=0.0,
+            mode_of_payment=tx_mode if tx_mode not in {"pending", "unpaid", "due"} else "cash",
+            payment_use_case="pay_at_cafe",
+            booking_type="kiosk_extension",
+            settlement_status="pending",
+            source_channel="kiosk",
+            initiated_by_staff_id=str(body.get("kioskId") or body.get("kiosk_id") or ""),
+            initiated_by_staff_name="Kiosk",
+            initiated_by_staff_role="kiosk",
+            base_amount=float(final_amount),
+            meals_amount=0.0,
+            controller_amount=0.0,
+            waive_off_amount=0.0,
+            app_fee_amount=float(app_fee_amount or 0.0),
+            taxable_amount=gst["taxable_amount"],
+            gst_rate=gst["gst_rate"],
+            cgst_amount=gst["cgst_amount"],
+            sgst_amount=gst["sgst_amount"],
+            igst_amount=gst["igst_amount"],
+            total_with_tax=gst["total_with_tax"],
+            reference_id=f"kiosk-extension:{primary_booking.id}",
+        )
+        db.session.add(transaction)
+
+        dashboard_status = "current" if should_start_now else "upcoming"
+        db.session.execute(
+            text(
+                f"""
+                INSERT INTO {booking_table}
+                    (book_id, game_id, date, start_time, end_time, book_status, console_id,
+                     username, user_id, game_name, status, extra_pay_status)
+                VALUES
+                    (:book_id, :game_id, :booked_date, :start_time, :end_time, :book_status, :console_id,
+                     :username, :user_id, :game_name, TRUE, FALSE)
+                """
+            ),
+            {
+                "book_id": int(new_booking.id),
+                "game_id": int(candidate["game_id"]),
+                "booked_date": candidate["next_slot_date"],
+                "start_time": candidate["next_start_dt"].time(),
+                "end_time": candidate["next_end_dt"].time(),
+                "book_status": dashboard_status,
+                "console_id": int(console_id) if should_start_now else None,
+                "username": username,
+                "user_id": int(resolved_user_id),
+                "game_name": candidate["available_game_name"],
+            },
+        )
+
+        if should_start_now:
+            db.session.execute(
+                text(
+                    f"""
+                    UPDATE {booking_table}
+                    SET book_status = 'past'
+                    WHERE book_id = :book_id AND book_status = 'current'
+                    """
+                ),
+                {"book_id": int(primary_booking.id)},
+            )
+            db.session.execute(
+                text(
+                    f"""
+                    UPDATE {console_table}
+                    SET is_available = FALSE
+                    WHERE console_id = :console_id AND game_id = :game_id
+                    """
+                ),
+                {"console_id": int(console_id), "game_id": int(candidate["game_id"])},
+            )
+
+        db.session.commit()
+
+        socketio = current_app.extensions.get("socketio")
+        room = f"vendor_{int(vendor_id)}"
+        event_payload = build_booking_event_payload(
+            vendor_id=int(vendor_id),
+            booking_id=int(new_booking.id),
+            slot_id=int(candidate["next_slot_id"]),
+            user_id=int(resolved_user_id),
+            username=username,
+            game_id=int(candidate["game_id"]),
+            game_name=candidate["available_game_name"],
+            date_value=candidate["next_slot_date"].isoformat(),
+            slot_price=float(final_amount),
+            start_time=candidate["next_start_dt"].time(),
+            end_time=candidate["next_end_dt"].time(),
+            console_id=int(console_id) if should_start_now else None,
+            status="checked_in" if should_start_now else "confirmed",
+            booking_status=dashboard_status,
+            squad_details=continuation_details,
+        )
+        emit_booking_event(socketio, event="booking", data=event_payload, vendor_id=int(vendor_id))
+        try:
+            socketio.emit("booking_admin", event_payload, to="dashboard_admin")
+        except Exception:
+            pass
+
+        if should_start_now and socketio:
+            socketio.emit("current_slot", {
+                "slot_id": int(candidate["next_slot_id"]),
+                "book_id": int(new_booking.id),
+                "start_time": candidate["next_start_dt"].isoformat(),
+                "end_time": candidate["next_end_dt"].isoformat(),
+                "status": "current",
+                "console_id": int(console_id),
+                "user_id": int(resolved_user_id),
+                "username": username,
+                "game_id": int(candidate["game_id"]),
+                "date": candidate["next_slot_date"].isoformat(),
+                "single_slot_price": float(final_amount),
+            }, room=room)
+
+        if socketio:
+            remaining_row = db.session.execute(
+                text(
+                    f"""
+                    SELECT COUNT(*) AS remaining
+                    FROM {console_table}
+                    WHERE game_id = :game_id AND is_available = TRUE
+                    """
+                ),
+                {"game_id": int(candidate["game_id"])},
+            ).fetchone()
+            remaining = int(remaining_row.remaining) if remaining_row and remaining_row.remaining is not None else 0
+            socketio.emit("console_availability", {
+                "vendorId": int(vendor_id),
+                "game_id": int(candidate["game_id"]),
+                "console_id": int(console_id),
+                "is_available": False,
+                "remaining_available_for_game": remaining,
+            }, room=room)
+            socketio.emit("kiosk_session_extended", {
+                "vendor_id": int(vendor_id),
+                "console_id": int(console_id),
+                "previous_booking_id": int(primary_booking.id),
+                "booking_id": int(new_booking.id),
+                "slot_id": int(candidate["next_slot_id"]),
+                "book_status": dashboard_status,
+                "settlement_status": "pending",
+                "amount_due": float(final_amount),
+                "start_time_ist": _to_ist_iso(candidate["next_start_dt"]),
+                "end_time_ist": _to_ist_iso(candidate["next_end_dt"]),
+                "auto_started": bool(should_start_now),
+            }, room=room)
+
+        return jsonify({
+            "success": True,
+            "message": "Continuation slot booked successfully",
+            "booking_id": int(new_booking.id),
+            "previous_booking_id": int(primary_booking.id),
+            "slot_id": int(candidate["next_slot_id"]),
+            "book_status": dashboard_status,
+            "auto_started": bool(should_start_now),
+            "settlement_status": "pending",
+            "amount_due": float(final_amount),
+            "payment_use_case": "pay_at_cafe",
+            "start_time_ist": _to_ist_iso(candidate["next_start_dt"]),
+            "end_time_ist": _to_ist_iso(candidate["next_end_dt"]),
         }), 201
 
     except Exception as e:
