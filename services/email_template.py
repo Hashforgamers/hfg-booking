@@ -2,7 +2,7 @@ import html
 import os
 import re
 
-DEFAULT_HASH_LOGO = "https://res.cloudinary.com/dxjjigepf/image/upload/v1774469992/hash_logo_fmngta.png"
+DEFAULT_HASH_LOGO = "https://res.cloudinary.com/dxjjigepf/image/upload/v1774472024/hash_for_gamer_logo_d1v4wc.png"
 
 
 def _extract_body(content: str) -> str:
@@ -33,8 +33,8 @@ def build_hfg_email_html(subject: str, content_html: str, preview_text: str = ""
         <td align=\"center\">
           <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"max-width:700px;background:#0b1220;border:1px solid #1e2a44;border-radius:12px;overflow:hidden;\">
             <tr>
-              <td style=\"padding:20px 24px;background:#050b18;color:#ffffff;\">
-                <img src=\"{html.escape(logo_url)}\" alt=\"Hash For Gamers\" style=\"display:block;height:46px;width:auto;margin:0 0 10px 0;\" />
+              <td style=\"padding:20px 24px;background:linear-gradient(180deg,#040915,#0b1220);color:#ffffff;\">
+                <img src=\"{html.escape(logo_url)}\" alt=\"Hash For Gamers\" style=\"display:block;height:52px;width:auto;margin:0 0 10px 0;border-radius:10px;\" />
                 <div style=\"font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:#22c55e;font-weight:700;\">Hash For Gamers</div>
                 <div style=\"margin-top:8px;font-size:22px;line-height:1.35;font-weight:700;\">{safe_subject}</div>
               </td>
