@@ -2322,6 +2322,231 @@ def _render_pay_at_cafe_email_action_page(success: bool, title: str, message: st
 </html>"""
 
 
+def _ensure_vendor_pay_at_cafe_settings_table():
+    db.session.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS vendor_pay_at_cafe_settings (
+                vendor_id INTEGER PRIMARY KEY,
+                auto_accept_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                auto_reject_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                auto_reject_after_minutes INTEGER NOT NULL DEFAULT 15,
+                updated_at TIMESTAMP NOT NULL DEFAULT now()
+            )
+            """
+        )
+    )
+    db.session.commit()
+
+
+def _get_vendor_pay_at_cafe_settings(vendor_id: int) -> dict:
+    _ensure_vendor_pay_at_cafe_settings_table()
+    row = db.session.execute(
+        text(
+            """
+            SELECT vendor_id,
+                   auto_accept_enabled,
+                   auto_reject_enabled,
+                   auto_reject_after_minutes
+            FROM vendor_pay_at_cafe_settings
+            WHERE vendor_id = :vendor_id
+            """
+        ),
+        {"vendor_id": int(vendor_id)},
+    ).mappings().first()
+    if row:
+        return dict(row)
+
+    defaults = {
+        "vendor_id": int(vendor_id),
+        "auto_accept_enabled": False,
+        "auto_reject_enabled": False,
+        "auto_reject_after_minutes": 15,
+    }
+    db.session.execute(
+        text(
+            """
+            INSERT INTO vendor_pay_at_cafe_settings (
+                vendor_id,
+                auto_accept_enabled,
+                auto_reject_enabled,
+                auto_reject_after_minutes,
+                updated_at
+            ) VALUES (
+                :vendor_id,
+                :auto_accept_enabled,
+                :auto_reject_enabled,
+                :auto_reject_after_minutes,
+                now()
+            )
+            ON CONFLICT (vendor_id) DO NOTHING
+            """
+        ),
+        defaults,
+    )
+    db.session.commit()
+    return defaults
+
+
+def _save_vendor_pay_at_cafe_settings(vendor_id: int, payload: dict) -> dict:
+    auto_accept = bool(payload.get("auto_accept_enabled", False))
+    auto_reject = bool(payload.get("auto_reject_enabled", False))
+    if auto_accept and auto_reject:
+        # Keep behavior deterministic and low-noise.
+        auto_reject = False
+    try:
+        auto_reject_after = int(payload.get("auto_reject_after_minutes", 15) or 15)
+    except Exception:
+        auto_reject_after = 15
+    auto_reject_after = max(1, min(auto_reject_after, 240))
+
+    _ensure_vendor_pay_at_cafe_settings_table()
+    db.session.execute(
+        text(
+            """
+            INSERT INTO vendor_pay_at_cafe_settings (
+                vendor_id,
+                auto_accept_enabled,
+                auto_reject_enabled,
+                auto_reject_after_minutes,
+                updated_at
+            ) VALUES (
+                :vendor_id,
+                :auto_accept_enabled,
+                :auto_reject_enabled,
+                :auto_reject_after_minutes,
+                now()
+            )
+            ON CONFLICT (vendor_id) DO UPDATE SET
+                auto_accept_enabled = EXCLUDED.auto_accept_enabled,
+                auto_reject_enabled = EXCLUDED.auto_reject_enabled,
+                auto_reject_after_minutes = EXCLUDED.auto_reject_after_minutes,
+                updated_at = now()
+            """
+        ),
+        {
+            "vendor_id": int(vendor_id),
+            "auto_accept_enabled": auto_accept,
+            "auto_reject_enabled": auto_reject,
+            "auto_reject_after_minutes": auto_reject_after,
+        },
+    )
+    db.session.commit()
+    return {
+        "vendor_id": int(vendor_id),
+        "auto_accept_enabled": auto_accept,
+        "auto_reject_enabled": auto_reject,
+        "auto_reject_after_minutes": auto_reject_after,
+    }
+
+
+def _ensure_pay_at_cafe_action_logs_table():
+    db.session.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS pay_at_cafe_action_logs (
+                id SERIAL PRIMARY KEY,
+                vendor_id INTEGER NOT NULL,
+                booking_id INTEGER NOT NULL,
+                action VARCHAR(16) NOT NULL,
+                action_source VARCHAR(32) NOT NULL DEFAULT 'manual_dashboard',
+                reason TEXT,
+                created_at TIMESTAMP NOT NULL DEFAULT now()
+            )
+            """
+        )
+    )
+    db.session.execute(
+        text(
+            """
+            CREATE INDEX IF NOT EXISTS idx_pay_at_cafe_action_logs_vendor_created
+            ON pay_at_cafe_action_logs (vendor_id, created_at DESC)
+            """
+        )
+    )
+    db.session.commit()
+
+
+def _log_pay_at_cafe_action(vendor_id: int, booking_ids, action: str, action_source: str, reason: str = ""):
+    _ensure_pay_at_cafe_action_logs_table()
+    ids = []
+    for item in booking_ids or []:
+        try:
+            ids.append(int(item))
+        except Exception:
+            continue
+    if not ids:
+        return
+    rows = [
+        {
+            "vendor_id": int(vendor_id),
+            "booking_id": bid,
+            "action": str(action or "").strip().lower(),
+            "action_source": str(action_source or "manual_dashboard").strip().lower(),
+            "reason": str(reason or "").strip()[:500],
+        }
+        for bid in ids
+    ]
+    db.session.execute(
+        text(
+            """
+            INSERT INTO pay_at_cafe_action_logs (
+                vendor_id,
+                booking_id,
+                action,
+                action_source,
+                reason,
+                created_at
+            ) VALUES (
+                :vendor_id,
+                :booking_id,
+                :action,
+                :action_source,
+                :reason,
+                now()
+            )
+            """
+        ),
+        rows,
+    )
+    db.session.commit()
+
+
+def _trigger_pay_at_cafe_action_async(booking_id: int, vendor_id: int, action: str, action_source: str, reason: str = ""):
+    action_norm = str(action or "").strip().lower()
+    if action_norm not in {"accept", "reject"}:
+        return
+    target_url = (
+        f"{_resolve_booking_public_base_url()}/api/pay-at-cafe/accept"
+        if action_norm == "accept"
+        else f"{_resolve_booking_public_base_url()}/api/pay-at-cafe/reject"
+    )
+    payload = {
+        "booking_id": int(booking_id),
+        "vendor_id": int(vendor_id),
+        "action_source": str(action_source or "").strip().lower() or f"auto_{action_norm}",
+    }
+    if action_norm == "reject":
+        payload["rejection_reason"] = reason or "Auto rejected by vendor settings"
+
+    app = current_app._get_current_object()
+
+    def _runner():
+        with app.app_context():
+            try:
+                requests.post(target_url, json=payload, timeout=10)
+            except Exception as exc:
+                current_app.logger.warning(
+                    "pay_at_cafe auto action trigger failed booking_id=%s vendor_id=%s action=%s err=%s",
+                    booking_id,
+                    vendor_id,
+                    action_norm,
+                    exc,
+                )
+
+    _ASYNC_EXECUTOR.submit(_runner)
+
+
 @booking_blueprint.route('/create_order', methods=['POST'])
 def create_order():
     data = request.get_json()
@@ -2626,6 +2851,35 @@ def create_booking():
                     )
             except Exception as vendor_mail_err:
                 log.warning("bookings.post.vendor_mail_failed cid=%s err=%s", cid, vendor_mail_err)
+
+            # Auto-accept (vendor setting): move pending request(s) to confirmed in background.
+            try:
+                pay_settings = _get_vendor_pay_at_cafe_settings(int(vendor_id))
+                if bool(pay_settings.get("auto_accept_enabled")):
+                    for item in booking_mappings:
+                        booking_id_val = item.get("booking_id")
+                        if booking_id_val is None:
+                            continue
+                        _trigger_pay_at_cafe_action_async(
+                            booking_id=int(booking_id_val),
+                            vendor_id=int(vendor_id),
+                            action="accept",
+                            action_source="auto_accept",
+                            reason="Auto accepted by vendor setting",
+                        )
+                    log.info(
+                        "bookings.post.auto_accept_triggered cid=%s vendor_id=%s bookings=%s",
+                        cid,
+                        vendor_id,
+                        len(booking_mappings),
+                    )
+            except Exception as auto_accept_err:
+                log.warning(
+                    "bookings.post.auto_accept_trigger_failed cid=%s vendor_id=%s err=%s",
+                    cid,
+                    vendor_id,
+                    auto_accept_err,
+                )
 
         log.info("bookings.post.success cid=%s bookings=%s", cid, booking_mappings)
         return jsonify({
@@ -7041,12 +7295,109 @@ def release_slot_controller():
         db.session.remove()
         
 # Add these endpoints to your booking_controller.py
+@booking_blueprint.route('/pay-at-cafe/settings/<int:vendor_id>', methods=['GET'])
+def get_pay_at_cafe_settings(vendor_id: int):
+    try:
+        settings = _get_vendor_pay_at_cafe_settings(vendor_id)
+        return jsonify({"success": True, "settings": settings}), 200
+    except Exception as exc:
+        db.session.rollback()
+        current_app.logger.exception("Failed to get pay-at-cafe settings vendor=%s err=%s", vendor_id, exc)
+        return jsonify({"success": False, "message": "Failed to fetch pay-at-cafe settings"}), 500
+
+
+@booking_blueprint.route('/pay-at-cafe/settings/<int:vendor_id>', methods=['PUT'])
+def update_pay_at_cafe_settings(vendor_id: int):
+    payload = request.get_json(silent=True) or {}
+    try:
+        settings = _save_vendor_pay_at_cafe_settings(vendor_id, payload)
+        return jsonify({
+            "success": True,
+            "message": "Pay-at-cafe settings updated",
+            "settings": settings,
+        }), 200
+    except Exception as exc:
+        db.session.rollback()
+        current_app.logger.exception("Failed to save pay-at-cafe settings vendor=%s err=%s", vendor_id, exc)
+        return jsonify({"success": False, "message": "Failed to save pay-at-cafe settings"}), 500
+
+
+@booking_blueprint.route('/pay-at-cafe/queue-summary/<int:vendor_id>', methods=['GET'])
+def get_pay_at_cafe_queue_summary(vendor_id: int):
+    try:
+        requested_date = (request.args.get("date") or "").strip()
+        try:
+            summary_date = datetime.strptime(requested_date, "%Y-%m-%d").date() if requested_date else datetime.now(IST).date()
+        except ValueError:
+            return jsonify({"success": False, "message": "date must be YYYY-MM-DD"}), 400
+
+        _ensure_pay_at_cafe_action_logs_table()
+
+        pending_rows = db.session.query(Booking.id).join(
+            AvailableGame, Booking.game_id == AvailableGame.id
+        ).filter(
+            AvailableGame.vendor_id == int(vendor_id),
+            Booking.status == "pending_acceptance",
+            Booking.booked_date == summary_date,
+        ).all()
+        pending_ids = {int(r.id) for r in pending_rows}
+
+        logs = db.session.execute(
+            text(
+                """
+                SELECT booking_id, action, action_source, created_at
+                FROM pay_at_cafe_action_logs
+                WHERE vendor_id = :vendor_id
+                  AND DATE(created_at) = :summary_date
+                ORDER BY created_at DESC
+                """
+            ),
+            {"vendor_id": int(vendor_id), "summary_date": summary_date},
+        ).mappings().all()
+
+        accepted_ids = {int(row["booking_id"]) for row in logs if str(row["action"] or "").lower() == "accepted"}
+        rejected_ids = {int(row["booking_id"]) for row in logs if str(row["action"] or "").lower() == "rejected"}
+
+        auto_accepted_ids = {
+            int(row["booking_id"])
+            for row in logs
+            if str(row["action"] or "").lower() == "accepted"
+            and str(row["action_source"] or "").lower() == "auto_accept"
+        }
+        auto_rejected_ids = {
+            int(row["booking_id"])
+            for row in logs
+            if str(row["action"] or "").lower() == "rejected"
+            and str(row["action_source"] or "").lower() == "auto_reject"
+        }
+
+        unique_requested = pending_ids | accepted_ids | rejected_ids
+
+        return jsonify({
+            "success": True,
+            "date": summary_date.isoformat(),
+            "summary": {
+                "requested": len(unique_requested),
+                "pending": len(pending_ids),
+                "accepted": len(accepted_ids),
+                "rejected": len(rejected_ids),
+                "auto_accepted": len(auto_accepted_ids),
+                "auto_rejected": len(auto_rejected_ids),
+            },
+        }), 200
+    except Exception as exc:
+        current_app.logger.exception("Failed pay-at-cafe queue summary vendor=%s err=%s", vendor_id, exc)
+        return jsonify({"success": False, "message": "Failed to fetch pay-at-cafe queue summary"}), 500
+
+
 @booking_blueprint.route('/pay-at-cafe/pending/<int:vendor_id>', methods=['GET'])
 def get_pending_pay_at_cafe_bookings(vendor_id):
     """Get all pending pay-at-cafe bookings for a vendor"""
     try:
         current_app.logger.info(f"Fetching pending pay at cafe bookings for vendor {vendor_id}")
-        
+        settings = _get_vendor_pay_at_cafe_settings(vendor_id)
+        auto_reject_enabled = bool(settings.get("auto_reject_enabled"))
+        auto_reject_after_minutes = int(settings.get("auto_reject_after_minutes") or 15)
         
         # Updated query with proper timezone handling
         pending_bookings = db.session.query(
@@ -7081,6 +7432,7 @@ def get_pending_pay_at_cafe_bookings(vendor_id):
 
         notifications_by_key = {}
         stale_skipped = []
+        auto_rejected_ids = []
         now_ist = datetime.now(IST)
         for booking in pending_bookings:
             try:
@@ -7107,15 +7459,32 @@ def get_pending_pay_at_cafe_bookings(vendor_id):
                     else:
                         slot_end_dt_ist = slot_end_dt.astimezone(IST)
                     if slot_end_dt_ist < (now_ist - timedelta(minutes=15)):
-                        stale_skipped.append(booking.bookingId)
+                        if auto_reject_enabled:
+                            auto_rejected_ids.append(int(booking.bookingId))
+                        else:
+                            stale_skipped.append(booking.bookingId)
                         continue
                 elif booking.emitted_at:
                     emitted_at_dt = booking.emitted_at
                     if emitted_at_dt.tzinfo is None:
                         emitted_at_dt = pytz.UTC.localize(emitted_at_dt)
-                    if emitted_at_dt.astimezone(IST) < (now_ist - timedelta(hours=24)):
-                        stale_skipped.append(booking.bookingId)
+                    threshold = now_ist - timedelta(minutes=auto_reject_after_minutes if auto_reject_enabled else 15)
+                    if emitted_at_dt.astimezone(IST) < threshold:
+                        if auto_reject_enabled:
+                            auto_rejected_ids.append(int(booking.bookingId))
+                        else:
+                            stale_skipped.append(booking.bookingId)
                         continue
+
+                if auto_reject_enabled:
+                    # Secondary safety: request age based auto-reject.
+                    emitted_at_dt = booking.emitted_at
+                    if emitted_at_dt:
+                        if emitted_at_dt.tzinfo is None:
+                            emitted_at_dt = pytz.UTC.localize(emitted_at_dt)
+                        if emitted_at_dt.astimezone(IST) < (now_ist - timedelta(minutes=auto_reject_after_minutes)):
+                            auto_rejected_ids.append(int(booking.bookingId))
+                            continue
 
                 if available_game_obj:
                     pricing = _compute_pay_at_cafe_pricing(
@@ -7188,12 +7557,26 @@ def get_pending_pay_at_cafe_bookings(vendor_id):
                 current_app.logger.error(f"Error processing booking {booking.bookingId}: {item_error}")
                 continue
 
+        # Auto reject stale requests in background so queue stays clean.
+        if auto_reject_enabled and auto_rejected_ids:
+            for bid in sorted(set(auto_rejected_ids)):
+                _trigger_pay_at_cafe_action_async(
+                    booking_id=int(bid),
+                    vendor_id=int(vendor_id),
+                    action="reject",
+                    action_source="auto_reject",
+                    reason="Auto rejected by vendor setting due to pending timeout",
+                )
+                stale_skipped.append(int(bid))
+
         notifications = list(notifications_by_key.values())
         current_app.logger.info(
-            "Successfully processed pending pay-at-cafe notifications vendor=%s active=%s stale_skipped=%s",
+            "Successfully processed pending pay-at-cafe notifications vendor=%s active=%s stale_skipped=%s auto_reject_enabled=%s auto_rejected=%s",
             vendor_id,
             len(notifications),
             len(stale_skipped),
+            auto_reject_enabled,
+            len(set(auto_rejected_ids)),
         )
         
         return jsonify({
@@ -7201,6 +7584,7 @@ def get_pending_pay_at_cafe_bookings(vendor_id):
             'notifications': notifications,
             'count': len(notifications),
             'stale_skipped_count': len(stale_skipped),
+            'auto_rejected_count': len(set(auto_rejected_ids)),
         }), 200
 
     except Exception as e:
@@ -7239,6 +7623,7 @@ def pay_at_cafe_email_action():
     action_payload = {
         "booking_id": booking_id,
         "vendor_id": vendor_id,
+        "action_source": "manual_email",
     }
     if action == "reject":
         action_payload["rejection_reason"] = "Rejected using secure email action link"
@@ -7312,9 +7697,18 @@ def pay_at_cafe_email_action():
 def accept_pay_at_cafe_booking():
     """Accept a pay-at-cafe booking and change status to confirmed"""
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True) or {}
         booking_id = data.get('booking_id')
         vendor_id = data.get('vendor_id')
+        action_source = str(data.get("action_source") or "manual_dashboard").strip().lower()
+        if action_source not in {"manual_dashboard", "manual_email", "auto_accept"}:
+            action_source = "manual_dashboard"
+
+        try:
+            booking_id = int(booking_id)
+            vendor_id = int(vendor_id)
+        except Exception:
+            return jsonify({"success": False, "message": "booking_id and vendor_id must be integers"}), 400
 
         current_app.logger.info(f"Accept pay at cafe booking: booking_id={booking_id}, vendor_id={vendor_id}")
         try:
@@ -7349,7 +7743,7 @@ def accept_pay_at_cafe_booking():
 
         # Verify vendor ownership
         available_game = AvailableGame.query.filter_by(id=booking.game_id).first()
-        if not available_game or available_game.vendor_id != vendor_id:
+        if not available_game or int(available_game.vendor_id) != int(vendor_id):
             return jsonify({"success": False, "message": "Unauthorized - This booking doesn't belong to your vendor"}), 403
 
         # Resolve batch scope (squad)
@@ -7539,6 +7933,26 @@ def accept_pay_at_cafe_booking():
 
         # Commit all changes
         db.session.commit()
+        if accepted_booking_ids:
+            try:
+                source_reason = {
+                    "manual_email": "Accepted from email action link",
+                    "auto_accept": "Auto accepted by vendor setting",
+                }.get(action_source, "Accepted via dashboard")
+                _log_pay_at_cafe_action(
+                    vendor_id=int(vendor_id),
+                    booking_ids=accepted_booking_ids,
+                    action="accepted",
+                    action_source=action_source,
+                    reason=source_reason,
+                )
+            except Exception as log_err:
+                current_app.logger.warning(
+                    "pay_at_cafe.accept action_log_failed vendor_id=%s booking_ids=%s err=%s",
+                    vendor_id,
+                    accepted_booking_ids,
+                    log_err,
+                )
 
         # Emit booking events so dashboards update upcoming list in real time
         socketio = current_app.extensions.get('socketio')
@@ -7585,10 +7999,19 @@ def accept_pay_at_cafe_booking():
 def reject_pay_at_cafe_booking():
     """Reject a pay-at-cafe booking and change status to cancelled"""
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True) or {}
         booking_id = data.get('booking_id')
         vendor_id = data.get('vendor_id')
         rejection_reason = data.get('rejection_reason', 'No reason provided')
+        action_source = str(data.get("action_source") or "manual_dashboard").strip().lower()
+        if action_source not in {"manual_dashboard", "manual_email", "auto_reject"}:
+            action_source = "manual_dashboard"
+
+        try:
+            booking_id = int(booking_id)
+            vendor_id = int(vendor_id)
+        except Exception:
+            return jsonify({"success": False, "message": "booking_id and vendor_id must be integers"}), 400
 
         current_app.logger.info(f"Reject pay at cafe booking: booking_id={booking_id}, vendor_id={vendor_id}, reason={rejection_reason}")
 
@@ -7606,7 +8029,7 @@ def reject_pay_at_cafe_booking():
 
         # Verify vendor ownership
         available_game = AvailableGame.query.filter_by(id=booking.game_id).first()
-        if not available_game or available_game.vendor_id != vendor_id:
+        if not available_game or int(available_game.vendor_id) != int(vendor_id):
             return jsonify({"success": False, "message": "Unauthorized - This booking doesn't belong to your vendor"}), 403
 
         details = _parse_json_details(booking.squad_details)
@@ -7680,6 +8103,22 @@ def reject_pay_at_cafe_booking():
         
         # Commit changes
         db.session.commit()
+        if rejected_booking_ids:
+            try:
+                _log_pay_at_cafe_action(
+                    vendor_id=int(vendor_id),
+                    booking_ids=rejected_booking_ids,
+                    action="rejected",
+                    action_source=action_source,
+                    reason=str(rejection_reason or "").strip() or "Rejected by vendor",
+                )
+            except Exception as log_err:
+                current_app.logger.warning(
+                    "pay_at_cafe.reject action_log_failed vendor_id=%s booking_ids=%s err=%s",
+                    vendor_id,
+                    rejected_booking_ids,
+                    log_err,
+                )
         
         return jsonify({
             "success": True,
