@@ -25,7 +25,7 @@ from models.bookingExtraService  import BookingExtraService
 from models.bookingSquadMember import BookingSquadMember
 from models.extraServiceCategory import ExtraServiceCategory
 from models.extraServiceMenu import ExtraServiceMenu
-from models.passModels import UserPass
+from models.passModels import UserPass, PassRedemptionLog
 from models.consolePricingOffer import ConsolePricingOffer
 from models.controllerPricingRule import ControllerPricingRule
 from models.controllerPricingTier import ControllerPricingTier  # noqa: F401 (mapper registration)
@@ -78,6 +78,7 @@ from utils.realtime import build_booking_event_payload
 from utils.realtime import emit_booking_event
 
 import uuid
+from collections import defaultdict
 
 from utils.common import generate_fid, generate_access_code, get_razorpay_keys
 
@@ -152,6 +153,47 @@ def _parse_json_details(raw_value):
         except Exception:
             return {}
     return {}
+
+
+def _menu_stock_qty(menu_item):
+    qty = getattr(menu_item, "stock_quantity", None)
+    if qty is None:
+        return None
+    try:
+        return int(qty)
+    except (TypeError, ValueError):
+        return None
+
+
+def _menu_stock_unit(menu_item):
+    return str(getattr(menu_item, "stock_unit", None) or "units")
+
+
+def _ensure_menu_stock_available(menu_item, required_qty: int):
+    """
+    Returns (is_available, error_message_or_none). stock_quantity=None means unlimited.
+    """
+    required = max(int(required_qty or 0), 0)
+    available_qty = _menu_stock_qty(menu_item)
+    if available_qty is None:
+        return True, None
+    if available_qty < required:
+        return (
+            False,
+            f"Insufficient stock for '{menu_item.name}'. Required {required} {_menu_stock_unit(menu_item)}, available {available_qty}.",
+        )
+    return True, None
+
+
+def _consume_menu_stock(menu_item, quantity: int):
+    """
+    Decrement stock in-memory; caller transaction controls commit/rollback.
+    """
+    requested = max(int(quantity or 0), 0)
+    available_qty = _menu_stock_qty(menu_item)
+    if available_qty is None:
+        return
+    menu_item.stock_quantity = max(0, available_qty - requested)
 
 
 def resolve_app_fee_amount(amount: float, payload=None) -> float:
@@ -863,6 +905,19 @@ def _normalize_slot_ids(raw_slot_ids):
     return normalized, invalid
 
 
+def _coerce_int_value(value, default=None):
+    if value is None:
+        return default
+    if isinstance(value, str):
+        value = value.strip()
+        if value == "":
+            return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _ensure_vendor_slot_rows_for_date(vendor_id, game_id, booked_date_obj, slot_ids):
     """
     Self-heal missing VENDOR_<id>_SLOT rows for selected date/slots so direct booking
@@ -875,19 +930,23 @@ def _ensure_vendor_slot_rows_for_date(vendor_id, game_id, booked_date_obj, slot_
     game = AvailableGame.query.filter_by(id=int(game_id), vendor_id=int(vendor_id)).first()
     fallback_available = max(int(getattr(game, "total_slot", 0) or 0), 1)
 
+    requested_slot_ids = [int(sid) for sid in slot_ids if sid is not None]
     valid_slot_ids = [
         int(row[0])
         for row in (
             db.session.query(Slot.id)
             .filter(
-                Slot.id.in_([int(sid) for sid in slot_ids]),
+                Slot.id.in_(requested_slot_ids),
                 Slot.gaming_type_id == int(game_id),
             )
             .all()
         )
     ]
 
-    for slot_id in valid_slot_ids:
+    # Fallback for historical/inconsistent data where slot mapping is missing but slot_id is already resolved upstream.
+    candidate_slot_ids = valid_slot_ids or requested_slot_ids
+
+    for slot_id in candidate_slot_ids:
         db.session.execute(
             text(
                 f"""
@@ -969,6 +1028,106 @@ def _default_repayment_type(payment_use_case: str) -> str:
     if normalized in {"upi", "card", "credit_card", "debit_card", "gateway", "online"}:
         return "refund"
     return "refund"
+
+
+def _safe_float(value, default=0.0):
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return float(default or 0.0)
+
+
+def _booking_slot_start_datetime_ist(booking, booked_date):
+    booked_on = _coerce_date_value(booked_date) or datetime.utcnow().date()
+    slot_obj = getattr(booking, "slot", None)
+    start_time = None
+    if slot_obj and getattr(slot_obj, "start_time", None):
+        start_time = slot_obj.start_time
+    elif getattr(booking, "custom_start_time", None):
+        start_time = booking.custom_start_time
+    if not start_time:
+        return None
+    local_dt = datetime.combine(booked_on, start_time)
+    return IST.localize(local_dt)
+
+
+def _resolve_cancellation_fee(booking, paid_amount: float, is_pay_at_cafe: bool, is_pass_payment: bool):
+    if paid_amount <= 0:
+        return 0.0
+
+    enabled = bool(current_app.config.get("CANCELLATION_FEE_ENABLED", True))
+    if not enabled:
+        return 0.0
+
+    if is_pay_at_cafe:
+        apply_pay_at_cafe = bool(current_app.config.get("CANCELLATION_FEE_APPLY_ON_PAY_AT_CAFE", False))
+        if not apply_pay_at_cafe:
+            return 0.0
+
+    if is_pass_payment:
+        apply_pass = bool(current_app.config.get("CANCELLATION_FEE_APPLY_ON_PASS", False))
+        if not apply_pass:
+            return 0.0
+
+    free_before_minutes = max(int(_safe_float(current_app.config.get("CANCELLATION_FREE_BEFORE_MINUTES", 180), 180)), 0)
+    now_ist = datetime.now(IST)
+    slot_start = _booking_slot_start_datetime_ist(booking, resolve_booking_booked_date(booking))
+    if slot_start:
+        minutes_until_start = (slot_start - now_ist).total_seconds() / 60.0
+        if minutes_until_start >= free_before_minutes:
+            return 0.0
+
+    percent = max(_safe_float(current_app.config.get("CANCELLATION_FEE_PERCENT", 5), 5), 0.0)
+    flat = max(_safe_float(current_app.config.get("CANCELLATION_FEE_FLAT", 0), 0), 0.0)
+    minimum = max(_safe_float(current_app.config.get("CANCELLATION_FEE_MIN", 0), 0), 0.0)
+    maximum = max(_safe_float(current_app.config.get("CANCELLATION_FEE_MAX", 50), 50), 0.0)
+
+    fee = 0.0
+    if flat > 0:
+        fee = flat
+    elif percent > 0:
+        fee = (paid_amount * percent) / 100.0
+
+    if minimum > 0:
+        fee = max(fee, minimum)
+    if maximum > 0:
+        fee = min(fee, maximum)
+
+    fee = min(max(fee, 0.0), paid_amount)
+    return round(fee, 2)
+
+
+def _append_cancellation_note(existing_note: str, reason: str):
+    existing = (existing_note or "").strip()
+    suffix = f"Cancelled: {reason.strip()}" if str(reason or "").strip() else "Cancelled"
+    return f"{existing}\n{suffix}".strip() if existing else suffix
+
+
+def _credit_wallet_for_cancellation(user_id: int, booking_id: int, amount: float):
+    credit_units = int(round(max(_safe_float(amount, 0.0), 0.0)))
+    if credit_units <= 0:
+        return 0
+
+    wallet = (
+        db.session.query(HashWallet)
+        .filter(HashWallet.user_id == int(user_id))
+        .with_for_update()
+        .first()
+    )
+    if not wallet:
+        wallet = HashWallet(user_id=int(user_id), balance=0)
+        db.session.add(wallet)
+        db.session.flush()
+
+    wallet.balance = int(wallet.balance or 0) + credit_units
+    wallet_txn = HashWalletTransaction(
+        user_id=int(user_id),
+        amount=credit_units,
+        type='booking_cancel_credit',
+        reference_id=str(booking_id),
+    )
+    db.session.add(wallet_txn)
+    return credit_units
 
 
 def _release_slot_for_booking(booking, vendor_id: int, booked_date):
@@ -1593,6 +1752,13 @@ def booking_pricing_preview():
                 return jsonify({
                     "success": False,
                     "message": f"Invalid or inactive menu item {menu_item_id} for this vendor"
+                }), 400
+
+            stock_ok, stock_error = _ensure_menu_stock_available(menu_item, quantity)
+            if not stock_ok:
+                return jsonify({
+                    "success": False,
+                    "message": stock_error
                 }), 400
 
             item_total = float(menu_item.price or 0.0) * quantity
@@ -2964,9 +3130,15 @@ def confirm_booking():
         total_extras_cost = 0.0
         for extra in extra_services_list:
             menu_obj = menu_map.get(extra.get('item_id'))
-            if not menu_obj:
-                continue
-            total_extras_cost += float(menu_obj.price or 0) * float(extra.get('quantity', 1) or 1)
+            quantity = int(extra.get('quantity', 1) or 1)
+            if not menu_obj or quantity <= 0:
+                return jsonify({
+                    "message": f"Invalid extra service item '{extra.get('item_id')}' in request"
+                }), 400
+            stock_ok, stock_error = _ensure_menu_stock_available(menu_obj, quantity)
+            if not stock_ok:
+                return jsonify({"message": stock_error}), 400
+            total_extras_cost += float(menu_obj.price or 0) * float(quantity)
         extras_total_per_booking = (total_extras_cost / len(booking_ids)) if booking_ids else 0.0
 
         effective_price_by_game = effective_price_by_game or {}
@@ -3232,7 +3404,12 @@ def confirm_booking():
                 if not menu_obj:
                     continue
 
-                quantity = extra.get('quantity', 1)
+                quantity = int(extra.get('quantity', 1) or 1)
+                stock_ok, stock_error = _ensure_menu_stock_available(menu_obj, quantity)
+                if not stock_ok:
+                    db.session.rollback()
+                    return jsonify({"message": stock_error}), 400
+                _consume_menu_stock(menu_obj, quantity)
                 unit_price = menu_obj.price
                 total_price = unit_price * quantity
 
@@ -4469,7 +4646,10 @@ def new_booking(vendor_id):
             
             for meal in selected_meals:
                 menu_item_id = meal.get('menu_item_id')
-                quantity = meal.get('quantity', 1)
+                try:
+                    quantity = int(meal.get('quantity', 1) or 1)
+                except (TypeError, ValueError):
+                    return jsonify({"success": False, "message": "Invalid meal quantity"}), 400
                 
                 if not menu_item_id or quantity <= 0:
                     return jsonify({"message": "Invalid meal data provided"}), 400
@@ -4488,6 +4668,10 @@ def new_booking(vendor_id):
                     return jsonify({
                         "message": f"Invalid or inactive menu item {menu_item_id} for this vendor"
                     }), 400
+
+                stock_ok, stock_error = _ensure_menu_stock_available(menu_item, quantity)
+                if not stock_ok:
+                    return jsonify({"message": stock_error}), 400
                 
                 item_total = menu_item.price * quantity
                 total_meals_cost += item_total
@@ -4668,9 +4852,31 @@ def new_booking(vendor_id):
         # ✅ Since BookingService.create_booking already handles slot decrement,
         # we don't need to manually update VENDOR_X_SLOT table here
 
+        if bookings and meal_details:
+            required_qty_by_menu = defaultdict(int)
+            menu_ref = {}
+            for meal_detail in meal_details:
+                menu_obj = meal_detail.get("menu_item")
+                if not menu_obj:
+                    continue
+                menu_id = int(menu_obj.id)
+                required_qty_by_menu[menu_id] += int(meal_detail.get("quantity") or 0) * len(bookings)
+                menu_ref[menu_id] = menu_obj
+
+            for menu_id, required_qty in required_qty_by_menu.items():
+                menu_obj = menu_ref.get(menu_id)
+                stock_ok, stock_error = _ensure_menu_stock_available(menu_obj, required_qty)
+                if not stock_ok:
+                    db.session.rollback()
+                    return jsonify({
+                        "success": False,
+                        "message": stock_error,
+                    }), 400
+
         # Add extra services to bookings
         for booking in bookings:
             for meal_detail in meal_details:
+                _consume_menu_stock(meal_detail['menu_item'], int(meal_detail['quantity'] or 0))
                 booking_extra_service = BookingExtraService(
                     booking_id=booking.id,
                     menu_item_id=meal_detail['menu_item'].id,
@@ -5193,97 +5399,282 @@ def new_booking(vendor_id):
         }), 500
 
 
-def cancel_bookings_with_refund(booking_ids, repayment_type=None, reason=None):
+def cancel_bookings_with_refund(
+    booking_ids,
+    repayment_type=None,
+    reason=None,
+    actor_scope="dashboard",
+    actor_user_id=None,
+    enforce_user_ownership=False,
+    apply_cancellation_fee=False,
+):
     if not booking_ids:
         raise ValueError("booking_id or booking_ids required")
 
+    parsed_ids = []
+    for booking_id in booking_ids:
+        try:
+            parsed_ids.append(int(booking_id))
+        except (TypeError, ValueError):
+            continue
+    parsed_ids = list(dict.fromkeys(parsed_ids))
+    if not parsed_ids:
+        raise ValueError("booking_id or booking_ids required")
+
     actor = resolve_transaction_actor(request)
-    cancelled_ids = []
-    refund_transactions = []
-    refund_total = 0.0
-    skipped_ids = []
+    normalized_scope = str(actor_scope or "").strip().lower()
+    actor_source = normalized_scope if normalized_scope in {"app", "dashboard"} else actor["source_channel"]
+    now_utc = datetime.utcnow()
 
     booking_rows = (
         Booking.query
-        .filter(Booking.id.in_([int(bid) for bid in booking_ids if bid]))
+        .options(joinedload(Booking.slot), joinedload(Booking.game))
+        .filter(Booking.id.in_(parsed_ids))
         .all()
     )
     if not booking_rows:
         raise ValueError("Booking not found")
 
-    for booking in booking_rows:
-        status = str(booking.status or "").strip().lower()
-        if status in {"cancelled", "canceled", "rejected", "completed", "discarded"}:
-            skipped_ids.append(int(booking.id))
+    booking_map = {int(b.id): b for b in booking_rows}
+    ordered_bookings = [booking_map[booking_id] for booking_id in parsed_ids if booking_id in booking_map]
+
+    tx_rows = (
+        db.session.query(Transaction)
+        .filter(Transaction.booking_id.in_(parsed_ids))
+        .order_by(Transaction.id.asc())
+        .all()
+    )
+    tx_by_booking = defaultdict(list)
+    for tx in tx_rows:
+        tx_by_booking[int(tx.booking_id)].append(tx)
+
+    redemption_rows = (
+        PassRedemptionLog.query
+        .filter(
+            PassRedemptionLog.booking_id.in_(parsed_ids),
+            PassRedemptionLog.is_cancelled == False,  # noqa: E712
+        )
+        .all()
+    )
+    redemptions_by_booking = defaultdict(list)
+    for redemption in redemption_rows:
+        if redemption.booking_id is not None:
+            redemptions_by_booking[int(redemption.booking_id)].append(redemption)
+
+    cancelled_ids = []
+    skipped_ids = []
+    unauthorized_ids = []
+    booking_summaries = []
+    refund_total = 0.0
+    cancellation_fee_total = 0.0
+    pass_hours_restored_total = 0.0
+
+    terminal_statuses = {"cancelled", "canceled", "rejected", "completed", "discarded"}
+    non_cancellable_statuses = {"checked_in", "current", "started", "running", "in_progress"}
+    user_pass_cache = {}
+    booking_event_meta = {}
+
+    for booking in ordered_bookings:
+        booking_id = int(booking.id)
+
+        if enforce_user_ownership and actor_user_id is not None and int(booking.user_id or 0) != int(actor_user_id):
+            unauthorized_ids.append(booking_id)
             continue
 
-        available_game = AvailableGame.query.get(booking.game_id)
-        vendor_id = (
-            int(available_game.vendor_id)
-            if available_game else
-            int(getattr(booking.transaction, "vendor_id", 0) or 0)
-        )
-        booked_date = resolve_booking_booked_date(booking)
+        status = str(booking.status or "").strip().lower()
+        if status in terminal_statuses or status in non_cancellable_statuses:
+            skipped_ids.append(booking_id)
+            continue
 
+        booking_txs = tx_by_booking.get(booking_id, [])
+        tx = None
+        if booking_txs:
+            preferred = [
+                t for t in booking_txs
+                if str(t.booking_type or "").strip().lower() in {"booking", "regular", "pay_at_cafe", "direct", ""}
+            ]
+            tx = preferred[0] if preferred else booking_txs[0]
+
+        booked_date = resolve_booking_booked_date(booking)
+        vendor_id = int(getattr(booking.game, "vendor_id", 0) or getattr(tx, "vendor_id", 0) or 0) or None
         _release_slot_for_booking(booking, vendor_id, booked_date)
+        if vendor_id:
+            try:
+                db.session.execute(
+                    text(f"""
+                        UPDATE VENDOR_{int(vendor_id)}_DASHBOARD
+                        SET book_status = 'cancelled'
+                        WHERE book_id = :book_id
+                    """),
+                    {"book_id": booking_id},
+                )
+            except Exception as dashboard_update_err:
+                current_app.logger.warning(
+                    "Dashboard table cancel sync failed vendor=%s booking_id=%s err=%s",
+                    vendor_id,
+                    booking_id,
+                    dashboard_update_err,
+                )
+
+        payment_use_case = str(getattr(tx, "payment_use_case", "") or getattr(tx, "mode_of_payment", "")).strip().lower()
+        settlement_status = str(getattr(tx, "settlement_status", "")).strip().lower()
+        payment_mode = str(getattr(tx, "mode_of_payment", "")).strip().lower()
+        paid_amount = max(_safe_float(getattr(tx, "amount", 0.0), 0.0), 0.0)
+
+        has_pass_redemption = bool(redemptions_by_booking.get(booking_id))
+        is_pass_payment = (
+            payment_use_case in {"pass", "cafe_pass", "global_pass"}
+            or payment_mode in {"date_pass", "hour_pass", "pass"}
+            or has_pass_redemption
+        )
+        is_pay_at_cafe = (
+            payment_use_case == "pay_at_cafe"
+            or payment_mode == "pay_at_cafe"
+            or settlement_status in {"pending", "unpaid", "due"}
+        )
+
+        chosen_repayment = (str(repayment_type or "").strip().lower() or None)
+        if chosen_repayment in {"no_refund", "no-refund"}:
+            chosen_repayment = "none"
+        if not chosen_repayment:
+            chosen_repayment = _default_repayment_type(payment_use_case) if paid_amount > 0 else "none"
+        if paid_amount <= 0:
+            chosen_repayment = "none"
+        if is_pay_at_cafe and settlement_status in {"pending", "unpaid", "due"} and repayment_type is None:
+            chosen_repayment = "none"
+
+        cancellation_fee = (
+            _resolve_cancellation_fee(
+                booking=booking,
+                paid_amount=paid_amount,
+                is_pay_at_cafe=is_pay_at_cafe,
+                is_pass_payment=is_pass_payment,
+            )
+            if apply_cancellation_fee and chosen_repayment != "none"
+            else 0.0
+        )
+        refundable_amount = paid_amount if chosen_repayment != "none" else 0.0
+        refund_amount = round(max(refundable_amount - cancellation_fee, 0.0), 2)
+        if chosen_repayment == "credit" and refund_amount > 0:
+            # Wallet schema is integer-based; normalize refund to wallet units.
+            refund_amount = float(int(round(refund_amount)))
+        wallet_credit_amount = 0.0
+
+        if tx and refund_amount > 0 and chosen_repayment != "none":
+            refund_tx = Transaction(
+                booking_id=booking.id,
+                vendor_id=tx.vendor_id,
+                user_id=booking.user_id,
+                booked_date=booked_date,
+                booking_date=now_utc.date(),
+                booking_time=now_utc.time(),
+                user_name=f"{tx.user_name} {chosen_repayment.upper()}-{tx.id}",
+                original_amount=-refund_amount,
+                discounted_amount=0,
+                amount=-refund_amount,
+                mode_of_payment=tx.mode_of_payment,
+                payment_use_case=tx.payment_use_case,
+                booking_type=chosen_repayment,
+                settlement_status="processed" if chosen_repayment in {"refund", "credit"} else "pending",
+                source_channel=actor_source,
+                initiated_by_staff_id=actor["staff_id"],
+                initiated_by_staff_name=actor["staff_name"],
+                initiated_by_staff_role=actor["staff_role"],
+                app_fee_amount=0.0,
+            )
+            db.session.add(refund_tx)
+            refund_total += refund_amount
+
+            if chosen_repayment == "credit":
+                wallet_credit_amount = float(
+                    _credit_wallet_for_cancellation(
+                        user_id=int(booking.user_id),
+                        booking_id=booking_id,
+                        amount=refund_amount,
+                    )
+                )
+
+        if tx and cancellation_fee > 0:
+            fee_tx = Transaction(
+                booking_id=booking.id,
+                vendor_id=tx.vendor_id,
+                user_id=booking.user_id,
+                booked_date=booked_date,
+                booking_date=now_utc.date(),
+                booking_time=now_utc.time(),
+                user_name=f"{tx.user_name} CANCELLATION_FEE-{tx.id}",
+                original_amount=cancellation_fee,
+                discounted_amount=0,
+                amount=cancellation_fee,
+                mode_of_payment=tx.mode_of_payment,
+                payment_use_case="cancellation_fee",
+                booking_type="cancellation_fee",
+                settlement_status="processed",
+                source_channel=actor_source,
+                initiated_by_staff_id=actor["staff_id"],
+                initiated_by_staff_name=actor["staff_name"],
+                initiated_by_staff_role=actor["staff_role"],
+                app_fee_amount=0.0,
+            )
+            db.session.add(fee_tx)
+            cancellation_fee_total += cancellation_fee
+
+        restored_hours = 0.0
+        for redemption in redemptions_by_booking.get(booking_id, []):
+            if redemption.is_cancelled:
+                continue
+            user_pass = user_pass_cache.get(int(redemption.user_pass_id))
+            if user_pass is None:
+                user_pass = (
+                    db.session.query(UserPass)
+                    .filter(UserPass.id == int(redemption.user_pass_id))
+                    .with_for_update()
+                    .first()
+                )
+                user_pass_cache[int(redemption.user_pass_id)] = user_pass
+            if user_pass:
+                user_pass.remaining_hours = Decimal(str(_safe_float(user_pass.remaining_hours, 0.0) + _safe_float(redemption.hours_deducted, 0.0)))
+                if not user_pass.is_active and _safe_float(user_pass.remaining_hours, 0.0) > 0:
+                    if not user_pass.valid_to or user_pass.valid_to >= datetime.now(IST).date():
+                        user_pass.is_active = True
+            redemption.is_cancelled = True
+            redemption.cancelled_at = datetime.now(IST)
+            redemption.notes = _append_cancellation_note(redemption.notes, reason or "Booking cancelled")
+            restored_hours += _safe_float(redemption.hours_deducted, 0.0)
+
+        pass_hours_restored_total += restored_hours
 
         booking.status = "cancelled"
-        booking.updated_at = datetime.utcnow()
-        cancelled_ids.append(int(booking.id))
+        booking.updated_at = now_utc
+        cancelled_ids.append(booking_id)
 
-        # Determine if a refund/credit is required
-        tx = (
-            db.session.query(Transaction)
-            .filter(Transaction.booking_id == booking.id)
-            .order_by(Transaction.id.asc())
-            .first()
-        )
-        if tx and float(tx.amount or 0) > 0:
-            payment_use_case = str(tx.payment_use_case or tx.mode_of_payment or "").strip().lower()
-            settlement_status = str(tx.settlement_status or "").strip().lower()
-            is_pay_at_cafe = payment_use_case == "pay_at_cafe" or settlement_status in {"pending", "unpaid", "due"}
-
-            if not is_pay_at_cafe and repayment_type != "none":
-                chosen_repayment = repayment_type or _default_repayment_type(payment_use_case)
-                refund_amount = float(tx.amount or 0)
-                refund_total += refund_amount
-                refund_tx = Transaction(
-                    booking_id=booking.id,
-                    vendor_id=tx.vendor_id,
-                    user_id=booking.user_id,
-                    booked_date=booked_date,
-                    booking_date=datetime.utcnow().date(),
-                    booking_time=datetime.utcnow().time(),
-                    user_name=f"{tx.user_name} {chosen_repayment.upper()}-{tx.id}",
-                    original_amount=-refund_amount,
-                    discounted_amount=0,
-                    amount=-refund_amount,
-                    mode_of_payment=tx.mode_of_payment,
-                    payment_use_case=tx.payment_use_case,
-                    booking_type=chosen_repayment,
-                    settlement_status="processed" if chosen_repayment == "refund" else "pending",
-                    source_channel=actor["source_channel"],
-                    initiated_by_staff_id=actor["staff_id"],
-                    initiated_by_staff_name=actor["staff_name"],
-                    initiated_by_staff_role=actor["staff_role"],
-                    app_fee_amount=0.0,
-                )
-                db.session.add(refund_tx)
-                refund_transactions.append(refund_tx)
+        summary = {
+            "booking_id": booking_id,
+            "repayment_type": chosen_repayment,
+            "refund_amount": round(refund_amount, 2),
+            "cancellation_fee": round(cancellation_fee, 2),
+            "wallet_credit_amount": round(wallet_credit_amount, 2),
+            "payment_use_case": payment_use_case or None,
+            "is_pay_at_cafe": is_pay_at_cafe,
+            "pass_hours_restored": round(restored_hours, 2),
+            "status": "cancelled",
+        }
+        booking_summaries.append(summary)
+        booking_event_meta[booking_id] = summary
 
     db.session.commit()
 
     socketio = current_app.extensions.get('socketio')
-    for booking in booking_rows:
-        if booking.id not in cancelled_ids:
+    for booking in ordered_bookings:
+        booking_id = int(booking.id)
+        if booking_id not in cancelled_ids:
             continue
-        vendor_id = (
-            int(AvailableGame.query.get(booking.game_id).vendor_id)
-            if booking.game_id else None
-        )
+
+        vendor_id = int(getattr(booking.game, "vendor_id", 0) or 0) or None
+        booking_summary = booking_event_meta.get(booking_id, {})
         try:
             payload = {
-                "booking_id": booking.id,
+                "booking_id": booking_id,
                 "slot_id": booking.slot_id,
                 "vendor_id": vendor_id,
                 "user_id": booking.user_id,
@@ -5297,39 +5688,44 @@ def cancel_bookings_with_refund(booking_ids, repayment_type=None, reason=None):
             current_app.logger.warning("Failed emitting booking cancel event booking_id=%s", booking.id)
 
         if socketio:
+            update_payload = {
+                "vendorId": vendor_id,
+                "bookingId": booking_id,
+                "event": "booking_cancelled",
+                "repayment_type": booking_summary.get("repayment_type") or "none",
+                "refund_total": float(booking_summary.get("refund_amount") or 0.0),
+                "cancellation_fee": float(booking_summary.get("cancellation_fee") or 0.0),
+                "wallet_credit_amount": float(booking_summary.get("wallet_credit_amount") or 0.0),
+                "payment_use_case": booking_summary.get("payment_use_case"),
+                "pass_hours_restored": float(booking_summary.get("pass_hours_restored") or 0.0),
+                "reason": reason,
+                "status": "cancelled",
+            }
             try:
                 socketio.emit(
                     "booking_payment_update",
-                    {
-                        "vendorId": vendor_id,
-                        "bookingId": booking.id,
-                        "event": "booking_cancelled",
-                        "repayment_type": repayment_type or "none",
-                        "refund_total": float(refund_total or 0),
-                    },
+                    update_payload,
                     to=f"vendor_{int(vendor_id)}" if vendor_id else None,
                 )
             except TypeError:
                 socketio.emit(
                     "booking_payment_update",
-                    {
-                        "vendorId": vendor_id,
-                        "bookingId": booking.id,
-                        "event": "booking_cancelled",
-                        "repayment_type": repayment_type or "none",
-                        "refund_total": float(refund_total or 0),
-                    },
+                    update_payload,
                     room=f"vendor_{int(vendor_id)}" if vendor_id else None,
                 )
 
     return {
-        "success": True,
-        "message": "Booking cancelled",
+        "success": len(cancelled_ids) > 0,
+        "message": "Booking cancelled" if cancelled_ids else "No eligible booking cancelled",
         "cancelled_ids": cancelled_ids,
         "skipped_ids": skipped_ids,
-        "refund_total": float(refund_total or 0),
-        "repayment_type": repayment_type or "none",
+        "unauthorized_ids": unauthorized_ids,
+        "refund_total": round(float(refund_total or 0.0), 2),
+        "cancellation_fee_total": round(float(cancellation_fee_total or 0.0), 2),
+        "pass_hours_restored_total": round(float(pass_hours_restored_total or 0.0), 2),
+        "repayment_type": repayment_type or "auto",
         "reason": reason,
+        "bookings": booking_summaries,
     }
 
 
@@ -5343,12 +5739,66 @@ def cancel_bookings_route():
             booking_ids = booking_ids or [booking_id]
         repayment_type = data.get("repayment_type")
         reason = data.get("reason")
-        result = cancel_bookings_with_refund(booking_ids, repayment_type=repayment_type, reason=reason)
+        result = cancel_bookings_with_refund(
+            booking_ids,
+            repayment_type=repayment_type,
+            reason=reason,
+            actor_scope="dashboard",
+            apply_cancellation_fee=False,
+        )
         return jsonify(result), 200
     except ValueError as e:
         return jsonify({"success": False, "message": str(e)}), 404
     except Exception as e:
         current_app.logger.exception("Failed to cancel booking")
+        db.session.rollback()
+        return jsonify({"success": False, "message": "Failed to cancel booking", "error": str(e)}), 500
+
+
+@booking_blueprint.route('/bookings/cancel/app', methods=['POST'])
+@auth_required_self(decrypt_user=True)
+def cancel_bookings_app_route():
+    try:
+        data = request.get_json(silent=True) or {}
+        booking_ids = data.get("booking_ids") or []
+        booking_id = data.get("booking_id")
+        if booking_id:
+            booking_ids = booking_ids or [booking_id]
+        if not booking_ids:
+            return jsonify({"success": False, "message": "booking_id or booking_ids required"}), 400
+
+        user_id = int(g.auth_user_id)
+        repayment_type = data.get("repayment_type")
+        reason = data.get("reason") or "Cancelled from app"
+
+        result = cancel_bookings_with_refund(
+            booking_ids=booking_ids,
+            repayment_type=repayment_type,
+            reason=reason,
+            actor_scope="app",
+            actor_user_id=user_id,
+            enforce_user_ownership=True,
+            apply_cancellation_fee=True,
+        )
+
+        if not result.get("cancelled_ids"):
+            if result.get("unauthorized_ids"):
+                return jsonify({
+                    "success": False,
+                    "message": "You can cancel only your own bookings.",
+                    "details": result,
+                }), 403
+            return jsonify({
+                "success": False,
+                "message": "No eligible booking cancelled.",
+                "details": result,
+            }), 400
+
+        return jsonify(result), 200
+    except ValueError as e:
+        return jsonify({"success": False, "message": str(e)}), 404
+    except Exception as e:
+        current_app.logger.exception("Failed to cancel booking from app")
         db.session.rollback()
         return jsonify({"success": False, "message": "Failed to cancel booking", "error": str(e)}), 500
 
@@ -5515,7 +5965,10 @@ def validate_selected_meals(vendor_id):
 
         for meal in selected_meals:
             menu_item_id = meal.get('menu_item_id')
-            quantity = meal.get('quantity', 1)
+            try:
+                quantity = int(meal.get('quantity', 1) or 1)
+            except (TypeError, ValueError):
+                return jsonify({'success': False, 'error': 'Meal quantity must be a valid integer'}), 400
 
             menu_item = db.session.query(ExtraServiceMenu).join(
                 ExtraServiceCategory
@@ -7115,7 +7568,10 @@ def add_meals_to_booking(booking_id):
         
         for meal in meals:
             menu_item_id = meal.get('menu_item_id')
-            quantity = meal.get('quantity', 1)
+            try:
+                quantity = int(meal.get('quantity', 1) or 1)
+            except (TypeError, ValueError):
+                return jsonify({"success": False, "message": "Invalid meal quantity"}), 400
             
             if not menu_item_id or quantity <= 0:
                 return jsonify({"success": False, "message": "Invalid meal data provided"}), 400
@@ -7135,6 +7591,13 @@ def add_meals_to_booking(booking_id):
                     "success": False,
                     "message": f"Invalid or inactive menu item {menu_item_id} for this vendor"
                 }), 400
+
+            stock_ok, stock_error = _ensure_menu_stock_available(menu_item, quantity)
+            if not stock_ok:
+                return jsonify({
+                    "success": False,
+                    "message": stock_error
+                }), 400
             
             item_total = menu_item.price * quantity
             total_meals_cost += item_total
@@ -7150,6 +7613,7 @@ def add_meals_to_booking(booking_id):
         
         # Create booking extra services for the existing booking
         for meal_detail in meal_details:
+            _consume_menu_stock(meal_detail['menu_item'], int(meal_detail['quantity'] or 0))
             booking_extra_service = BookingExtraService(
                 booking_id=booking_id,
                 menu_item_id=meal_detail['menu_item'].id,
@@ -7635,7 +8099,7 @@ def _resolve_extension_candidate(vendor_id: int, current_booking_id: int, reques
     if not booking:
         return None, {"code": 404, "message": "Current booking not found"}
 
-    game_id = int(requested_game_id or booking.game_id or 0)
+    game_id = _coerce_int_value(requested_game_id, _coerce_int_value(booking.game_id, 0)) or 0
     if not game_id:
         return None, {"code": 400, "message": "game_id missing for current booking"}
 
@@ -7662,12 +8126,52 @@ def _resolve_extension_candidate(vendor_id: int, current_booking_id: int, reques
     if not next_slot:
         return None, {"code": 200, "message": "No immediate next slot configured for this game"}
 
+    # Self-heal missing VENDOR_<id>_SLOT rows for next slot date.
+    try:
+        _ensure_vendor_slot_rows_for_date(
+            vendor_id=int(vendor_id),
+            game_id=int(game_id),
+            booked_date_obj=next_slot_date,
+            slot_ids=[int(next_slot.id)],
+        )
+    except Exception:
+        current_app.logger.warning(
+            "Could not self-heal next-slot row vendor_id=%s game_id=%s date=%s slot_id=%s",
+            vendor_id,
+            game_id,
+            next_slot_date,
+            getattr(next_slot, "id", None),
+        )
+
     reason = _precheck_slot_booking_eligibility(
         vendor_id=int(vendor_id),
         slot_id=int(next_slot.id),
         booked_date_obj=next_slot_date,
         required_units=1,
     )
+
+    if reason == "Slot row not found for selected date.":
+        try:
+            _ensure_vendor_slot_rows_for_date(
+                vendor_id=int(vendor_id),
+                game_id=int(game_id),
+                booked_date_obj=next_slot_date,
+                slot_ids=[int(next_slot.id)],
+            )
+            reason = _precheck_slot_booking_eligibility(
+                vendor_id=int(vendor_id),
+                slot_id=int(next_slot.id),
+                booked_date_obj=next_slot_date,
+                required_units=1,
+            )
+        except Exception:
+            current_app.logger.warning(
+                "Next-slot row retry failed vendor_id=%s game_id=%s date=%s slot_id=%s",
+                vendor_id,
+                game_id,
+                next_slot_date,
+                getattr(next_slot, "id", None),
+            )
 
     start_dt, end_dt = _slot_window_for_date(next_slot_date, next_slot.start_time, next_slot.end_time)
     current_start_dt, current_end_dt = _slot_window_for_date(booked_date, current_slot.start_time, current_slot.end_time)
@@ -7715,19 +8219,21 @@ def kiosk_check_next_slot(vendor_id):
     """
     try:
         body = request.get_json(silent=True) or {}
-        current_booking_id = body.get("current_booking_id") or body.get("currentBookingId") or body.get("booking_id")
-        game_id = body.get("game_id") or body.get("gameId")
-        console_id = body.get("console_id") or body.get("consoleId")
-        user_id = body.get("user_id") or body.get("userId")
+        current_booking_id = _coerce_int_value(
+            body.get("current_booking_id") or body.get("currentBookingId") or body.get("booking_id")
+        )
+        game_id = _coerce_int_value(body.get("game_id") or body.get("gameId"))
+        console_id = _coerce_int_value(body.get("console_id") or body.get("consoleId"))
+        user_id = _coerce_int_value(body.get("user_id") or body.get("userId"))
         access_code = body.get("access_code") or body.get("accessCode")
 
-        if not current_booking_id and console_id:
+        if not current_booking_id and console_id is not None:
             try:
                 current_booking_id = _resolve_current_booking_id_for_console(
                     vendor_id=int(vendor_id),
                     console_id=int(console_id),
-                    game_id=int(game_id) if game_id is not None else None,
-                    user_id=int(user_id) if user_id is not None else None,
+                    game_id=game_id,
+                    user_id=user_id,
                 )
             except Exception:
                 current_booking_id = None
@@ -7736,7 +8242,7 @@ def kiosk_check_next_slot(vendor_id):
             current_booking_id = _resolve_booking_id_from_access_code(
                 vendor_id=int(vendor_id),
                 access_code=str(access_code),
-                game_id=int(game_id) if game_id is not None else None,
+                game_id=game_id,
             )
 
         if not current_booking_id:
@@ -7749,7 +8255,7 @@ def kiosk_check_next_slot(vendor_id):
         candidate, err = _resolve_extension_candidate(
             vendor_id=int(vendor_id),
             current_booking_id=int(current_booking_id),
-            requested_game_id=int(game_id) if game_id is not None else None,
+            requested_game_id=game_id,
         )
         if err and int(err.get("code", 500)) != 200:
             return jsonify({"success": False, "can_extend": False, "message": err.get("message")}), int(err.get("code", 500))
@@ -7799,29 +8305,31 @@ def kiosk_book_next_slot(vendor_id):
     """
     try:
         body = request.get_json(silent=True) or {}
-        console_id = body.get("console_id") or body.get("consoleId")
-        game_id = body.get("game_id") or body.get("gameId") or body.get("GameId")
-        current_booking_id = body.get("current_booking_id") or body.get("currentBookingId") or body.get("booking_id")
-        user_id = body.get("user_id") or body.get("userId")
+        console_id = _coerce_int_value(body.get("console_id") or body.get("consoleId"))
+        game_id = _coerce_int_value(body.get("game_id") or body.get("gameId") or body.get("GameId"))
+        current_booking_id = _coerce_int_value(
+            body.get("current_booking_id") or body.get("currentBookingId") or body.get("booking_id")
+        )
+        user_id = _coerce_int_value(body.get("user_id") or body.get("userId"))
         access_code = body.get("access_code") or body.get("accessCode")
         auto_start = bool(body.get("auto_start") if body.get("auto_start") is not None else body.get("autoStart", True))
 
-        if not console_id:
+        if console_id is None:
             return jsonify({"success": False, "message": "console_id is required"}), 400
 
         if not current_booking_id:
             current_booking_id = _resolve_current_booking_id_for_console(
                 vendor_id=int(vendor_id),
                 console_id=int(console_id),
-                game_id=int(game_id) if game_id is not None else None,
-                user_id=int(user_id) if user_id is not None else None,
+                game_id=game_id,
+                user_id=user_id,
             )
 
         if not current_booking_id and access_code:
             current_booking_id = _resolve_booking_id_from_access_code(
                 vendor_id=int(vendor_id),
                 access_code=str(access_code),
-                game_id=int(game_id) if game_id is not None else None,
+                game_id=game_id,
             )
 
         if not current_booking_id:
@@ -7833,15 +8341,15 @@ def kiosk_book_next_slot(vendor_id):
         candidate, err = _resolve_extension_candidate(
             vendor_id=int(vendor_id),
             current_booking_id=int(current_booking_id),
-            requested_game_id=int(game_id) if game_id is not None else None,
+            requested_game_id=game_id,
         )
         if err and int(err.get("code", 500)) != 200:
             return jsonify({"success": False, "message": err.get("message")}), int(err.get("code", 500))
         if not candidate:
             return jsonify({"success": False, "message": err.get("message") if err else "No next slot found"}), 409
 
-        requested_slot_id = body.get("slot_id") or body.get("slotId")
-        if requested_slot_id and int(requested_slot_id) != int(candidate["next_slot_id"]):
+        requested_slot_id = _coerce_int_value(body.get("slot_id") or body.get("slotId"))
+        if requested_slot_id is not None and int(requested_slot_id) != int(candidate["next_slot_id"]):
             return jsonify({
                 "success": False,
                 "message": "Requested slot does not match immediate next slot candidate",
@@ -7859,6 +8367,36 @@ def kiosk_book_next_slot(vendor_id):
         vendor_slot_table = f"VENDOR_{int(vendor_id)}_SLOT"
         booking_table = f"VENDOR_{int(vendor_id)}_DASHBOARD"
         console_table = f"VENDOR_{int(vendor_id)}_CONSOLE_AVAILABILITY"
+
+        # Idempotency guard for kiosk retries/network retries:
+        # if continuation already exists for this current booking + next slot, return it.
+        existing_tx = (
+            Transaction.query
+            .filter(
+                Transaction.vendor_id == int(vendor_id),
+                Transaction.reference_id == f"kiosk-extension:{int(current_booking_id)}",
+            )
+            .order_by(Transaction.id.desc())
+            .first()
+        )
+        if existing_tx and existing_tx.booking_id:
+            existing_booking = Booking.query.filter_by(id=int(existing_tx.booking_id)).first()
+            if existing_booking and int(existing_booking.slot_id or 0) == int(candidate["next_slot_id"]):
+                existing_status = "current" if str(existing_booking.status or "").lower() == "checked_in" else "upcoming"
+                return jsonify({
+                    "success": True,
+                    "message": "Continuation slot already booked",
+                    "booking_id": int(existing_booking.id),
+                    "previous_booking_id": int(current_booking_id),
+                    "slot_id": int(candidate["next_slot_id"]),
+                    "book_status": existing_status,
+                    "auto_started": bool(str(existing_booking.status or "").lower() == "checked_in"),
+                    "settlement_status": str(existing_tx.settlement_status or "pending"),
+                    "amount_due": float(existing_tx.amount or 0.0),
+                    "payment_use_case": str(existing_tx.payment_use_case or "pay_at_cafe"),
+                    "start_time_ist": _to_ist_iso(candidate["next_start_dt"]),
+                    "end_time_ist": _to_ist_iso(candidate["next_end_dt"]),
+                }), 200
 
         # Lock and decrement slot capacity atomically.
         slot_row = db.session.execute(
@@ -7977,11 +8515,9 @@ def kiosk_book_next_slot(vendor_id):
             text(
                 f"""
                 INSERT INTO {booking_table}
-                    (book_id, game_id, date, start_time, end_time, book_status, console_id,
-                     username, user_id, game_name, status, extra_pay_status)
+                    (username, user_id, start_time, end_time, date, book_id, game_id, game_name, console_id, book_status)
                 VALUES
-                    (:book_id, :game_id, :booked_date, :start_time, :end_time, :book_status, :console_id,
-                     :username, :user_id, :game_name, TRUE, FALSE)
+                    (:username, :user_id, :start_time, :end_time, :booked_date, :book_id, :game_id, :game_name, :console_id, :book_status)
                 """
             ),
             {

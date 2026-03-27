@@ -11,8 +11,10 @@ class ExtraServiceMenu(db.Model):
     price = Column(Float, nullable=False)
     description = Column(String(500))
     is_active = Column(Boolean, default=True)
+    stock_quantity = Column(Integer, nullable=True)
+    stock_unit = Column(String(32), nullable=False, default='units')
+    low_stock_threshold = Column(Integer, nullable=False, default=0)
 
     category = relationship('ExtraServiceCategory', back_populates='menus')
     booking_extra_services = relationship('BookingExtraService', back_populates='extra_service_menu')
     images = relationship('ExtraServiceMenuImage', back_populates='menu_item')
-

@@ -43,3 +43,13 @@ class Config:
 
     # Optional pricing audit logging (guarded to avoid noisy prod logs)
     LOG_BOOKING_PRICING = os.getenv("LOG_BOOKING_PRICING", "false").lower() in ("true", "1", "t", "yes", "y")
+
+    # App cancellation policy (defaults tuned for low-noise app operations)
+    CANCELLATION_FEE_ENABLED = os.getenv("CANCELLATION_FEE_ENABLED", "true").lower() in ("true", "1", "t", "yes", "y")
+    CANCELLATION_FEE_PERCENT = float(os.getenv("CANCELLATION_FEE_PERCENT", "5") or 0)
+    CANCELLATION_FEE_FLAT = float(os.getenv("CANCELLATION_FEE_FLAT", "0") or 0)
+    CANCELLATION_FEE_MIN = float(os.getenv("CANCELLATION_FEE_MIN", "0") or 0)
+    CANCELLATION_FEE_MAX = float(os.getenv("CANCELLATION_FEE_MAX", "50") or 0)
+    CANCELLATION_FREE_BEFORE_MINUTES = int(os.getenv("CANCELLATION_FREE_BEFORE_MINUTES", "180") or 180)
+    CANCELLATION_FEE_APPLY_ON_PAY_AT_CAFE = os.getenv("CANCELLATION_FEE_APPLY_ON_PAY_AT_CAFE", "false").lower() in ("true", "1", "t", "yes", "y")
+    CANCELLATION_FEE_APPLY_ON_PASS = os.getenv("CANCELLATION_FEE_APPLY_ON_PASS", "false").lower() in ("true", "1", "t", "yes", "y")

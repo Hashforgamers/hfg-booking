@@ -26,6 +26,25 @@ services:
       RAZORPAY_KEY_ID: dummyValue
       RAZORPAY_KEY_SECRET: dummyvalue
 
+      # Cancellation policy defaults (app cancellations)
+      CANCELLATION_FEE_ENABLED: "true"
+      CANCELLATION_FEE_PERCENT: "5"
+      CANCELLATION_FEE_FLAT: "0"
+      CANCELLATION_FEE_MIN: "0"
+      CANCELLATION_FEE_MAX: "50"
+      CANCELLATION_FREE_BEFORE_MINUTES: "180"
+      CANCELLATION_FEE_APPLY_ON_PAY_AT_CAFE: "false"
+      CANCELLATION_FEE_APPLY_ON_PASS: "false"
+
+      # Pass OTP verification policy for dashboard pass redemptions
+      PASS_BOOKING_REQUIRE_OTP: "true"
+      PASS_BOOKING_OTP_TTL_SECONDS: "300"
+      PASS_BOOKING_OTP_RATE_LIMIT_SECONDS: "30"
+      PASS_BOOKING_OTP_MAX_ATTEMPTS: "5"
+      PASS_BOOKING_VERIFY_TTL_SECONDS: "900"
+      PASS_BOOKING_OTP_PUSH_ENABLED: "true"
+      USER_NOTIFICATION_ENDPOINT: "https://hfg-user-onboard.onrender.com/api/users/notifications/demo"
+
     volumes:
       - .:/app
 
