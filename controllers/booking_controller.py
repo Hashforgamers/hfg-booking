@@ -66,6 +66,7 @@ from models.hashWalletTransaction import HashWalletTransaction
 import time
 import json
 import base64
+import html
 import requests
 import hmac
 import hashlib
@@ -79,6 +80,7 @@ from utils.realtime import emit_booking_event
 
 import uuid
 from collections import defaultdict
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
 from utils.common import generate_fid, generate_access_code, get_razorpay_keys
 
@@ -2211,6 +2213,115 @@ def _send_vendor_booking_mail_async(app, mail_jobs):
         _ASYNC_EXECUTOR.submit(_runner)
 
 
+def _resolve_booking_public_base_url() -> str:
+    configured = str(current_app.config.get("BOOKING_PUBLIC_BASE_URL") or "").strip()
+    base = configured
+    if not base:
+        try:
+            base = str(request.url_root or "").strip()
+        except RuntimeError:
+            base = "https://hfg-booking.onrender.com"
+    base = base.rstrip("/")
+    if base.endswith("/api"):
+        base = base[:-4]
+    return base or "https://hfg-booking.onrender.com"
+
+
+def _resolve_dashboard_public_url() -> str:
+    return str(
+        current_app.config.get("DASHBOARD_PUBLIC_URL") or "https://dashboard.hashforgamers.com"
+    ).strip()
+
+
+def _pay_at_cafe_action_serializer() -> URLSafeTimedSerializer:
+    secret = str(
+        current_app.config.get("PAY_AT_CAFE_EMAIL_ACTION_SECRET")
+        or current_app.config.get("SECRET_KEY")
+        or "dev-secret-change-me"
+    )
+    return URLSafeTimedSerializer(secret_key=secret, salt="pay-at-cafe-email-action-v1")
+
+
+def _build_pay_at_cafe_email_action_url(booking_id: int, vendor_id: int, action: str) -> str:
+    serializer = _pay_at_cafe_action_serializer()
+    token = serializer.dumps({
+        "booking_id": int(booking_id),
+        "vendor_id": int(vendor_id),
+        "action": str(action or "").strip().lower(),
+    })
+    return f"{_resolve_booking_public_base_url()}/api/pay-at-cafe/email-action?token={token}"
+
+
+def _decode_pay_at_cafe_email_action_token(token: str):
+    token_value = str(token or "").strip()
+    if not token_value:
+        return None, "Missing action token"
+    try:
+        ttl_minutes = int(current_app.config.get("PAY_AT_CAFE_EMAIL_ACTION_TTL_MINUTES", 720) or 720)
+    except Exception:
+        ttl_minutes = 720
+    serializer = _pay_at_cafe_action_serializer()
+    try:
+        payload = serializer.loads(token_value, max_age=max(ttl_minutes, 1) * 60)
+    except SignatureExpired:
+        return None, "This action link has expired. Please open dashboard and review pending requests."
+    except BadSignature:
+        return None, "Invalid action token."
+
+    try:
+        booking_id = int(payload.get("booking_id"))
+        vendor_id = int(payload.get("vendor_id"))
+    except Exception:
+        return None, "Invalid action token payload."
+    action = str(payload.get("action") or "").strip().lower()
+    if action not in {"accept", "reject"}:
+        return None, "Unsupported action in token."
+    return {"booking_id": booking_id, "vendor_id": vendor_id, "action": action}, None
+
+
+def _render_pay_at_cafe_email_action_page(success: bool, title: str, message: str, dashboard_url: str = ""):
+    safe_title = html.escape(str(title or "Hash For Gamers"))
+    safe_message = html.escape(str(message or ""))
+    safe_dash = html.escape(str(dashboard_url or _resolve_dashboard_public_url()))
+    badge_bg = "#16a34a" if success else "#dc2626"
+    badge_text = "Success" if success else "Action Required"
+    return f"""<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>{safe_title}</title>
+  </head>
+  <body style="margin:0;padding:24px;background:#050912;font-family:Arial,Helvetica,sans-serif;color:#e5e7eb;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+      <tr>
+        <td align="center">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:620px;background:#0b1220;border:1px solid #1e2a44;border-radius:14px;overflow:hidden;">
+            <tr>
+              <td style="padding:20px 24px;background:linear-gradient(180deg,#040915,#0b1220);">
+                <img src="https://res.cloudinary.com/dxjjigepf/image/upload/v1774472024/hash_for_gamer_logo_d1v4wc.png" alt="Hash For Gamers" style="display:block;height:52px;width:auto;margin:0 0 8px 0;border-radius:10px;" />
+                <span style="display:inline-block;background:{badge_bg};color:#fff;padding:6px 10px;border-radius:999px;font-size:12px;font-weight:700;">{badge_text}</span>
+                <h1 style="margin:12px 0 0 0;font-size:24px;line-height:1.3;color:#fff;">{safe_title}</h1>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:24px;">
+                <p style="margin:0;color:#cbd5e1;font-size:15px;line-height:1.6;">{safe_message}</p>
+                <div style="margin-top:20px;">
+                  <a href="{safe_dash}" style="display:inline-block;padding:11px 18px;border-radius:8px;background:#2563eb;color:#fff;text-decoration:none;font-weight:700;">
+                    Open Dashboard
+                  </a>
+                </div>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>"""
+
+
 @booking_blueprint.route('/create_order', methods=['POST'])
 def create_order():
     data = request.get_json()
@@ -2479,6 +2590,21 @@ def create_booking():
                             "amount_paid": round(line_amount, 2),
                         })
 
+                    primary_booking_id = int(booking_details[0]["booking_id"]) if booking_details else None
+                    accept_action_url = None
+                    reject_action_url = None
+                    if primary_booking_id:
+                        accept_action_url = _build_pay_at_cafe_email_action_url(
+                            booking_id=primary_booking_id,
+                            vendor_id=int(vendor_id),
+                            action="accept",
+                        )
+                        reject_action_url = _build_pay_at_cafe_email_action_url(
+                            booking_id=primary_booking_id,
+                            vendor_id=int(vendor_id),
+                            action="reject",
+                        )
+
                     _send_vendor_booking_mail_async(
                         current_app._get_current_object(),
                         [{
@@ -2493,6 +2619,9 @@ def create_booking():
                             "net_total_paid": round(total_estimated, 2),
                             "notification_type": "booking_requested",
                             "gamer_name": (user_obj.name if user_obj else username) or None,
+                            "accept_action_url": accept_action_url,
+                            "reject_action_url": reject_action_url,
+                            "dashboard_url": _resolve_dashboard_public_url(),
                         }]
                     )
             except Exception as vendor_mail_err:
@@ -7080,6 +7209,104 @@ def get_pending_pay_at_cafe_bookings(vendor_id):
             'success': False,
             'error': str(e)
         }), 500
+
+
+@booking_blueprint.route('/pay-at-cafe/email-action', methods=['GET'])
+def pay_at_cafe_email_action():
+    """
+    One-click email action endpoint for vendor to accept/reject pay-at-cafe requests.
+    """
+    dashboard_url = _resolve_dashboard_public_url()
+    token = request.args.get("token")
+    token_payload, token_error = _decode_pay_at_cafe_email_action_token(token)
+    if token_error:
+        page = _render_pay_at_cafe_email_action_page(
+            success=False,
+            title="Invalid Action Link",
+            message=token_error,
+            dashboard_url=dashboard_url,
+        )
+        return page, 400, {"Content-Type": "text/html; charset=utf-8"}
+
+    booking_id = int(token_payload["booking_id"])
+    vendor_id = int(token_payload["vendor_id"])
+    action = token_payload["action"]
+    action_url = (
+        f"{_resolve_booking_public_base_url()}/api/pay-at-cafe/accept"
+        if action == "accept"
+        else f"{_resolve_booking_public_base_url()}/api/pay-at-cafe/reject"
+    )
+    action_payload = {
+        "booking_id": booking_id,
+        "vendor_id": vendor_id,
+    }
+    if action == "reject":
+        action_payload["rejection_reason"] = "Rejected using secure email action link"
+
+    try:
+        upstream = requests.post(action_url, json=action_payload, timeout=12)
+    except Exception as exc:
+        current_app.logger.exception(
+            "pay_at_cafe.email_action upstream call failed booking_id=%s vendor_id=%s action=%s error=%s",
+            booking_id,
+            vendor_id,
+            action,
+            exc,
+        )
+        page = _render_pay_at_cafe_email_action_page(
+            success=False,
+            title="Could Not Process Action",
+            message="We could not process your request right now. Please retry from dashboard.",
+            dashboard_url=dashboard_url,
+        )
+        return page, 502, {"Content-Type": "text/html; charset=utf-8"}
+
+    upstream_json = {}
+    try:
+        upstream_json = upstream.json() if upstream.content else {}
+    except Exception:
+        upstream_json = {}
+
+    upstream_message = (
+        str(upstream_json.get("message") or "").strip()
+        or str(upstream_json.get("error") or "").strip()
+        or f"Request failed with status {upstream.status_code}"
+    )
+
+    if upstream.ok and bool(upstream_json.get("success", True)):
+        title = "Booking Accepted" if action == "accept" else "Booking Rejected"
+        message = (
+            "Pay at Cafe booking request was accepted successfully."
+            if action == "accept"
+            else "Pay at Cafe booking request was rejected successfully."
+        )
+        page = _render_pay_at_cafe_email_action_page(
+            success=True,
+            title=title,
+            message=message,
+            dashboard_url=dashboard_url,
+        )
+        return page, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+    # If already processed, show user-friendly state instead of error wall.
+    normalized_message = upstream_message.lower()
+    already_processed = "not pending acceptance" in normalized_message or "booking is not pending" in normalized_message
+    if already_processed:
+        page = _render_pay_at_cafe_email_action_page(
+            success=True,
+            title="Request Already Processed",
+            message="This pay-at-cafe request was already accepted/rejected earlier.",
+            dashboard_url=dashboard_url,
+        )
+        return page, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+    page = _render_pay_at_cafe_email_action_page(
+        success=False,
+        title="Action Failed",
+        message=upstream_message,
+        dashboard_url=dashboard_url,
+    )
+    return page, 400, {"Content-Type": "text/html; charset=utf-8"}
 
 @booking_blueprint.route('/pay-at-cafe/accept', methods=['POST'])
 def accept_pay_at_cafe_booking():

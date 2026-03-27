@@ -53,3 +53,11 @@ class Config:
     CANCELLATION_FREE_BEFORE_MINUTES = int(os.getenv("CANCELLATION_FREE_BEFORE_MINUTES", "180") or 180)
     CANCELLATION_FEE_APPLY_ON_PAY_AT_CAFE = os.getenv("CANCELLATION_FEE_APPLY_ON_PAY_AT_CAFE", "false").lower() in ("true", "1", "t", "yes", "y")
     CANCELLATION_FEE_APPLY_ON_PASS = os.getenv("CANCELLATION_FEE_APPLY_ON_PASS", "false").lower() in ("true", "1", "t", "yes", "y")
+
+    # Public URLs for email action links
+    BOOKING_PUBLIC_BASE_URL = os.getenv("BOOKING_PUBLIC_BASE_URL", "").strip()
+    DASHBOARD_PUBLIC_URL = os.getenv("DASHBOARD_PUBLIC_URL", "https://dashboard.hashforgamers.com").strip()
+
+    # Pay-at-cafe email action token settings
+    PAY_AT_CAFE_EMAIL_ACTION_SECRET = os.getenv("PAY_AT_CAFE_EMAIL_ACTION_SECRET", SECRET_KEY)
+    PAY_AT_CAFE_EMAIL_ACTION_TTL_MINUTES = int(os.getenv("PAY_AT_CAFE_EMAIL_ACTION_TTL_MINUTES", "720") or 720)

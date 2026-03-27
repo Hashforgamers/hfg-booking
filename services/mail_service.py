@@ -315,6 +315,9 @@ def vendor_booking_notification_mail(
     net_total_paid=None,
     notification_type="booking_confirmed",
     gamer_name=None,
+    accept_action_url=None,
+    reject_action_url=None,
+    dashboard_url=None,
 ):
     booking_rows = "".join(
         f"""
@@ -342,10 +345,46 @@ def vendor_booking_notification_mail(
     )
     amount_label = "Estimated Amount" if is_pending_request else "Total Paid"
     action_note = (
-        "Please review this request in your Pay at Cafe panel."
+        "Use the quick action buttons below, or review this request in your Pay at Cafe panel."
         if is_pending_request
         else "Please prepare the slot for the customer."
     )
+    action_buttons = ""
+    if is_pending_request and (accept_action_url or reject_action_url):
+        button_cells = []
+        if accept_action_url:
+            button_cells.append(
+                f"""
+                <td style=\"padding:0 8px 0 0;\">
+                    <a href=\"{html.escape(str(accept_action_url))}\"
+                       style=\"display:inline-block;padding:10px 18px;border-radius:8px;background:#16a34a;color:#ffffff;text-decoration:none;font-weight:700;\">
+                        Accept
+                    </a>
+                </td>
+                """
+            )
+        if reject_action_url:
+            button_cells.append(
+                f"""
+                <td style=\"padding:0;\">
+                    <a href=\"{html.escape(str(reject_action_url))}\"
+                       style=\"display:inline-block;padding:10px 18px;border-radius:8px;background:#dc2626;color:#ffffff;text-decoration:none;font-weight:700;\">
+                        Reject
+                    </a>
+                </td>
+                """
+            )
+        action_buttons = f"""
+        <div style=\"margin-top:18px;\">
+          <div style=\"margin:0 0 8px 0;color:#cbd5e1;font-size:13px;\">Quick Actions</div>
+          <table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\">
+            <tr>
+              {''.join(button_cells)}
+            </tr>
+          </table>
+          {f'<p style="margin:10px 0 0 0;color:#94a3b8;font-size:12px;">Open dashboard: <a href="{html.escape(str(dashboard_url))}" style="color:#60a5fa;text-decoration:none;">{html.escape(str(dashboard_url))}</a></p>' if dashboard_url else ''}
+        </div>
+        """
 
     content = f"""
     <p style=\"margin:0 0 8px 0;\">Hello <strong>{_safe(cafe_name)}</strong>,</p>
@@ -373,6 +412,7 @@ def vendor_booking_notification_mail(
     </table>
 
     <p style=\"margin-top:16px;color:#cbd5e1;\">{_safe(action_note)}</p>
+    {action_buttons}
     """
 
     send_email(
