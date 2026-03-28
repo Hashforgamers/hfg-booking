@@ -198,10 +198,11 @@ def _consume_menu_stock(menu_item, quantity: int):
     menu_item.stock_quantity = max(0, available_qty - requested)
 
 
-def resolve_app_fee_amount(amount: float, payload=None) -> float:
+def resolve_app_fee_amount(amount: float, payload=None, source_channel=None) -> float:
     """
     Resolve app fee (platform fee) for transparency.
-    Priority: explicit app_fee_amount > app_fee_percent > config defaults.
+    App fee must be applied only for app-origin bookings.
+    Priority (for app-origin only): explicit app_fee_amount > app_fee_percent > config defaults.
     """
     try:
         amount_val = max(float(amount or 0.0), 0.0)
@@ -209,6 +210,17 @@ def resolve_app_fee_amount(amount: float, payload=None) -> float:
         amount_val = 0.0
 
     data = payload or {}
+    resolved_source = str(
+        source_channel
+        or data.get("source_channel")
+        or data.get("sourceChannel")
+        or data.get("booking_source")
+        or data.get("bookingSource")
+        or ""
+    ).strip().lower()
+    if resolved_source and resolved_source != "app":
+        return 0.0
+
     explicit_amount_present = ("app_fee_amount" in data) or ("appFeeAmount" in data)
     explicit_percent_present = ("app_fee_percent" in data) or ("appFeePercent" in data)
 
@@ -825,12 +837,15 @@ def _safe_decode_jwt_claims(token: str):
         return {}
 
 
-def resolve_transaction_actor(request_obj):
+def resolve_transaction_actor(request_obj, default_source="app"):
     """
     Resolve source + staff attribution for transaction audit logs.
     """
     source_header = (request_obj.headers.get("X-Client-Source") or "").strip().lower()
-    source_channel = source_header if source_header in {"app", "dashboard"} else "app"
+    fallback_source = str(default_source or "app").strip().lower()
+    if fallback_source not in {"app", "dashboard", "kiosk"}:
+        fallback_source = "app"
+    source_channel = source_header if source_header in {"app", "dashboard", "kiosk"} else fallback_source
 
     actor = {
         "source_channel": source_channel,
@@ -1860,7 +1875,11 @@ def booking_pricing_preview():
             + float(extra_controller_fare or 0.0),
             0.0
         )
-        app_fee_amount = resolve_app_fee_amount(final_amount, data)
+        app_fee_amount = resolve_app_fee_amount(
+            final_amount,
+            data,
+            source_channel=(request.headers.get("X-Client-Source") or data.get("source_channel") or "dashboard"),
+        )
 
         if squad_enabled:
             normalized_squad_details["discount_per_slot"] = round(
@@ -2001,7 +2020,11 @@ def booking_pricing_estimate():
                 extra_controller_fare = float(computed_controller_fare or 0.0)
 
         estimated_final_amount = max((slot_base_price - squad_discount_amount) + extra_controller_fare, 0.0)
-        app_fee_amount = resolve_app_fee_amount(estimated_final_amount, payload)
+        app_fee_amount = resolve_app_fee_amount(
+            estimated_final_amount,
+            payload,
+            source_channel=(request.headers.get("X-Client-Source") or payload.get("source_channel") or "dashboard"),
+        )
 
         if squad_enabled:
             normalized_squad_details["discount_per_slot"] = round(float(squad_discount_amount or 0.0), 2)
@@ -3746,7 +3769,7 @@ def confirm_booking():
             booking.updated_at = datetime.utcnow()
             booking.access_code_id = access_code_entry.id
 
-            app_fee_amount = resolve_app_fee_amount(amount_payable, data)
+            app_fee_amount = resolve_app_fee_amount(amount_payable, data, source_channel="app")
             payment_use_case = normalize_payment_use_case(payment_mode_used, "app")
             settlement_status = resolve_settlement_status(payment_use_case)
 
@@ -3951,7 +3974,11 @@ def confirm_booking():
                         float(extra_controller_fare_total or 0.0)
                     )
                 controller_payment_mode = "wallet" if payment_mode == "wallet" else "payment_gateway"
-                controller_app_fee = resolve_app_fee_amount(float(extra_controller_fare_total or 0.0), data)
+                controller_app_fee = resolve_app_fee_amount(
+                    float(extra_controller_fare_total or 0.0),
+                    data,
+                    source_channel="app",
+                )
                 controller_transaction = Transaction(
                     booking_id=controller_booking.id,
                     vendor_id=controller_vendor.id,
@@ -4203,7 +4230,7 @@ def direct_booking():
         for booking in bookings:
             slot_obj = slot_lookup.get(int(booking.slot_id))
             unit_price = float(get_effective_price_for_schedule(vendor_id, available_game, booked_date_obj, slot_obj) or 0.0)
-            app_fee_amount = resolve_app_fee_amount(unit_price, data)
+            app_fee_amount = resolve_app_fee_amount(unit_price, data, source_channel="dashboard")
             transaction = Transaction(
                 booking_id=booking.id,  # Linking each booking
                 vendor_id=vendor_id,
@@ -5360,7 +5387,7 @@ def new_booking(vendor_id):
                 max(total_base_before_discount - total_discount, 0.0), 2
             )
 
-        actor = resolve_transaction_actor(request)
+        actor = resolve_transaction_actor(request, default_source="dashboard")
         payment_use_case = normalize_payment_use_case(payment_type, actor["source_channel"])
         settlement_status = resolve_settlement_status(payment_use_case)
         credit_account = None
@@ -5401,7 +5428,11 @@ def new_booking(vendor_id):
             discounted_amount = waive_off_per_slot + slot_discount
             final_amount = max(original_amount - discounted_amount, 0.0)
             gst = calculate_gst_breakdown(vendor_id, final_amount)
-            app_fee_amount = resolve_app_fee_amount(final_amount, data)
+            app_fee_amount = resolve_app_fee_amount(
+                final_amount,
+                data,
+                source_channel=actor["source_channel"],
+            )
 
             transaction = Transaction(
                 booking_id=booking.id,
@@ -5462,7 +5493,11 @@ def new_booking(vendor_id):
         # Handle extra controller fare
         if extra_controller_fare > 0:
             gst = calculate_gst_breakdown(vendor_id, extra_controller_fare)
-            app_fee_amount = resolve_app_fee_amount(extra_controller_fare, data)
+            app_fee_amount = resolve_app_fee_amount(
+                extra_controller_fare,
+                data,
+                source_channel=actor["source_channel"],
+            )
             controller_transaction = Transaction(
                 booking_id=bookings[0].id,
                 vendor_id=vendor_id,
@@ -5679,7 +5714,11 @@ def new_booking(vendor_id):
                     "total_price": detail['total_price']
                 })
 
-        app_fee_total = resolve_app_fee_amount(total_paid, data)
+        app_fee_total = resolve_app_fee_amount(
+            total_paid,
+            data,
+            source_channel=actor["source_channel"],
+        )
         try:
             booking_mail(
                 gamer_name=name,
@@ -6493,7 +6532,7 @@ def extra_booking():
         waive_off_amount = float(data.get("waiveOffAmount", 0.0))
         reference_id = data.get("reference_id")
 
-        actor = resolve_transaction_actor(request)
+        actor = resolve_transaction_actor(request, default_source="dashboard")
         payment_use_case = normalize_payment_use_case(mode_of_payment, actor["source_channel"])
         settlement_status = resolve_settlement_status(payment_use_case)
         credit_account = None
@@ -6542,7 +6581,11 @@ def extra_booking():
         original_amount = amount * effective_multiplier
         discounted_amount = waive_off_amount
         final_amount = max(original_amount - discounted_amount, 0.0)
-        app_fee_amount = resolve_app_fee_amount(final_amount, data)
+        app_fee_amount = resolve_app_fee_amount(
+            final_amount,
+            data,
+            source_channel=actor["source_channel"],
+        )
         if credit_account:
             credit_limit_error = validate_monthly_credit_capacity(credit_account, final_amount)
             if credit_limit_error:
@@ -7817,7 +7860,7 @@ def accept_pay_at_cafe_booking():
             final_amount = float(pricing.get("final_amount") or 0.0)
             controller_amount = float(pricing.get("controller_amount") or 0.0)
             controller_qty = int(pricing.get("controller_qty") or 0)
-            app_fee_amount = resolve_app_fee_amount(final_amount, data)
+            app_fee_amount = resolve_app_fee_amount(final_amount, data, source_channel="app")
 
             updated_details["pricing_mode"] = pricing.get("pricing_mode")
             updated_details["console_group"] = pricing.get("console_group")
@@ -8319,7 +8362,7 @@ def add_meals_to_booking(booking_id):
             updated_squad_details["member_meal_ledger"] = ledger
             booking.squad_details = updated_squad_details
         
-        actor = resolve_transaction_actor(request)
+        actor = resolve_transaction_actor(request, default_source="dashboard")
         # Default behavior for in-session meal additions:
         # keep transaction pending and settle at end of session from Extra Payment overlay.
         settle_on_release = bool(data.get("settle_on_release", True))
@@ -8342,7 +8385,11 @@ def add_meals_to_booking(booking_id):
         booking_date = datetime.utcnow().date()
         gst = calculate_gst_breakdown(vendor_id, total_meals_cost)
         
-        app_fee_amount = resolve_app_fee_amount(total_meals_cost, data)
+        app_fee_amount = resolve_app_fee_amount(
+            total_meals_cost,
+            data,
+            source_channel=actor["source_channel"],
+        )
         additional_transaction = Transaction(
             booking_id=booking_id,
             vendor_id=vendor_id,
@@ -9138,7 +9185,7 @@ def kiosk_book_next_slot(vendor_id):
         db.session.flush()
 
         final_amount = round(float(candidate["price"]), 2)
-        app_fee_amount = resolve_app_fee_amount(final_amount, body)
+        app_fee_amount = resolve_app_fee_amount(final_amount, body, source_channel="kiosk")
         gst = calculate_gst_breakdown(int(vendor_id), final_amount)
         tx_mode = str(body.get("paymentType") or body.get("modeOfPayment") or "cash").strip().lower() or "cash"
 
