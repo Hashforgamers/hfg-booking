@@ -1068,6 +1068,16 @@ def _booking_slot_start_datetime_ist(booking, booked_date):
     return IST.localize(local_dt)
 
 
+def _is_no_show_eligible(booking, booked_date):
+    slot_start = _booking_slot_start_datetime_ist(booking, booked_date)
+    if not slot_start:
+        return False, "Slot start time is unavailable."
+    now_ist = datetime.now(IST)
+    if now_ist < slot_start:
+        return False, "No-show can be marked only after slot start time."
+    return True, ""
+
+
 def _resolve_cancellation_fee(booking, paid_amount: float, is_pay_at_cafe: bool, is_pass_payment: bool):
     if paid_amount <= 0:
         return 0.0
@@ -1098,6 +1108,44 @@ def _resolve_cancellation_fee(booking, paid_amount: float, is_pay_at_cafe: bool,
     flat = max(_safe_float(current_app.config.get("CANCELLATION_FEE_FLAT", 0), 0), 0.0)
     minimum = max(_safe_float(current_app.config.get("CANCELLATION_FEE_MIN", 0), 0), 0.0)
     maximum = max(_safe_float(current_app.config.get("CANCELLATION_FEE_MAX", 50), 50), 0.0)
+
+    fee = 0.0
+    if flat > 0:
+        fee = flat
+    elif percent > 0:
+        fee = (paid_amount * percent) / 100.0
+
+    if minimum > 0:
+        fee = max(fee, minimum)
+    if maximum > 0:
+        fee = min(fee, maximum)
+
+    fee = min(max(fee, 0.0), paid_amount)
+    return round(fee, 2)
+
+
+def _resolve_no_show_fee(paid_amount: float, is_pay_at_cafe: bool, is_pass_payment: bool):
+    if paid_amount <= 0:
+        return 0.0
+
+    enabled = bool(current_app.config.get("NO_SHOW_FEE_ENABLED", True))
+    if not enabled:
+        return 0.0
+
+    if is_pay_at_cafe:
+        apply_pay_at_cafe = bool(current_app.config.get("NO_SHOW_FEE_APPLY_ON_PAY_AT_CAFE", False))
+        if not apply_pay_at_cafe:
+            return 0.0
+
+    if is_pass_payment:
+        apply_pass = bool(current_app.config.get("NO_SHOW_FEE_APPLY_ON_PASS", True))
+        if not apply_pass:
+            return 0.0
+
+    percent = max(_safe_float(current_app.config.get("NO_SHOW_FEE_PERCENT", 100), 100), 0.0)
+    flat = max(_safe_float(current_app.config.get("NO_SHOW_FEE_FLAT", 0), 0), 0.0)
+    minimum = max(_safe_float(current_app.config.get("NO_SHOW_FEE_MIN", 0), 0), 0.0)
+    maximum = max(_safe_float(current_app.config.get("NO_SHOW_FEE_MAX", paid_amount), paid_amount), 0.0)
 
     fee = 0.0
     if flat > 0:
@@ -1151,13 +1199,20 @@ def _release_slot_for_booking(booking, vendor_id: int, booked_date):
     try:
         if not booking or not booking.slot_id or not vendor_id or not booked_date:
             return False
+        squad_details = booking.squad_details if isinstance(booking.squad_details, dict) else {}
+        slot_units = (
+            int(squad_details.get("player_count", 1))
+            if bool(squad_details.get("enabled")) and str(squad_details.get("console_group", "")).lower() == "pc"
+            else 1
+        )
+        slot_units = max(slot_units, 1)
         db.session.execute(
             text(f"""
                 UPDATE VENDOR_{int(vendor_id)}_SLOT
-                SET available_slot = available_slot + 1, is_available = TRUE
+                SET available_slot = available_slot + :slot_units, is_available = TRUE
                 WHERE slot_id = :slot_id AND date = :booked_date
             """),
-            {"slot_id": int(booking.slot_id), "booked_date": booked_date}
+            {"slot_id": int(booking.slot_id), "booked_date": booked_date, "slot_units": slot_units}
         )
         return True
     except Exception as e:
@@ -5891,7 +5946,7 @@ def cancel_bookings_with_refund(
     cancellation_fee_total = 0.0
     pass_hours_restored_total = 0.0
 
-    terminal_statuses = {"cancelled", "canceled", "rejected", "completed", "discarded"}
+    terminal_statuses = {"cancelled", "canceled", "rejected", "completed", "discarded", "no_show"}
     non_cancellable_statuses = {"checked_in", "current", "started", "running", "in_progress"}
     user_pass_cache = {}
     booking_event_meta = {}
@@ -6223,6 +6278,397 @@ def cancel_bookings_app_route():
         current_app.logger.exception("Failed to cancel booking from app")
         db.session.rollback()
         return jsonify({"success": False, "message": "Failed to cancel booking", "error": str(e)}), 500
+
+
+def mark_bookings_no_show(
+    booking_ids,
+    reason=None,
+    actor_scope="dashboard",
+    actor_user_id=None,
+    enforce_user_ownership=False,
+    apply_no_show_fee=True,
+):
+    if not booking_ids:
+        raise ValueError("booking_id or booking_ids required")
+
+    parsed_ids = []
+    for booking_id in booking_ids:
+        try:
+            parsed_ids.append(int(booking_id))
+        except (TypeError, ValueError):
+            continue
+    parsed_ids = list(dict.fromkeys(parsed_ids))
+    if not parsed_ids:
+        raise ValueError("booking_id or booking_ids required")
+
+    actor = resolve_transaction_actor(request)
+    normalized_scope = str(actor_scope or "").strip().lower()
+    actor_source = normalized_scope if normalized_scope in {"app", "dashboard", "kiosk"} else actor["source_channel"]
+    now_utc = datetime.utcnow()
+
+    booking_rows = (
+        Booking.query
+        .options(joinedload(Booking.slot), joinedload(Booking.game))
+        .filter(Booking.id.in_(parsed_ids))
+        .all()
+    )
+    if not booking_rows:
+        raise ValueError("Booking not found")
+
+    booking_map = {int(b.id): b for b in booking_rows}
+    ordered_bookings = [booking_map[booking_id] for booking_id in parsed_ids if booking_id in booking_map]
+
+    tx_rows = (
+        db.session.query(Transaction)
+        .filter(Transaction.booking_id.in_(parsed_ids))
+        .order_by(Transaction.id.asc())
+        .all()
+    )
+    tx_by_booking = defaultdict(list)
+    for tx in tx_rows:
+        tx_by_booking[int(tx.booking_id)].append(tx)
+
+    no_show_ids = []
+    skipped_ids = []
+    skipped_details = []
+    unauthorized_ids = []
+    booking_summaries = []
+    refund_total = 0.0
+    no_show_fee_total = 0.0
+    writeoff_total = 0.0
+    wallet_credit_total = 0.0
+    booking_event_meta = {}
+
+    terminal_statuses = {"cancelled", "canceled", "rejected", "completed", "discarded", "no_show"}
+    non_no_show_statuses = {"checked_in", "current", "started", "running", "in_progress"}
+
+    for booking in ordered_bookings:
+        booking_id = int(booking.id)
+
+        if enforce_user_ownership and actor_user_id is not None and int(booking.user_id or 0) != int(actor_user_id):
+            unauthorized_ids.append(booking_id)
+            continue
+
+        status = str(booking.status or "").strip().lower()
+        if status in terminal_statuses or status in non_no_show_statuses:
+            skipped_ids.append(booking_id)
+            skipped_details.append({
+                "booking_id": booking_id,
+                "reason": f"Booking status '{status or 'unknown'}' is not eligible for no-show.",
+            })
+            continue
+
+        booking_txs = tx_by_booking.get(booking_id, [])
+        tx = None
+        if booking_txs:
+            preferred = [
+                t for t in booking_txs
+                if str(t.booking_type or "").strip().lower() in {
+                    "booking", "regular", "pay_at_cafe", "direct", "date_pass", "hour_pass", ""
+                }
+            ]
+            tx = preferred[0] if preferred else booking_txs[0]
+
+        booked_date = resolve_booking_booked_date(booking)
+        vendor_id = int(getattr(booking.game, "vendor_id", 0) or getattr(tx, "vendor_id", 0) or 0) or None
+        eligible, eligibility_reason = _is_no_show_eligible(booking, booked_date)
+        if not eligible:
+            skipped_ids.append(booking_id)
+            skipped_details.append({
+                "booking_id": booking_id,
+                "reason": eligibility_reason or "Booking is not eligible for no-show.",
+            })
+            continue
+
+        _release_slot_for_booking(booking, vendor_id, booked_date)
+        if vendor_id:
+            try:
+                db.session.execute(
+                    text(f"""
+                        UPDATE VENDOR_{int(vendor_id)}_DASHBOARD
+                        SET book_status = 'discarded'
+                        WHERE book_id = :book_id
+                    """),
+                    {"book_id": booking_id},
+                )
+            except Exception as dashboard_update_err:
+                current_app.logger.warning(
+                    "Dashboard table no-show sync failed vendor=%s booking_id=%s err=%s",
+                    vendor_id,
+                    booking_id,
+                    dashboard_update_err,
+                )
+
+        payment_use_case = str(getattr(tx, "payment_use_case", "") or getattr(tx, "mode_of_payment", "")).strip().lower()
+        settlement_status = str(getattr(tx, "settlement_status", "")).strip().lower()
+        payment_mode = str(getattr(tx, "mode_of_payment", "")).strip().lower()
+        paid_amount = max(_safe_float(getattr(tx, "amount", 0.0), 0.0), 0.0)
+
+        is_pass_payment = (
+            payment_use_case in {"pass", "cafe_pass", "global_pass"}
+            or payment_mode in {"date_pass", "hour_pass", "pass"}
+        )
+        is_pay_at_cafe = (
+            payment_use_case == "pay_at_cafe"
+            or payment_mode == "pay_at_cafe"
+            or settlement_status in {"pending", "unpaid", "due"}
+        )
+
+        no_show_fee = (
+            _resolve_no_show_fee(
+                paid_amount=paid_amount,
+                is_pay_at_cafe=is_pay_at_cafe,
+                is_pass_payment=is_pass_payment,
+            )
+            if apply_no_show_fee
+            else 0.0
+        )
+        no_show_fee = min(no_show_fee, paid_amount)
+        refund_amount = round(max(paid_amount - no_show_fee, 0.0), 2)
+        wallet_credit_amount = 0.0
+        writeoff_amount = 0.0
+        repayment_type = "none"
+
+        # Pay-at-cafe pending amount should not remain in pending pipeline when marked no-show.
+        if tx and is_pay_at_cafe and settlement_status in {"pending", "unpaid", "due"}:
+            writeoff_amount = round(max(paid_amount - no_show_fee, 0.0), 2)
+            tx.settlement_status = "pending" if no_show_fee > 0 else "no_show_waived"
+            tx.amount = round(no_show_fee, 2) if no_show_fee > 0 else 0.0
+            if no_show_fee <= 0:
+                tx.app_fee_amount = 0.0
+
+            if writeoff_amount > 0:
+                writeoff_tx = Transaction(
+                    booking_id=booking.id,
+                    vendor_id=tx.vendor_id,
+                    user_id=booking.user_id,
+                    booked_date=booked_date,
+                    booking_date=now_utc.date(),
+                    booking_time=now_utc.time(),
+                    user_name=f"{tx.user_name} NO_SHOW_WRITEOFF-{tx.id}",
+                    original_amount=-writeoff_amount,
+                    discounted_amount=0,
+                    amount=-writeoff_amount,
+                    mode_of_payment=tx.mode_of_payment,
+                    payment_use_case="no_show",
+                    booking_type="no_show_writeoff",
+                    settlement_status="processed",
+                    source_channel=actor_source,
+                    initiated_by_staff_id=actor["staff_id"],
+                    initiated_by_staff_name=actor["staff_name"],
+                    initiated_by_staff_role=actor["staff_role"],
+                    app_fee_amount=0.0,
+                )
+                db.session.add(writeoff_tx)
+                writeoff_total += writeoff_amount
+        else:
+            if refund_amount > 0:
+                repayment_type = _default_repayment_type(payment_use_case)
+                if repayment_type == "credit":
+                    wallet_credit_amount = float(
+                        _credit_wallet_for_cancellation(
+                            user_id=int(booking.user_id),
+                            booking_id=booking_id,
+                            amount=refund_amount,
+                        )
+                    )
+                    wallet_credit_total += wallet_credit_amount
+                else:
+                    if tx:
+                        refund_tx = Transaction(
+                            booking_id=booking.id,
+                            vendor_id=tx.vendor_id,
+                            user_id=booking.user_id,
+                            booked_date=booked_date,
+                            booking_date=now_utc.date(),
+                            booking_time=now_utc.time(),
+                            user_name=f"{tx.user_name} NO_SHOW_REFUND-{tx.id}",
+                            original_amount=-refund_amount,
+                            discounted_amount=0,
+                            amount=-refund_amount,
+                            mode_of_payment=tx.mode_of_payment,
+                            payment_use_case=tx.payment_use_case,
+                            booking_type="no_show_refund",
+                            settlement_status="processed",
+                            source_channel=actor_source,
+                            initiated_by_staff_id=actor["staff_id"],
+                            initiated_by_staff_name=actor["staff_name"],
+                            initiated_by_staff_role=actor["staff_role"],
+                            app_fee_amount=0.0,
+                        )
+                        db.session.add(refund_tx)
+                        refund_total += refund_amount
+
+        booking.status = "no_show"
+        booking.updated_at = now_utc
+        if isinstance(booking.squad_details, dict):
+            next_details = dict(booking.squad_details)
+            next_details["settlement_status"] = (
+                str(getattr(tx, "settlement_status", "")).strip().lower()
+                if tx and getattr(tx, "settlement_status", None)
+                else next_details.get("settlement_status")
+            )
+            next_details["no_show_marked_at"] = now_utc.isoformat()
+            if reason:
+                next_details["no_show_reason"] = str(reason)
+            booking.squad_details = next_details
+
+        no_show_ids.append(booking_id)
+        no_show_fee_total += no_show_fee
+
+        summary = {
+            "booking_id": booking_id,
+            "status": "no_show",
+            "repayment_type": repayment_type,
+            "refund_amount": round(refund_amount, 2),
+            "wallet_credit_amount": round(wallet_credit_amount, 2),
+            "no_show_fee": round(no_show_fee, 2),
+            "writeoff_amount": round(writeoff_amount, 2),
+            "payment_use_case": payment_use_case or None,
+            "is_pay_at_cafe": is_pay_at_cafe,
+        }
+        booking_summaries.append(summary)
+        booking_event_meta[booking_id] = summary
+
+    db.session.commit()
+
+    socketio = current_app.extensions.get('socketio')
+    for booking in ordered_bookings:
+        booking_id = int(booking.id)
+        if booking_id not in no_show_ids:
+            continue
+
+        vendor_id = int(getattr(booking.game, "vendor_id", 0) or 0) or None
+        booking_summary = booking_event_meta.get(booking_id, {})
+        try:
+            payload = {
+                "booking_id": booking_id,
+                "slot_id": booking.slot_id,
+                "vendor_id": vendor_id,
+                "user_id": booking.user_id,
+                "game_id": booking.game_id,
+                "status": "no_show",
+                "booking_status": "discarded",
+                "date": resolve_booking_booked_date(booking).isoformat(),
+            }
+            emit_booking_event(socketio, event="booking", data=payload, vendor_id=vendor_id)
+        except Exception:
+            current_app.logger.warning("Failed emitting booking no_show event booking_id=%s", booking.id)
+
+        if socketio:
+            update_payload = {
+                "vendorId": vendor_id,
+                "bookingId": booking_id,
+                "event": "booking_no_show",
+                "status": "no_show",
+                "booking_status": "discarded",
+                "no_show_fee": float(booking_summary.get("no_show_fee") or 0.0),
+                "refund_total": float(booking_summary.get("refund_amount") or 0.0),
+                "wallet_credit_amount": float(booking_summary.get("wallet_credit_amount") or 0.0),
+                "writeoff_amount": float(booking_summary.get("writeoff_amount") or 0.0),
+                "repayment_type": booking_summary.get("repayment_type") or "none",
+                "payment_use_case": booking_summary.get("payment_use_case"),
+                "reason": reason,
+            }
+            try:
+                socketio.emit(
+                    "booking_payment_update",
+                    update_payload,
+                    to=f"vendor_{int(vendor_id)}" if vendor_id else None,
+                )
+            except TypeError:
+                socketio.emit(
+                    "booking_payment_update",
+                    update_payload,
+                    room=f"vendor_{int(vendor_id)}" if vendor_id else None,
+                )
+
+    return {
+        "success": len(no_show_ids) > 0,
+        "message": "Booking marked as no-show" if no_show_ids else "No eligible booking marked as no-show",
+        "no_show_ids": no_show_ids,
+        "skipped_ids": skipped_ids,
+        "skipped_details": skipped_details,
+        "unauthorized_ids": unauthorized_ids,
+        "refund_total": round(float(refund_total or 0.0), 2),
+        "wallet_credit_total": round(float(wallet_credit_total or 0.0), 2),
+        "no_show_fee_total": round(float(no_show_fee_total or 0.0), 2),
+        "writeoff_total": round(float(writeoff_total or 0.0), 2),
+        "reason": reason,
+        "bookings": booking_summaries,
+    }
+
+
+@booking_blueprint.route('/bookings/no-show', methods=['POST'])
+def mark_bookings_no_show_route():
+    try:
+        data = request.get_json(silent=True) or {}
+        booking_ids = data.get("booking_ids") or []
+        booking_id = data.get("booking_id")
+        if booking_id:
+            booking_ids = booking_ids or [booking_id]
+        reason = data.get("reason") or "Marked as no-show from dashboard"
+        result = mark_bookings_no_show(
+            booking_ids=booking_ids,
+            reason=reason,
+            actor_scope="dashboard",
+            apply_no_show_fee=True,
+        )
+        if not result.get("no_show_ids"):
+            return jsonify({"success": False, "message": "No eligible booking marked as no-show", "details": result}), 400
+        return jsonify(result), 200
+    except ValueError as e:
+        return jsonify({"success": False, "message": str(e)}), 404
+    except Exception as e:
+        current_app.logger.exception("Failed to mark booking as no-show")
+        db.session.rollback()
+        return jsonify({"success": False, "message": "Failed to mark no-show", "error": str(e)}), 500
+
+
+@booking_blueprint.route('/bookings/no-show/app', methods=['POST'])
+@auth_required_self(decrypt_user=True)
+def mark_bookings_no_show_app_route():
+    try:
+        data = request.get_json(silent=True) or {}
+        booking_ids = data.get("booking_ids") or []
+        booking_id = data.get("booking_id")
+        if booking_id:
+            booking_ids = booking_ids or [booking_id]
+        if not booking_ids:
+            return jsonify({"success": False, "message": "booking_id or booking_ids required"}), 400
+
+        user_id = int(g.auth_user_id)
+        reason = data.get("reason") or "Marked as no-show from app"
+
+        result = mark_bookings_no_show(
+            booking_ids=booking_ids,
+            reason=reason,
+            actor_scope="app",
+            actor_user_id=user_id,
+            enforce_user_ownership=True,
+            apply_no_show_fee=True,
+        )
+
+        if not result.get("no_show_ids"):
+            if result.get("unauthorized_ids"):
+                return jsonify({
+                    "success": False,
+                    "message": "You can mark no-show only for your own bookings.",
+                    "details": result,
+                }), 403
+            return jsonify({
+                "success": False,
+                "message": "No eligible booking marked as no-show.",
+                "details": result,
+            }), 400
+
+        return jsonify(result), 200
+    except ValueError as e:
+        return jsonify({"success": False, "message": str(e)}), 404
+    except Exception as e:
+        current_app.logger.exception("Failed to mark booking as no-show from app")
+        db.session.rollback()
+        return jsonify({"success": False, "message": "Failed to mark no-show", "error": str(e)}), 500
 
 
 

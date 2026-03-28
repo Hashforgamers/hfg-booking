@@ -36,6 +36,15 @@ services:
       CANCELLATION_FEE_APPLY_ON_PAY_AT_CAFE: "false"
       CANCELLATION_FEE_APPLY_ON_PASS: "false"
 
+      # No-show policy defaults
+      NO_SHOW_FEE_ENABLED: "true"
+      NO_SHOW_FEE_PERCENT: "100"
+      NO_SHOW_FEE_FLAT: "0"
+      NO_SHOW_FEE_MIN: "0"
+      NO_SHOW_FEE_MAX: "100000"
+      NO_SHOW_FEE_APPLY_ON_PAY_AT_CAFE: "false"
+      NO_SHOW_FEE_APPLY_ON_PASS: "true"
+
       # Pass OTP verification policy for dashboard pass redemptions
       PASS_BOOKING_REQUIRE_OTP: "true"
       PASS_BOOKING_OTP_TTL_SECONDS: "300"
