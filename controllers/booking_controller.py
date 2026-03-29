@@ -40,17 +40,17 @@ from sqlalchemy.orm import joinedload
 
 IST = pytz.timezone("Asia/Kolkata")
 
-# Squad platform policy (backend source of truth).
-# Discount rule-engine applies only to PC squad bookings.
-SQUAD_PLATFORM_RULES = {
-    "pc": {"enabled": True, "max_players": 10, "pricing_mode": "squad_discount"},
-    "ps": {"enabled": True, "max_players": 4, "pricing_mode": "controller_pricing"},
-    "xbox": {"enabled": True, "max_players": 4, "pricing_mode": "controller_pricing"},
-    "vr": {"enabled": False, "max_players": 1, "pricing_mode": "solo_only"},
-}
-
-DEFAULT_SQUAD_PRICING_POLICY = {
-    "pc": {2: 0, 3: 3, 4: 5, 5: 8, 6: 10, 7: 12, 8: 15, 9: 18, 10: 20},
+# Squad discount baseline used when vendor has not configured custom rules.
+SQUAD_DEFAULT_DISCOUNT_BASELINE = {
+    2: 0,
+    3: 3,
+    4: 5,
+    5: 8,
+    6: 10,
+    7: 12,
+    8: 15,
+    9: 18,
+    10: 20,
 }
 
 from sqlalchemy.sql import text
@@ -60,6 +60,12 @@ import sqlalchemy as sa
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy import func, distinct
 from services.mail_service import booking_mail, reject_booking_mail, extra_booking_time_mail, vendor_booking_notification_mail
+from services.console_catalog_service import (
+    get_merged_console_catalog,
+    resolve_console_capabilities,
+    normalize_console_slug,
+    legacy_console_group,
+)
 
 from models.hashWallet import HashWallet
 from models.hashWalletTransaction import HashWalletTransaction
@@ -520,15 +526,15 @@ def _compute_pay_at_cafe_pricing(vendor_id: int, available_game, squad_details: 
             "controller_qty": 0,
             "player_count": 1,
             "pricing_mode": "solo_only",
-            "console_group": _resolve_console_group(getattr(available_game, "game_name", "") or ""),
+            "console_group": _resolve_console_group(getattr(available_game, "game_name", "") or "", vendor_id=vendor_id),
             "discount_percent": 0.0,
         }
 
     console_group = str(
-        details.get("console_group") or _resolve_console_group(getattr(available_game, "game_name", "") or "")
+        details.get("console_group") or _resolve_console_group(getattr(available_game, "game_name", "") or "", vendor_id=vendor_id)
     ).lower()
     pricing_mode = str(
-        details.get("pricing_mode") or _resolve_squad_pricing_mode(getattr(available_game, "game_name", "") or "")
+        details.get("pricing_mode") or _resolve_squad_pricing_mode(getattr(available_game, "game_name", "") or "", vendor_id=vendor_id)
     ).lower()
     try:
         player_count = int(details.get("player_count") or details.get("playerCount") or 1)
@@ -537,13 +543,14 @@ def _compute_pay_at_cafe_pricing(vendor_id: int, available_game, squad_details: 
     player_count = max(player_count, 1)
 
     discount_percent = float(
-        details.get("discount_percent")
-        or _resolve_squad_discount_percent(
-            getattr(available_game, "game_name", "") or "",
-            player_count,
-            policy=_load_squad_pricing_policy(vendor_id),
-        )
-        or 0.0
+            details.get("discount_percent")
+            or _resolve_squad_discount_percent(
+                getattr(available_game, "game_name", "") or "",
+                player_count,
+                policy=_load_squad_pricing_policy(vendor_id),
+                vendor_id=vendor_id,
+            )
+            or 0.0
     )
 
     controller_qty = int(details.get("suggested_extra_controller_qty") or details.get("suggestedExtraControllerQty") or 0)
@@ -551,7 +558,7 @@ def _compute_pay_at_cafe_pricing(vendor_id: int, available_game, squad_details: 
         controller_qty = max(controller_qty, player_count - 1)
     controller_amount = 0.0
 
-    if console_group == "pc":
+    if _requires_multi_console_units(getattr(available_game, "game_name", "") or "", vendor_id=vendor_id):
         base_amount = base_price * player_count
         discount_amount = (base_amount * discount_percent / 100.0) if pricing_mode == "squad_discount" else 0.0
         final_amount = max(base_amount - discount_amount, 0.0)
@@ -567,7 +574,7 @@ def _compute_pay_at_cafe_pricing(vendor_id: int, available_game, squad_details: 
             "discount_percent": discount_percent,
         }
 
-    if console_group in {"ps", "xbox"} and pricing_mode == "controller_pricing" and controller_qty > 0:
+    if is_controller_pricing_supported(getattr(available_game, "game_name", "") or "", vendor_id=vendor_id) and pricing_mode == "controller_pricing" and controller_qty > 0:
         computed_controller_fare = calculate_extra_controller_fare(
             vendor_id=vendor_id,
             available_game_id=available_game.id,
@@ -683,19 +690,23 @@ def _resolve_available_game_for_vendor(vendor_id: int, console_type: str = None,
         if resolved_game:
             return resolved_game
 
-    console_type_lower = str(console_type or "").strip().lower()
+    console_type_lower = normalize_console_slug(console_type)
     if not console_type_lower:
         return db.session.query(AvailableGame).filter_by(vendor_id=vendor_id).first()
 
     pattern_groups = {
         "pc": ["%pc%", "%gaming%", "%computer%"],
-        "ps5": ["%ps5%", "%playstation%", "%sony%"],
-        "ps": ["%ps%", "%playstation%", "%sony%"],
+        "playstation": ["%ps%", "%ps4%", "%ps5%", "%playstation%", "%sony%"],
         "xbox": ["%xbox%", "%microsoft%"],
-        "vr": ["%vr%", "%virtual%", "%reality%"],
+        "vr_headset": ["%vr%", "%virtual%", "%reality%"],
+        "nintendo_switch": ["%switch%", "%nintendo%"],
+        "steam_deck": ["%steam%", "%deck%"],
+        "arcade_cabinet": ["%arcade%"],
+        "racing_rig": ["%racing%", "%rig%", "%sim%"],
+        "simulator": ["%simulator%", "%sim%"],
     }
 
-    for pattern in pattern_groups.get(console_type_lower, [f"%{console_type_lower}%"]):
+    for pattern in pattern_groups.get(console_type_lower, [f"%{console_type_lower.replace('_', '%')}%"]):
         resolved_game = db.session.query(AvailableGame).filter(
             AvailableGame.vendor_id == vendor_id,
             AvailableGame.game_name.ilike(pattern)
@@ -742,81 +753,172 @@ def calculate_extra_controller_fare(vendor_id: int, available_game_id: int, quan
     return float(dp[quantity] if dp[quantity] != float("inf") else quantity * base_price)
 
 
-def is_controller_pricing_supported(console_name: str) -> bool:
-    value = str(console_name or "").strip().lower()
-    return ("ps" in value) or ("xbox" in value)
+def _resolve_console_capabilities(console_name: str, vendor_id: int = None) -> dict:
+    return resolve_console_capabilities(vendor_id=vendor_id, raw_console=console_name)
 
 
-def _resolve_console_group(console_name: str) -> str:
-    value = str(console_name or "").strip().lower()
-    if "ps" in value:
-        return "ps"
-    if "xbox" in value:
-        return "xbox"
-    if "vr" in value:
-        return "vr"
-    if "pc" in value:
-        return "pc"
-    return "unknown"
+def is_controller_pricing_supported(console_name: str, vendor_id: int = None) -> bool:
+    caps = _resolve_console_capabilities(console_name, vendor_id=vendor_id)
+    controller_policy = str(caps.get("controller_policy") or "").strip().lower()
+    if controller_policy in {"per_player", "controller_pricing", "optional"}:
+        return True
+
+    group = legacy_console_group(caps.get("slug"), caps)
+    return group in {"ps", "xbox"}
 
 
-def _load_squad_pricing_policy(vendor_id: int):
+def _resolve_console_group(console_name: str, vendor_id: int = None) -> str:
+    caps = _resolve_console_capabilities(console_name, vendor_id=vendor_id)
+    group = legacy_console_group(caps.get("slug"), caps)
+    if group == "unknown":
+        return str(caps.get("slug") or "unknown").strip().lower() or "unknown"
+    return group
+
+
+def _default_squad_policy_for_max_players(max_players: int):
+    max_players = max(2, int(max_players or 2))
+    policy = {}
+    previous_discount = 0.0
+    for players in range(2, max_players + 1):
+        if players in SQUAD_DEFAULT_DISCOUNT_BASELINE:
+            previous_discount = float(SQUAD_DEFAULT_DISCOUNT_BASELINE[players])
+        else:
+            previous_discount = min(50.0, previous_discount + 2.0)
+        policy[players] = float(previous_discount)
+    return policy
+
+
+def _get_vendor_supported_squad_groups(vendor_id: int):
+    groups = {}
+    available_games = AvailableGame.query.filter_by(vendor_id=int(vendor_id)).all()
+    for game in available_games:
+        caps = _resolve_console_capabilities(game.game_name or "", vendor_id=vendor_id)
+        if not bool(caps.get("supports_multiplayer")):
+            continue
+        group = _resolve_console_group(game.game_name or "", vendor_id=vendor_id)
+        if not group or group in groups:
+            continue
+        groups[group] = max(2, int(caps.get("default_capacity") or 2))
+
+    if groups:
+        return groups
+
+    # Backward-compatible fallback if vendor catalog/games not ready.
+    return {"pc": 10}
+
+
+def _build_vendor_platform_rules(vendor_id: int, supported_groups: dict = None):
+    supported_groups = supported_groups or _get_vendor_supported_squad_groups(vendor_id)
+    rules = {}
+    if not supported_groups:
+        return rules
+
+    available_games = AvailableGame.query.filter_by(vendor_id=int(vendor_id)).all()
+    game_by_group = {}
+    for game in available_games:
+        group = _resolve_console_group(game.game_name or "", vendor_id=vendor_id)
+        if group and group not in game_by_group:
+            game_by_group[group] = game
+
+    for group, max_players in supported_groups.items():
+        game = game_by_group.get(group)
+        console_name = game.game_name if game else group
+        caps = _resolve_console_capabilities(console_name, vendor_id=vendor_id)
+        rules[group] = {
+            "enabled": bool(caps.get("supports_multiplayer")),
+            "max_players": int(max_players),
+            "pricing_mode": _resolve_squad_pricing_mode(console_name, vendor_id=vendor_id),
+            "console_slug": str(caps.get("slug") or ""),
+            "display_name": str(caps.get("display_name") or console_name),
+            "input_mode": str(caps.get("input_mode") or ""),
+            "controller_policy": str(caps.get("controller_policy") or ""),
+        }
+    return rules
+
+
+def _load_squad_pricing_policy(vendor_id: int, supported_groups: dict = None):
+    supported_groups = supported_groups or _get_vendor_supported_squad_groups(vendor_id)
     policy = {
-        group: {int(players): float(discount) for players, discount in values.items()}
-        for group, values in DEFAULT_SQUAD_PRICING_POLICY.items()
+        str(group): _default_squad_policy_for_max_players(max_players)
+        for group, max_players in supported_groups.items()
     }
     rows = (
         SquadPricingRule.query
-        .filter_by(vendor_id=vendor_id, is_active=True)
+        .filter_by(vendor_id=int(vendor_id), is_active=True)
         .all()
     )
-    if not rows:
-        return policy
-
-    for group in list(policy.keys()):
-        policy[group] = {}
 
     for row in rows:
         group = str(row.console_group or "").strip().lower()
-        if group != "pc":
+        if group not in supported_groups:
             continue
-        max_rule_players = int(SQUAD_PLATFORM_RULES["pc"]["max_players"])
+        max_rule_players = int(supported_groups.get(group) or 2)
         if int(row.player_count) < 2 or int(row.player_count) > max_rule_players:
             continue
         policy[group][int(row.player_count)] = float(row.discount_percent or 0)
 
-    if not policy.get("pc"):
-        defaults = DEFAULT_SQUAD_PRICING_POLICY["pc"]
-        policy["pc"] = {int(k): float(v) for k, v in defaults.items()}
-
     return policy
 
 
-def _max_players_for_console(console_name: str, policy: dict = None) -> int:
-    group = _resolve_console_group(console_name)
-    rules = SQUAD_PLATFORM_RULES.get(group)
-    if not rules:
-        return 1
-    return int(rules.get("max_players", 1))
+def _max_players_for_console(console_name: str, policy: dict = None, vendor_id: int = None) -> int:
+    caps = _resolve_console_capabilities(console_name, vendor_id=vendor_id)
+    group = legacy_console_group(caps.get("slug"), caps)
+    if group == "unknown":
+        group = str(caps.get("slug") or "").strip().lower()
+
+    supported_groups = _get_vendor_supported_squad_groups(vendor_id) if vendor_id else {}
+    configured = max(int(caps.get("default_capacity") or 1), int(supported_groups.get(group) or 1))
+    if isinstance(policy, dict) and isinstance(policy.get(group), dict) and policy.get(group):
+        return max(configured, max(int(k) for k in policy[group].keys()))
+    return configured
 
 
-def _resolve_squad_discount_percent(console_name: str, player_count: int, policy: dict = None) -> float:
+def _resolve_squad_discount_percent(console_name: str, player_count: int, policy: dict = None, vendor_id: int = None) -> float:
     if player_count <= 1:
         return 0.0
-    group = _resolve_console_group(console_name)
-    if group != "pc":
-        return 0.0
-    source = policy or DEFAULT_SQUAD_PRICING_POLICY
-    grid = source.get(group, {})
+    group = _resolve_console_group(console_name, vendor_id=vendor_id)
+    if policy is not None:
+        source = policy
+    elif vendor_id is not None:
+        supported_groups = _get_vendor_supported_squad_groups(vendor_id)
+        source = _load_squad_pricing_policy(vendor_id, supported_groups=supported_groups)
+    else:
+        source = {group: _default_squad_policy_for_max_players(10)}
+    grid = source.get(group, {}) if isinstance(source, dict) else {}
     if not grid:
         return 0.0
     capped_players = max(2, min(int(player_count), max(grid.keys())))
     return float(grid.get(capped_players, 0.0))
 
 
-def _resolve_squad_pricing_mode(console_name: str) -> str:
-    group = _resolve_console_group(console_name)
-    return str(SQUAD_PLATFORM_RULES.get(group, {}).get("pricing_mode", "solo_only"))
+def _resolve_squad_pricing_mode(console_name: str, vendor_id: int = None) -> str:
+    caps = _resolve_console_capabilities(console_name, vendor_id=vendor_id)
+    if not bool(caps.get("supports_multiplayer")):
+        return "solo_only"
+
+    controller_policy = str(caps.get("controller_policy") or "").strip().lower()
+    if controller_policy in {"per_player", "controller_pricing", "optional"}:
+        return "controller_pricing"
+    return "squad_discount"
+
+
+def _requires_multi_console_units(console_name: str, vendor_id: int = None) -> bool:
+    """
+    Backward-compatible guard for squad slot-unit reservation.
+    PC-like systems (keyboard/mouse computer setups) consume N parallel slots.
+    Controller-led multiplayer remains single-slot + controller pricing.
+    """
+    caps = _resolve_console_capabilities(console_name, vendor_id=vendor_id)
+    if not bool(caps.get("supports_multiplayer")):
+        return False
+
+    group = legacy_console_group(caps.get("slug"), caps)
+    if group == "pc":
+        return True
+
+    input_mode = str(caps.get("input_mode") or "").strip().lower()
+    family = str(caps.get("family") or "").strip().lower()
+    return input_mode == "keyboard_mouse" or family == "computer"
 
 
 def _safe_decode_jwt_claims(token: str):
@@ -1200,9 +1302,19 @@ def _release_slot_for_booking(booking, vendor_id: int, booked_date):
         if not booking or not booking.slot_id or not vendor_id or not booked_date:
             return False
         squad_details = booking.squad_details if isinstance(booking.squad_details, dict) else {}
+        console_name = ""
+        if getattr(booking, "game", None):
+            console_name = str(getattr(booking.game, "game_name", "") or "")
+        elif getattr(booking, "game_id", None):
+            game = AvailableGame.query.filter_by(id=int(booking.game_id)).first()
+            console_name = str(getattr(game, "game_name", "") or "") if game else ""
+        use_multi_units = (
+            str(squad_details.get("console_group", "")).lower() == "pc"
+            or _requires_multi_console_units(console_name, vendor_id=vendor_id)
+        )
         slot_units = (
             int(squad_details.get("player_count", 1))
-            if bool(squad_details.get("enabled")) and str(squad_details.get("console_group", "")).lower() == "pc"
+            if bool(squad_details.get("enabled")) and use_multi_units
             else 1
         )
         slot_units = max(slot_units, 1)
@@ -1323,6 +1435,7 @@ def _resolve_or_create_squad_member_user(member_name: str, member_phone: str):
 def _normalize_squad_booking_payload(
     squad_payload,
     console_name: str,
+    vendor_id: int = None,
     vendor_policy: dict = None,
 ):
     if not isinstance(squad_payload, dict):
@@ -1378,15 +1491,12 @@ def _normalize_squad_booking_payload(
     if not squad_enabled:
         return normalized_details
 
-    console_group = _resolve_console_group(console_name or "")
-    group_rules = SQUAD_PLATFORM_RULES.get(
-        console_group,
-        {"enabled": False, "max_players": 1, "pricing_mode": "solo_only"},
-    )
-    max_players = int(group_rules.get("max_players", 1))
-    pricing_mode = str(group_rules.get("pricing_mode", "solo_only"))
+    console_group = _resolve_console_group(console_name or "", vendor_id=vendor_id)
+    max_players = _max_players_for_console(console_name or "", policy=vendor_policy, vendor_id=vendor_id)
+    pricing_mode = _resolve_squad_pricing_mode(console_name or "", vendor_id=vendor_id)
+    capabilities = _resolve_console_capabilities(console_name or "", vendor_id=vendor_id)
 
-    if not bool(group_rules.get("enabled")):
+    if not bool(capabilities.get("supports_multiplayer")):
         raise ValueError(f"Squad booking is not supported for {console_name}")
     if normalized_details["player_count"] < 2:
         raise ValueError("Squad booking requires at least 2 players")
@@ -1397,6 +1507,7 @@ def _normalize_squad_booking_payload(
         console_name or "",
         normalized_details["player_count"],
         policy=vendor_policy,
+        vendor_id=vendor_id,
     )
     normalized_details["console_group"] = console_group
     normalized_details["max_players_for_console"] = max_players
@@ -1576,18 +1687,10 @@ def get_squad_pricing_policy(vendor_id):
     This is a backend source-of-truth policy for frontend previews.
     """
     try:
-        available_games = (
-            AvailableGame.query
-            .filter(AvailableGame.vendor_id == vendor_id)
-            .all()
-        )
-        console_groups = sorted({
-            _resolve_console_group(game.game_name or "")
-            for game in available_games
-        })
-        if not console_groups:
-            console_groups = sorted(DEFAULT_SQUAD_PRICING_POLICY.keys())
-        policy = _load_squad_pricing_policy(vendor_id)
+        supported_groups = _get_vendor_supported_squad_groups(vendor_id)
+        console_groups = sorted(supported_groups.keys())
+        policy = _load_squad_pricing_policy(vendor_id, supported_groups=supported_groups)
+        platform_rules = _build_vendor_platform_rules(vendor_id, supported_groups=supported_groups)
 
         return jsonify({
             "success": True,
@@ -1596,10 +1699,10 @@ def get_squad_pricing_policy(vendor_id):
                 for group, values in policy.items()
             },
             "available_console_groups": console_groups,
-            "platform_rules": SQUAD_PLATFORM_RULES,
-            "rule_engine_scope": ["pc"],
+            "platform_rules": platform_rules,
+            "rule_engine_scope": sorted(console_groups),
             "discount_basis": "slot_base_only",
-            "note": "Discount applies per slot on console base amount only. Meals/controllers are excluded."
+            "note": "Capability-driven squad policy. Discount applies on console base amount only; meals/controllers are excluded."
         }), 200
     except Exception as e:
         current_app.logger.error(f"Failed to fetch squad pricing policy: {str(e)}")
@@ -1666,6 +1769,7 @@ def booking_pricing_preview():
             normalized_squad_details = _normalize_squad_booking_payload(
                 squad_payload,
                 available_game.game_name or "",
+                vendor_id=vendor_id,
                 vendor_policy=vendor_squad_policy,
             )
         except ValueError as squad_error:
@@ -1673,12 +1777,15 @@ def booking_pricing_preview():
 
         squad_enabled = bool(normalized_squad_details.get("enabled"))
         console_group = str(
-            normalized_squad_details.get("console_group") or _resolve_console_group(available_game.game_name or "")
+            normalized_squad_details.get("console_group") or _resolve_console_group(available_game.game_name or "", vendor_id=vendor_id)
         ).strip().lower()
-        is_pc_squad = bool(squad_enabled and console_group == "pc")
+        uses_multi_slot_units = bool(
+            squad_enabled and _requires_multi_console_units(available_game.game_name or "", vendor_id=vendor_id)
+        )
         squad_player_count = int(normalized_squad_details.get("player_count") or normalized_squad_details.get("playerCount") or 1)
-        slot_units_required = squad_player_count if is_pc_squad else 1
+        slot_units_required = squad_player_count if uses_multi_slot_units else 1
         squad_discount_percent = float(normalized_squad_details.get("discount_percent") or 0.0)
+        squad_pricing_mode = str(normalized_squad_details.get("pricing_mode") or "").strip().lower()
 
         def _parse_preview_time(value):
             if value is None:
@@ -1854,9 +1961,9 @@ def booking_pricing_preview():
         if requested_extra_controller_qty < 0:
             return jsonify({"success": False, "message": "extra_controller_qty cannot be negative"}), 400
 
-        if squad_enabled and console_group in {"ps", "xbox"}:
+        if squad_enabled and str(normalized_squad_details.get("pricing_mode") or "").lower() == "controller_pricing":
             requested_extra_controller_qty = max(requested_extra_controller_qty, squad_player_count - 1)
-        elif not is_controller_pricing_supported(available_game.game_name):
+        elif not is_controller_pricing_supported(available_game.game_name, vendor_id=vendor_id):
             requested_extra_controller_qty = 0
 
         extra_controller_fare = 0.0
@@ -1881,10 +1988,10 @@ def booking_pricing_preview():
             slot_obj = entry["slot_obj"]
             slot_id = entry.get("slot_id")
             effective_price = get_effective_price_for_schedule(vendor_id, available_game, book_date, slot_obj)
-            slot_base_price = float(effective_price or 0.0) * (squad_player_count if is_pc_squad else 1)
+            slot_base_price = float(effective_price or 0.0) * (squad_player_count if uses_multi_slot_units else 1)
             slot_discount = (
                 (slot_base_price * squad_discount_percent / 100.0)
-                if is_pc_squad and str(normalized_squad_details.get("pricing_mode") or "") == "squad_discount"
+                if squad_pricing_mode == "squad_discount"
                 else 0.0
             )
 
@@ -1941,7 +2048,7 @@ def booking_pricing_preview():
                 (slot_breakdown[0]["slot_discount_amount"] if slot_breakdown else 0.0), 2
             )
             normalized_squad_details["total_discount"] = round(float(total_discount or 0.0), 2)
-            normalized_squad_details["slot_base_multiplier"] = int(squad_player_count if is_pc_squad else 1)
+            normalized_squad_details["slot_base_multiplier"] = int(squad_player_count if uses_multi_slot_units else 1)
             normalized_squad_details["applied_extra_controller_qty"] = int(requested_extra_controller_qty)
 
         return jsonify({
@@ -2032,6 +2139,7 @@ def booking_pricing_estimate():
             normalized_squad_details = _normalize_squad_booking_payload(
                 squad_payload,
                 available_game.game_name or "",
+                vendor_id=vendor_id,
                 vendor_policy=vendor_squad_policy,
             )
         except ValueError as squad_error:
@@ -2039,9 +2147,11 @@ def booking_pricing_estimate():
 
         squad_enabled = bool(normalized_squad_details.get("enabled"))
         console_group = str(
-            normalized_squad_details.get("console_group") or _resolve_console_group(available_game.game_name or "")
+            normalized_squad_details.get("console_group") or _resolve_console_group(available_game.game_name or "", vendor_id=vendor_id)
         ).strip().lower()
-        is_pc_squad = bool(squad_enabled and console_group == "pc")
+        uses_multi_slot_units = bool(
+            squad_enabled and _requires_multi_console_units(available_game.game_name or "", vendor_id=vendor_id)
+        )
         squad_player_count = int(normalized_squad_details.get("player_count") or normalized_squad_details.get("playerCount") or 1)
         effective_price = (
             get_effective_price_for_schedule(vendor_id, available_game, book_date)
@@ -2049,17 +2159,18 @@ def booking_pricing_estimate():
         )
 
         slot_unit_price = float(effective_price or 0.0)
-        slot_base_price = slot_unit_price * (squad_player_count if is_pc_squad else 1)
+        slot_base_price = slot_unit_price * (squad_player_count if uses_multi_slot_units else 1)
         squad_discount_percent = float(normalized_squad_details.get("discount_percent") or 0.0)
+        squad_pricing_mode = str(normalized_squad_details.get("pricing_mode") or "").strip().lower()
         squad_discount_amount = (
             (slot_base_price * squad_discount_percent / 100.0)
-            if is_pc_squad and str(normalized_squad_details.get("pricing_mode") or "") == "squad_discount"
+            if squad_pricing_mode == "squad_discount"
             else 0.0
         )
 
         extra_controller_qty = 0
         extra_controller_fare = 0.0
-        if squad_enabled and console_group in {"ps", "xbox"}:
+        if squad_enabled and str(normalized_squad_details.get("pricing_mode") or "").lower() == "controller_pricing":
             extra_controller_qty = max(0, squad_player_count - 1)
             if extra_controller_qty > 0:
                 computed_controller_fare = calculate_extra_controller_fare(
@@ -2083,7 +2194,7 @@ def booking_pricing_estimate():
 
         if squad_enabled:
             normalized_squad_details["discount_per_slot"] = round(float(squad_discount_amount or 0.0), 2)
-            normalized_squad_details["slot_base_multiplier"] = int(squad_player_count if is_pc_squad else 1)
+            normalized_squad_details["slot_base_multiplier"] = int(squad_player_count if uses_multi_slot_units else 1)
             normalized_squad_details["applied_extra_controller_qty"] = int(extra_controller_qty)
 
         return jsonify({
@@ -2752,6 +2863,7 @@ def create_booking():
             normalized_squad_details = _normalize_squad_booking_payload(
                 squad_payload,
                 available_game.game_name or "",
+                vendor_id=vendor_id,
                 vendor_policy=vendor_squad_policy,
             )
         except ValueError as squad_error:
@@ -2761,7 +2873,7 @@ def create_booking():
             normalized_squad_details["batch_id"] = str(uuid.uuid4())
         slot_units = (
             int(normalized_squad_details.get("player_count", 1))
-            if squad_enabled and str(normalized_squad_details.get("console_group", "")).lower() == "pc"
+            if squad_enabled and _requires_multi_console_units(available_game.game_name or "", vendor_id=vendor_id)
             else 1
         )
         log.info("bookings.post.vendor_resolved cid=%s vendor_id=%s", cid, vendor_id)
@@ -3489,7 +3601,11 @@ def confirm_booking():
         booking_map = {b.id: b for b in booking_objects}
         first_booking = booking_objects[0] if booking_objects else None
         first_game = first_booking.game if first_booking else None
-        vendor_squad_policy = _load_squad_pricing_policy(first_game.vendor_id) if first_game else DEFAULT_SQUAD_PRICING_POLICY
+        vendor_squad_policy = (
+            _load_squad_pricing_policy(first_game.vendor_id)
+            if first_game
+            else {"pc": _default_squad_policy_for_max_players(10)}
+        )
 
         persisted_squad_details = first_booking.squad_details if first_booking and isinstance(first_booking.squad_details, dict) else {}
         if squad_payload is not None and first_game:
@@ -3497,6 +3613,7 @@ def confirm_booking():
                 persisted_squad_details = _normalize_squad_booking_payload(
                     squad_payload,
                     first_game.game_name or "",
+                    vendor_id=first_game.vendor_id,
                     vendor_policy=vendor_squad_policy,
                 )
             except ValueError as squad_error:
@@ -3608,7 +3725,7 @@ def confirm_booking():
         required_extra_controller_qty = 0
         extra_controller_fare_total = 0.0
 
-        if squad_enabled and squad_console_group in {"ps", "xbox"}:
+        if squad_enabled and str(persisted_squad_details.get("pricing_mode") or "").strip().lower() == "controller_pricing":
             required_extra_controller_qty = max(0, squad_player_count - 1)
             if required_extra_controller_qty > 0 and first_game:
                 computed_controller_fare = calculate_extra_controller_fare(
@@ -3629,14 +3746,16 @@ def confirm_booking():
                 booking.game.id,
                 float(booking.game.single_slot_price or 0.0)
             )
-            is_pc_squad_booking = bool(squad_enabled and squad_console_group == "pc")
+            uses_multi_slot_units = bool(
+                squad_enabled and _requires_multi_console_units(booking.game.game_name or "", vendor_id=booking.game.vendor_id)
+            )
             base_slot_price_for_squad_by_game[booking.game.id] = (
                 game_effective_price * squad_player_count
-                if is_pc_squad_booking else game_effective_price
+                if uses_multi_slot_units else game_effective_price
             )
             squad_discount_per_slot_by_game[booking.game.id] = (
                 (base_slot_price_for_squad_by_game[booking.game.id] * float(persisted_squad_details.get("discount_percent") or 0.0) / 100.0)
-                if is_pc_squad_booking and str(persisted_squad_details.get("pricing_mode") or "") == "squad_discount"
+                if str(persisted_squad_details.get("pricing_mode") or "").strip().lower() == "squad_discount"
                 else 0.0
             )
 
@@ -3661,6 +3780,9 @@ def confirm_booking():
             if not all([available_game, vendor, slot_obj, user]):
                 current_app.logger.warning(f"Booking {booking_id} missing related data")
                 continue
+            uses_multi_slot_units = bool(
+                squad_enabled and _requires_multi_console_units(available_game.game_name or "", vendor_id=available_game.vendor_id)
+            )
 
             captain_phone = user.contact_info.phone if user and user.contact_info else ""
             if squad_enabled and not booking.squad_members:
@@ -3762,10 +3884,10 @@ def confirm_booking():
 
             # NO PASS - REGULAR PAYMENT
             else:
-                slot_price = slot_unit_price * (squad_player_count if is_pc_squad_booking else 1)
+                slot_price = slot_unit_price * (squad_player_count if uses_multi_slot_units else 1)
                 discount_amount = (
                     (slot_price * float(persisted_squad_details.get("discount_percent") or 0.0) / 100.0)
-                    if is_pc_squad_booking and str(persisted_squad_details.get("pricing_mode") or "") == "squad_discount"
+                    if str(persisted_squad_details.get("pricing_mode") or "").strip().lower() == "squad_discount"
                     else 0.0
                 )
                 amount_payable = max(slot_price - discount_amount, 0.0)
@@ -4016,7 +4138,12 @@ def confirm_booking():
 
             confirmed_ids.append(booking.id)
 
-        if squad_enabled and squad_console_group in {"ps", "xbox"} and extra_controller_fare_total > 0 and booking_objects:
+        if (
+            squad_enabled
+            and str(persisted_squad_details.get("pricing_mode") or "").strip().lower() == "controller_pricing"
+            and extra_controller_fare_total > 0
+            and booking_objects
+        ):
             controller_booking = booking_objects[0]
             controller_game = controller_booking.game
             controller_user = user_map.get(controller_booking.user_id)
@@ -4855,102 +4982,18 @@ def new_booking(vendor_id):
         for game in all_games:
             current_app.logger.info(f"  Game ID {game.id}: name='{game.game_name}', price={game.single_slot_price}")
 
-        # ✅ STRATEGY 1: Try to match by console_id if provided
-        available_game = None
-        
-        if console_id:
-            current_app.logger.info(f"🔍 Trying to find game by console_id: {console_id}")
-            available_game = db.session.query(AvailableGame).filter_by(
-                vendor_id=vendor_id, 
-                id=console_id
-            ).first()
-            if available_game:
-                current_app.logger.info(f"✅ Found game by ID: {available_game.game_name}")
-
-        # ✅ STRATEGY 2: Try to match by console type using game_name
-        if not available_game:
-            current_app.logger.info(f"🔍 Trying to find game by console type: {console_type}")
-            console_type_lower = console_type.lower()
-            
-            try:
-                if console_type_lower == 'pc':
-                    available_game = db.session.query(AvailableGame).filter(
-                        AvailableGame.vendor_id == vendor_id,
-                        AvailableGame.game_name.ilike('%pc%')
-                    ).first()
-                    
-                    if not available_game:
-                        available_game = db.session.query(AvailableGame).filter(
-                            AvailableGame.vendor_id == vendor_id,
-                            AvailableGame.game_name.ilike('%gaming%')
-                        ).first()
-                        
-                    if not available_game:
-                        available_game = db.session.query(AvailableGame).filter(
-                            AvailableGame.vendor_id == vendor_id,
-                            AvailableGame.game_name.ilike('%computer%')
-                        ).first()
-                        
-                elif console_type_lower == 'ps5':
-                    available_game = db.session.query(AvailableGame).filter(
-                        AvailableGame.vendor_id == vendor_id,
-                        AvailableGame.game_name.ilike('%ps5%')
-                    ).first()
-                    
-                    if not available_game:
-                        available_game = db.session.query(AvailableGame).filter(
-                            AvailableGame.vendor_id == vendor_id,
-                            AvailableGame.game_name.ilike('%playstation%')
-                        ).first()
-                        
-                    if not available_game:
-                        available_game = db.session.query(AvailableGame).filter(
-                            AvailableGame.vendor_id == vendor_id,
-                            AvailableGame.game_name.ilike('%sony%')
-                        ).first()
-                        
-                elif console_type_lower == 'xbox':
-                    available_game = db.session.query(AvailableGame).filter(
-                        AvailableGame.vendor_id == vendor_id,
-                        AvailableGame.game_name.ilike('%xbox%')
-                    ).first()
-                    
-                    if not available_game:
-                        available_game = db.session.query(AvailableGame).filter(
-                            AvailableGame.vendor_id == vendor_id,
-                            AvailableGame.game_name.ilike('%microsoft%')
-                        ).first()
-                        
-                elif console_type_lower == 'vr':
-                    available_game = db.session.query(AvailableGame).filter(
-                        AvailableGame.vendor_id == vendor_id,
-                        AvailableGame.game_name.ilike('%vr%')
-                    ).first()
-                    
-                    if not available_game:
-                        available_game = db.session.query(AvailableGame).filter(
-                            AvailableGame.vendor_id == vendor_id,
-                            AvailableGame.game_name.ilike('%virtual%')
-                        ).first()
-                        
-                    if not available_game:
-                        available_game = db.session.query(AvailableGame).filter(
-                            AvailableGame.vendor_id == vendor_id,
-                            AvailableGame.game_name.ilike('%reality%')
-                        ).first()
-                
-                if available_game:
-                    current_app.logger.info(f"✅ Found match by pattern: {available_game.game_name}")
-                    
-            except Exception as e:
-                current_app.logger.warning(f"Error in pattern matching: {str(e)}")
-
-        # ✅ STRATEGY 3: Fallback to first available game
-        if not available_game:
-            current_app.logger.warning(f"⚠️ No specific match found, using first available game for vendor {vendor_id}")
-            available_game = db.session.query(AvailableGame).filter_by(vendor_id=vendor_id).first()
-            if available_game:
-                current_app.logger.info(f"⚠️ Using fallback game: {available_game.game_name}")
+        # Resolve game with compatibility mapping (legacy types + new catalog slugs).
+        available_game = _resolve_available_game_for_vendor(
+            vendor_id=vendor_id,
+            console_type=console_type,
+            console_id=console_id,
+        )
+        if available_game:
+            current_app.logger.info(
+                "✅ Matched game via catalog resolver: game_id=%s game_name=%s",
+                available_game.id,
+                available_game.game_name,
+            )
 
         if not available_game:
             current_app.logger.error(f"❌ No games found for vendor {vendor_id}")
@@ -5003,7 +5046,7 @@ def new_booking(vendor_id):
         if extra_controller_qty < 0:
             return jsonify({"message": "extraControllerQty cannot be negative"}), 400
 
-        if not is_controller_pricing_supported(available_game.game_name):
+        if not is_controller_pricing_supported(available_game.game_name, vendor_id=vendor_id):
             # PC/VR and other unsupported console types should never carry controller surcharge.
             extra_controller_qty = 0
             extra_controller_fare = 0.0
@@ -5036,12 +5079,12 @@ def new_booking(vendor_id):
         # - VR: squad not supported
         if squad_enabled:
             console_name = available_game.game_name or ""
-            console_group = _resolve_console_group(console_name)
-            group_rules = SQUAD_PLATFORM_RULES.get(console_group, {"enabled": False, "max_players": 1, "pricing_mode": "solo_only"})
-            max_players = int(group_rules.get("max_players", 1))
-            pricing_mode = str(group_rules.get("pricing_mode", "solo_only"))
+            console_group = _resolve_console_group(console_name, vendor_id=vendor_id)
+            max_players = _max_players_for_console(console_name, policy=vendor_squad_policy, vendor_id=vendor_id)
+            pricing_mode = _resolve_squad_pricing_mode(console_name, vendor_id=vendor_id)
+            capabilities = _resolve_console_capabilities(console_name, vendor_id=vendor_id)
 
-            if not bool(group_rules.get("enabled")):
+            if not bool(capabilities.get("supports_multiplayer")):
                 return jsonify({
                     "message": f"Squad booking is not supported for {console_name}"
                 }), 400
@@ -5055,7 +5098,8 @@ def new_booking(vendor_id):
             discount_pct = _resolve_squad_discount_percent(
                 console_name,
                 normalized_squad_details["player_count"],
-                policy=vendor_squad_policy
+                policy=vendor_squad_policy,
+                vendor_id=vendor_id,
             )
             normalized_squad_details["console_group"] = console_group
             normalized_squad_details["max_players_for_console"] = max_players
@@ -5069,7 +5113,7 @@ def new_booking(vendor_id):
                     extra_controller_qty = required_extra_controller_qty
 
         # Recompute controller surcharge after squad normalization.
-        if is_controller_pricing_supported(available_game.game_name) and extra_controller_qty > 0:
+        if is_controller_pricing_supported(available_game.game_name, vendor_id=vendor_id) and extra_controller_qty > 0:
             computed_controller_fare = calculate_extra_controller_fare(
                 vendor_id=vendor_id,
                 available_game_id=available_game.id,
@@ -5080,7 +5124,7 @@ def new_booking(vendor_id):
 
         slot_units_required = (
             int(normalized_squad_details.get("player_count", 1))
-            if squad_enabled and str(normalized_squad_details.get("console_group", "")).lower() == "pc"
+            if squad_enabled and _requires_multi_console_units(available_game.game_name or "", vendor_id=vendor_id)
             else 1
         )
         slot_units_required = max(slot_units_required, 1)
@@ -5385,16 +5429,23 @@ def new_booking(vendor_id):
         transactions = []
         waive_off_per_slot = waive_off_total / len(bookings) if bookings else 0.0
         meals_cost_per_slot = total_meals_cost / len(bookings) if bookings and total_meals_cost > 0 else 0.0
-        console_group_for_pricing = str(normalized_squad_details.get("console_group", _resolve_console_group(available_game.game_name or "")))
-        is_pc_squad = bool(squad_enabled and console_group_for_pricing == "pc")
-        squad_player_multiplier = int(normalized_squad_details.get("player_count", 1)) if is_pc_squad else 1
-        squad_pricing_mode = str(normalized_squad_details.get("pricing_mode", _resolve_squad_pricing_mode(available_game.game_name or "")))
-        squad_discount_applicable = bool(is_pc_squad and squad_pricing_mode == "squad_discount")
+        console_group_for_pricing = str(
+            normalized_squad_details.get("console_group", _resolve_console_group(available_game.game_name or "", vendor_id=vendor_id))
+        )
+        uses_multi_slot_units = bool(
+            squad_enabled and _requires_multi_console_units(available_game.game_name or "", vendor_id=vendor_id)
+        )
+        squad_player_multiplier = int(normalized_squad_details.get("player_count", 1)) if uses_multi_slot_units else 1
+        squad_pricing_mode = str(
+            normalized_squad_details.get("pricing_mode", _resolve_squad_pricing_mode(available_game.game_name or "", vendor_id=vendor_id))
+        )
+        squad_discount_applicable = bool(squad_pricing_mode == "squad_discount")
         squad_discount_percent = (
             _resolve_squad_discount_percent(
                 available_game.game_name or "",
                 int(normalized_squad_details.get("player_count", 1)),
-                policy=vendor_squad_policy
+                policy=vendor_squad_policy,
+                vendor_id=vendor_id,
             )
             if squad_discount_applicable else 0.0
         )
@@ -5411,7 +5462,7 @@ def new_booking(vendor_id):
             slot_obj = runtime_slot_map.get(int(booking.slot_id))
             unit_price = float(get_effective_price_for_schedule(vendor_id, available_game, booked_date_obj, slot_obj) or 0.0)
             total_unit_price += unit_price
-            base_slot_price = unit_price * (squad_player_multiplier if is_pc_squad else 1)
+            base_slot_price = unit_price * (squad_player_multiplier if uses_multi_slot_units else 1)
             slot_discount = (
                 (base_slot_price * squad_discount_percent / 100.0)
                 if squad_discount_applicable else 0.0
@@ -5623,8 +5674,9 @@ def new_booking(vendor_id):
             runtime_console_id = int(console_id) if console_id is not None else -1
 
             if slot_obj and _is_slot_live_now_ist(booked_for_date_obj, slot_obj.start_time, slot_obj.end_time):
-                console_group = str(normalized_squad_details.get("console_group", "")).lower()
-                is_pc_squad = bool(squad_enabled and console_group == "pc")
+                is_pc_squad = bool(
+                    squad_enabled and _requires_multi_console_units(available_game.game_name or "", vendor_id=vendor_id)
+                )
                 required_console_count = (
                     int(normalized_squad_details.get("player_count", 1))
                     if is_pc_squad
@@ -7013,10 +7065,15 @@ def extra_booking():
             db.session.flush()
 
         squad_details = primary_booking.squad_details if isinstance(primary_booking.squad_details, dict) else {}
-        squad_console_group = str(squad_details.get("console_group") or "").strip().lower()
+        runtime_game = (
+            AvailableGame.query.filter_by(id=int(game_id), vendor_id=int(vendor_id)).first()
+            if game_id is not None else None
+        )
+        runtime_console_name = str(getattr(runtime_game, "game_name", "") or "")
+        runtime_console_group = _resolve_console_group(runtime_console_name, vendor_id=vendor_id)
         squad_player_count = int(squad_details.get("player_count") or squad_details.get("playerCount") or 1)
         is_pc_squad = bool(
-            squad_console_group == "pc"
+            _requires_multi_console_units(runtime_console_name, vendor_id=vendor_id)
             and squad_player_count > 1
             and (squad_details.get("enabled") is True or squad_player_count > 1)
         )
@@ -7080,7 +7137,7 @@ def extra_booking():
             ledger.append({
                 "recorded_at": datetime.utcnow().isoformat(),
                 "slot_id": int(slot_id),
-                "console_group": "pc",
+                "console_group": runtime_console_group or "unknown",
                 "player_count": int(effective_multiplier),
                 "per_player_amount": round(float(amount), 2),
                 "original_amount": round(float(original_amount), 2),

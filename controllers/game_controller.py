@@ -11,6 +11,14 @@ import time
 import os
 from threading import Lock
 from sqlalchemy import func
+from services.console_catalog_service import (
+    get_merged_console_catalog,
+    resolve_console_capabilities,
+    normalize_console_slug,
+    get_vendor_console_overrides,
+    upsert_vendor_console_override,
+    set_vendor_console_override_active,
+)
 
 
 game_blueprint = Blueprint('game', __name__)
@@ -190,6 +198,9 @@ def get_all_console_by_vendor_id(vendor_id):
         .all()
     )
 
+    catalog = get_merged_console_catalog(vendor_id=vendor_id)
+    capability_by_slug = {str(item.get("slug")): item for item in catalog}
+
     # If no games found, return an appropriate message
     if not games:
         return jsonify({
@@ -199,12 +210,121 @@ def get_all_console_by_vendor_id(vendor_id):
         }), 200
 
     # Return the game details along with the vendor's open days in JSON format
+    items = []
+    for row in games:
+        normalized_slug = normalize_console_slug(row.game_name or "")
+        capabilities = capability_by_slug.get(normalized_slug) or resolve_console_capabilities(vendor_id, row.game_name)
+        items.append(
+            {
+                "id": row.id,
+                "console_name": row.game_name,
+                "console_slug": capabilities.get("slug", normalized_slug or "unknown"),
+                "console_display_name": capabilities.get("display_name", row.game_name),
+                "console_price": row.single_slot_price,
+                "console_count": int(row.console_count or 0),
+                "icon": capabilities.get("icon") or "Monitor",
+                "family": capabilities.get("family") or "other",
+                "input_mode": capabilities.get("input_mode") or "controller",
+                "supports_multiplayer": bool(capabilities.get("supports_multiplayer")),
+                "default_capacity": int(capabilities.get("default_capacity") or 1),
+                "controller_policy": capabilities.get("controller_policy") or "none",
+                "is_active": True,
+            }
+        )
+
     return jsonify({
-        "games": [{
-            "id": row.id,
-            "console_name": row.game_name,
-            "console_price": row.single_slot_price,
-            "console_count": int(row.console_count or 0),
-            "is_active": True,
-        } for row in games],
+        "games": items,
+        "catalog": catalog,
     })
+
+
+@game_blueprint.route('/console-types/vendor/<int:vendor_id>', methods=['GET'])
+@cross_origin(origins="*")
+def get_console_types_by_vendor(vendor_id):
+    include_inactive = str(request.args.get("include_inactive", "false")).strip().lower() == "true"
+    return jsonify(
+        {
+            "vendor_id": int(vendor_id),
+            "console_types": get_merged_console_catalog(vendor_id=vendor_id, include_inactive=include_inactive),
+        }
+    ), 200
+
+
+@game_blueprint.route('/console-types', methods=['GET'])
+@cross_origin(origins="*")
+def get_console_types():
+    vendor_id = request.args.get("vendor_id")
+    include_inactive = str(request.args.get("include_inactive", "false")).strip().lower() == "true"
+    resolved_vendor_id = None
+    if vendor_id is not None:
+        try:
+            resolved_vendor_id = int(vendor_id)
+        except (TypeError, ValueError):
+            return jsonify({"message": "vendor_id must be a valid integer"}), 400
+
+    return jsonify(
+        {
+            "vendor_id": resolved_vendor_id,
+            "console_types": get_merged_console_catalog(
+                vendor_id=resolved_vendor_id,
+                include_inactive=include_inactive,
+            ),
+        }
+    ), 200
+
+
+@game_blueprint.route('/console-types/vendor/<int:vendor_id>/overrides', methods=['GET'])
+@cross_origin(origins="*")
+def get_console_type_overrides(vendor_id):
+    include_inactive = str(request.args.get("include_inactive", "false")).strip().lower() == "true"
+    return jsonify(
+        {
+            "vendor_id": int(vendor_id),
+            "overrides": get_vendor_console_overrides(vendor_id=vendor_id, include_inactive=include_inactive),
+            "console_types": get_merged_console_catalog(vendor_id=vendor_id, include_inactive=include_inactive),
+        }
+    ), 200
+
+
+@game_blueprint.route('/console-types/vendor/<int:vendor_id>/overrides', methods=['POST'])
+@cross_origin(origins="*")
+def create_or_update_console_type_override(vendor_id):
+    payload = request.get_json(silent=True) or {}
+    try:
+        row = upsert_vendor_console_override(vendor_id=vendor_id, payload=payload)
+        db.session.commit()
+        return jsonify(
+            {
+                "success": True,
+                "vendor_id": int(vendor_id),
+                "override": row,
+                "console_types": get_merged_console_catalog(vendor_id=vendor_id),
+            }
+        ), 200
+    except ValueError as exc:
+        db.session.rollback()
+        return jsonify({"success": False, "message": str(exc)}), 400
+    except Exception as exc:
+        db.session.rollback()
+        return jsonify({"success": False, "message": f"Failed to save override: {exc}"}), 500
+
+
+@game_blueprint.route('/console-types/vendor/<int:vendor_id>/overrides/<string:slug>', methods=['DELETE'])
+@cross_origin(origins="*")
+def deactivate_console_type_override(vendor_id, slug):
+    try:
+        row = set_vendor_console_override_active(vendor_id=vendor_id, slug=slug, is_active=False)
+        if row is None:
+            return jsonify({"success": False, "message": "Override not found"}), 404
+        db.session.commit()
+        return jsonify(
+            {
+                "success": True,
+                "vendor_id": int(vendor_id),
+                "override": row,
+                "console_types": get_merged_console_catalog(vendor_id=vendor_id),
+            }
+        ), 200
+    except Exception as exc:
+        db.session.rollback()
+        return jsonify({"success": False, "message": f"Failed to delete override: {exc}"}), 500
