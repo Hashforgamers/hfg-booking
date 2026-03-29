@@ -54,6 +54,15 @@ class Config:
     CANCELLATION_FEE_APPLY_ON_PAY_AT_CAFE = os.getenv("CANCELLATION_FEE_APPLY_ON_PAY_AT_CAFE", "false").lower() in ("true", "1", "t", "yes", "y")
     CANCELLATION_FEE_APPLY_ON_PASS = os.getenv("CANCELLATION_FEE_APPLY_ON_PASS", "false").lower() in ("true", "1", "t", "yes", "y")
 
+    # No-show policy (default: full fee on paid bookings, waive pending pay-at-cafe)
+    NO_SHOW_FEE_ENABLED = os.getenv("NO_SHOW_FEE_ENABLED", "true").lower() in ("true", "1", "t", "yes", "y")
+    NO_SHOW_FEE_PERCENT = float(os.getenv("NO_SHOW_FEE_PERCENT", "100") or 0)
+    NO_SHOW_FEE_FLAT = float(os.getenv("NO_SHOW_FEE_FLAT", "0") or 0)
+    NO_SHOW_FEE_MIN = float(os.getenv("NO_SHOW_FEE_MIN", "0") or 0)
+    NO_SHOW_FEE_MAX = float(os.getenv("NO_SHOW_FEE_MAX", "100000") or 0)
+    NO_SHOW_FEE_APPLY_ON_PAY_AT_CAFE = os.getenv("NO_SHOW_FEE_APPLY_ON_PAY_AT_CAFE", "false").lower() in ("true", "1", "t", "yes", "y")
+    NO_SHOW_FEE_APPLY_ON_PASS = os.getenv("NO_SHOW_FEE_APPLY_ON_PASS", "true").lower() in ("true", "1", "t", "yes", "y")
+
     # Public URLs for email action links
     BOOKING_PUBLIC_BASE_URL = os.getenv("BOOKING_PUBLIC_BASE_URL", "").strip()
     DASHBOARD_PUBLIC_URL = os.getenv("DASHBOARD_PUBLIC_URL", "https://dashboard.hashforgamers.com").strip()
