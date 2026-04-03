@@ -70,12 +70,30 @@ def get_games_by_vendor_id(vendor_id):
         response.headers["X-Response-Time-ms"] = f"{(time.perf_counter() - started_at) * 1000:.2f}"
         return response, 200
 
-    today = today_dt.strftime('%a').lower()
+    def _normalize_day_token(day_value: str) -> str:
+        token = (day_value or "").strip().lower()
+        mapping = {
+            "monday": "mon",
+            "mon": "mon",
+            "tuesday": "tue",
+            "tue": "tue",
+            "tues": "tue",
+            "wednesday": "wed",
+            "wed": "wed",
+            "thursday": "thu",
+            "thu": "thu",
+            "thurs": "thu",
+            "friday": "fri",
+            "fri": "fri",
+            "saturday": "sat",
+            "sat": "sat",
+            "sunday": "sun",
+            "sun": "sun",
+        }
+        return mapping.get(token, token)
+
+    today = _normalize_day_token(today_dt.strftime('%a').lower())
     day_aliases = {today}
-    if today == "tue":
-        day_aliases.add("tues")
-    if today == "thu":
-        day_aliases.add("thurs")
 
     opening_days = (
         OpeningDay.query
@@ -83,19 +101,8 @@ def get_games_by_vendor_id(vendor_id):
         .filter_by(vendor_id=vendor_id, is_open=True)
         .all()
     )
-    open_days = {row.day.lower() for row in opening_days}
-
-    if open_days and not (day_aliases & open_days):
-        payload = {
-            "message": "Shop is closed today, no games available.",
-            "shop_open": False,
-            "game_count": 0
-        }
-        _games_cache_set(cache_key, payload, now)
-        response = jsonify(payload)
-        response.headers["X-Cache"] = "MISS"
-        response.headers["X-Response-Time-ms"] = f"{(time.perf_counter() - started_at) * 1000:.2f}"
-        return response, 200
+    open_days = {_normalize_day_token(row.day) for row in opening_days}
+    is_shop_open_today = (not open_days) or bool(day_aliases & open_days)
 
     games = (
         AvailableGame.query
@@ -109,10 +116,27 @@ def get_games_by_vendor_id(vendor_id):
         .all()
     )
 
-    if not games:
+    catalog = get_merged_console_catalog(vendor_id=vendor_id)
+    games_by_slug = {}
+    for game in games:
+        slug = normalize_console_slug(game.game_name or "")
+        games_by_slug[slug] = game
+
+    vendor_console_counts = (
+        db.session.query(Console.console_type, func.count(Console.id))
+        .filter(Console.vendor_id == vendor_id)
+        .group_by(Console.console_type)
+        .all()
+    )
+    inventory_by_slug = {}
+    for console_type, count in vendor_console_counts:
+        slug = normalize_console_slug(console_type or "")
+        inventory_by_slug[slug] = inventory_by_slug.get(slug, 0) + int(count or 0)
+
+    if not games and not inventory_by_slug:
         payload = {
             "message": "No games found for this vendor",
-            "shop_open": True,
+            "shop_open": is_shop_open_today,
             "game_count": 0
         }
         _games_cache_set(cache_key, payload, now)
@@ -122,6 +146,29 @@ def get_games_by_vendor_id(vendor_id):
         return response, 200
 
     open_days_list = [row.day for row in opening_days]
+    catalog_entries = []
+    for entry in catalog:
+        slug = normalize_console_slug(entry.get("slug") or "")
+        linked_game = games_by_slug.get(slug)
+        catalog_entries.append({
+            "console_slug": slug,
+            "console_display_name": entry.get("display_name") or (linked_game.game_name if linked_game else slug.replace("_", " ").title()),
+            "icon": entry.get("icon") or "Monitor",
+            "family": entry.get("family") or "other",
+            "input_mode": entry.get("input_mode") or "controller",
+            "supports_multiplayer": bool(entry.get("supports_multiplayer")),
+            "default_capacity": int(entry.get("default_capacity") or 1),
+            "controller_policy": entry.get("controller_policy") or "none",
+            "inventory_count": int(inventory_by_slug.get(slug, 0)),
+            "has_game_pricing": bool(linked_game),
+            "available_game_id": int(linked_game.id) if linked_game else None,
+            "bookable": bool(linked_game),
+        })
+
+    missing_catalog_pricing = [
+        c for c in catalog_entries if c["inventory_count"] > 0 and not c["has_game_pricing"]
+    ]
+
     payload = {
         "games": [{
             "id": game.id,
@@ -130,8 +177,11 @@ def get_games_by_vendor_id(vendor_id):
             "single_slot_price": game.single_slot_price,
             "opening_days": open_days_list
         } for game in games],
-        "shop_open": True,
-        "game_count": len(games)
+        "shop_open": is_shop_open_today,
+        "game_count": len(games),
+        "console_types": catalog_entries,
+        "missing_catalog_pricing_count": len(missing_catalog_pricing),
+        "missing_catalog_pricing": missing_catalog_pricing,
     }
     _games_cache_set(cache_key, payload, now)
     response = jsonify(payload)
