@@ -3522,6 +3522,19 @@ def confirm_booking():
 
         current_app.logger.info(f"Confirm payload: {data}")
 
+        def _payment_label(mode_value: str) -> str:
+            if mode_value == "wallet":
+                return "Hash Wallet"
+            if mode_value == "payment_gateway":
+                return "Online Payment"
+            if mode_value == "hour_pass":
+                return f"Hour Pass{f' ({pass_type_name})' if pass_type_name else ''}"
+            if mode_value == "date_pass":
+                return f"Pass{f' ({pass_type_name})' if pass_type_name else ''}"
+            if mode_value == "free":
+                return "Free"
+            return str(mode_value or "unknown").replace("_", " ").title()
+
         if not booking_ids or not book_date_str:
             return jsonify({'message': 'booking_id and book_date are required'}), 400
         
@@ -4080,7 +4093,7 @@ def confirm_booking():
                     username=user.name,
                     game_id=booking.game_id,
                     game_name=available_game.game_name,
-                    date_value=book_date,
+                    date_value=book_date.isoformat() if hasattr(book_date, "isoformat") else str(book_date),
                     slot_price=slot_unit_price,
                     start_time=slot_obj.start_time,
                     end_time=slot_obj.end_time,
