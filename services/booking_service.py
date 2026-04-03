@@ -344,7 +344,7 @@ class BookingService:
         from app import create_app
 
         # Create the Flask app
-        app, _ = create_app()
+        app = create_app()
 
         # Push the application context inside the job
         with app.app_context():
