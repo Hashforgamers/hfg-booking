@@ -3783,6 +3783,12 @@ def confirm_booking():
             uses_multi_slot_units = bool(
                 squad_enabled and _requires_multi_console_units(available_game.game_name or "", vendor_id=available_game.vendor_id)
             )
+            slot_unit_price = float(
+                effective_price_by_game.get(
+                    available_game.id,
+                    float(available_game.single_slot_price or 0.0),
+                )
+            )
 
             captain_phone = user.contact_info.phone if user and user.contact_info else ""
             if squad_enabled and not booking.squad_members:
@@ -7881,10 +7887,18 @@ def get_pay_at_cafe_queue_summary(vendor_id: int):
 
         pending_rows = db.session.query(Booking.id).join(
             AvailableGame, Booking.game_id == AvailableGame.id
+        ).outerjoin(
+            Transaction, Transaction.booking_id == Booking.id
         ).filter(
             AvailableGame.vendor_id == int(vendor_id),
             Booking.status == "pending_acceptance",
-            Booking.booked_date == summary_date,
+            or_(
+                Transaction.booked_date == summary_date,
+                and_(
+                    Transaction.id.is_(None),
+                    func.date(Booking.created_at) == summary_date,
+                ),
+            ),
         ).all()
         pending_ids = {int(r.id) for r in pending_rows}
 
