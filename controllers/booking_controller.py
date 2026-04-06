@@ -7890,11 +7890,9 @@ def update_pay_at_cafe_settings(vendor_id: int):
 @booking_blueprint.route('/pay-at-cafe/queue-summary/<int:vendor_id>', methods=['GET'])
 def get_pay_at_cafe_queue_summary(vendor_id: int):
     try:
-        requested_date = (request.args.get("date") or "").strip()
-        try:
-            summary_date = datetime.strptime(requested_date, "%Y-%m-%d").date() if requested_date else datetime.now(IST).date()
-        except ValueError:
-            return jsonify({"success": False, "message": "date must be YYYY-MM-DD"}), 400
+        start_date, end_date, mode, date_error = _parse_pay_at_cafe_queue_date_filters(request.args)
+        if date_error:
+            return jsonify({"success": False, "message": date_error}), 400
 
         _ensure_pay_at_cafe_action_logs_table()
 
@@ -7905,13 +7903,7 @@ def get_pay_at_cafe_queue_summary(vendor_id: int):
         ).filter(
             AvailableGame.vendor_id == int(vendor_id),
             Booking.status == "pending_acceptance",
-            or_(
-                Transaction.booked_date == summary_date,
-                and_(
-                    Transaction.id.is_(None),
-                    func.date(Booking.created_at) == summary_date,
-                ),
-            ),
+            _pay_at_cafe_queue_date_predicate(start_date, end_date),
         ).all()
         pending_ids = {int(r.id) for r in pending_rows}
 
@@ -7921,11 +7913,11 @@ def get_pay_at_cafe_queue_summary(vendor_id: int):
                 SELECT booking_id, action, action_source, created_at
                 FROM pay_at_cafe_action_logs
                 WHERE vendor_id = :vendor_id
-                  AND DATE(created_at) = :summary_date
+                  AND DATE(created_at) BETWEEN :start_date AND :end_date
                 ORDER BY created_at DESC
                 """
             ),
-            {"vendor_id": int(vendor_id), "summary_date": summary_date},
+            {"vendor_id": int(vendor_id), "start_date": start_date, "end_date": end_date},
         ).mappings().all()
 
         accepted_ids = {int(row["booking_id"]) for row in logs if str(row["action"] or "").lower() == "accepted"}
@@ -7946,9 +7938,11 @@ def get_pay_at_cafe_queue_summary(vendor_id: int):
 
         unique_requested = pending_ids | accepted_ids | rejected_ids
 
-        return jsonify({
+        response_payload = {
             "success": True,
-            "date": summary_date.isoformat(),
+            "mode": mode,
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
             "summary": {
                 "requested": len(unique_requested),
                 "pending": len(pending_ids),
@@ -7957,10 +7951,238 @@ def get_pay_at_cafe_queue_summary(vendor_id: int):
                 "auto_accepted": len(auto_accepted_ids),
                 "auto_rejected": len(auto_rejected_ids),
             },
-        }), 200
+        }
+        if mode == "single":
+            response_payload["date"] = start_date.isoformat()
+        return jsonify(response_payload), 200
     except Exception as exc:
         current_app.logger.exception("Failed pay-at-cafe queue summary vendor=%s err=%s", vendor_id, exc)
         return jsonify({"success": False, "message": "Failed to fetch pay-at-cafe queue summary"}), 500
+
+
+def _parse_pay_at_cafe_queue_date_filters(args):
+    requested_date = (args.get("date") or "").strip()
+    requested_start_date = (args.get("start_date") or "").strip()
+    requested_end_date = (args.get("end_date") or "").strip()
+
+    if requested_date and (requested_start_date or requested_end_date):
+        return None, None, None, "Use either date or start_date/end_date, not both"
+
+    if requested_start_date or requested_end_date:
+        if not requested_start_date or not requested_end_date:
+            return None, None, None, "Both start_date and end_date are required for range filter"
+        start_date = _coerce_date_value(requested_start_date)
+        end_date = _coerce_date_value(requested_end_date)
+        if not start_date or not end_date:
+            return None, None, None, "start_date and end_date must be YYYY-MM-DD"
+        if start_date > end_date:
+            return None, None, None, "start_date cannot be after end_date"
+        return start_date, end_date, "range", None
+
+    if requested_date:
+        summary_date = _coerce_date_value(requested_date)
+        if not summary_date:
+            return None, None, None, "date must be YYYY-MM-DD"
+        return summary_date, summary_date, "single", None
+
+    today = datetime.now(IST).date()
+    return today, today, "single", None
+
+
+def _pay_at_cafe_queue_date_predicate(start_date, end_date):
+    return or_(
+        Transaction.booked_date.between(start_date, end_date),
+        and_(
+            Transaction.id.is_(None),
+            func.date(Booking.created_at).between(start_date, end_date),
+        ),
+    )
+
+
+def _fetch_pay_at_cafe_queue_id_sets(vendor_id: int, start_date, end_date):
+    pending_rows = db.session.query(Booking.id).join(
+        AvailableGame, Booking.game_id == AvailableGame.id
+    ).outerjoin(
+        Transaction, Transaction.booking_id == Booking.id
+    ).filter(
+        AvailableGame.vendor_id == int(vendor_id),
+        Booking.status == "pending_acceptance",
+        _pay_at_cafe_queue_date_predicate(start_date, end_date),
+    ).all()
+    pending_ids = {int(r.id) for r in pending_rows}
+
+    logs = db.session.execute(
+        text(
+            """
+            SELECT booking_id, action, action_source, created_at
+            FROM pay_at_cafe_action_logs
+            WHERE vendor_id = :vendor_id
+              AND DATE(created_at) BETWEEN :start_date AND :end_date
+            ORDER BY created_at DESC
+            """
+        ),
+        {"vendor_id": int(vendor_id), "start_date": start_date, "end_date": end_date},
+    ).mappings().all()
+
+    accepted_ids = set()
+    rejected_ids = set()
+    auto_accepted_ids = set()
+    auto_rejected_ids = set()
+    latest_action_map = {}
+
+    for row in logs:
+        booking_id = row.get("booking_id")
+        if booking_id is None:
+            continue
+        booking_id = int(booking_id)
+        action = str(row.get("action") or "").lower()
+        action_source = str(row.get("action_source") or "").lower()
+
+        if action == "accepted":
+            accepted_ids.add(booking_id)
+            if action_source == "auto_accept":
+                auto_accepted_ids.add(booking_id)
+        elif action == "rejected":
+            rejected_ids.add(booking_id)
+            if action_source == "auto_reject":
+                auto_rejected_ids.add(booking_id)
+
+        if booking_id not in latest_action_map:
+            latest_action_map[booking_id] = {
+                "action": action,
+                "action_source": action_source,
+                "action_at": row.get("created_at").isoformat() if row.get("created_at") else None,
+            }
+
+    requested_ids = pending_ids | accepted_ids | rejected_ids
+    return {
+        "pending": pending_ids,
+        "accepted": accepted_ids,
+        "rejected": rejected_ids,
+        "auto_accepted": auto_accepted_ids,
+        "auto_rejected": auto_rejected_ids,
+        "requested": requested_ids,
+        "latest_action_map": latest_action_map,
+    }
+
+
+@booking_blueprint.route('/pay-at-cafe/queue-list/<int:vendor_id>', methods=['GET'])
+def get_pay_at_cafe_queue_list(vendor_id: int):
+    try:
+        status = str(request.args.get("status") or "pending").strip().lower()
+        allowed_statuses = {"requested", "pending", "accepted", "rejected", "auto_accepted", "auto_rejected"}
+        if status not in allowed_statuses:
+            return jsonify({"success": False, "message": f"status must be one of: {', '.join(sorted(allowed_statuses))}"}), 400
+
+        start_date, end_date, mode, date_error = _parse_pay_at_cafe_queue_date_filters(request.args)
+        if date_error:
+            return jsonify({"success": False, "message": date_error}), 400
+
+        _ensure_pay_at_cafe_action_logs_table()
+        queue_sets = _fetch_pay_at_cafe_queue_id_sets(int(vendor_id), start_date, end_date)
+        booking_ids = queue_sets.get(status, set()) or set()
+        if not booking_ids:
+            response_payload = {
+                "success": True,
+                "vendor_id": int(vendor_id),
+                "mode": mode,
+                "status": status,
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+                "count": 0,
+                "items": [],
+            }
+            if mode == "single":
+                response_payload["date"] = start_date.isoformat()
+            return jsonify(response_payload), 200
+
+        rows = db.session.query(
+            Booking.id.label("booking_id"),
+            Booking.user_id.label("user_id"),
+            Booking.game_id.label("game_id"),
+            Booking.slot_id.label("slot_id"),
+            Booking.status.label("booking_status"),
+            Booking.created_at.label("created_at"),
+            Booking.squad_details.label("squad_details"),
+            User.name.label("username"),
+            ContactInfo.phone.label("phone"),
+            ContactInfo.email.label("email"),
+            AvailableGame.game_name.label("game_name"),
+            AvailableGame.single_slot_price.label("single_slot_price"),
+            Slot.start_time.label("start_time"),
+            Slot.end_time.label("end_time"),
+            Transaction.booked_date.label("booked_date"),
+        ).join(
+            User, Booking.user_id == User.id
+        ).outerjoin(
+            ContactInfo,
+            and_(ContactInfo.parent_id == User.id, ContactInfo.parent_type == "user")
+        ).join(
+            AvailableGame, Booking.game_id == AvailableGame.id
+        ).outerjoin(
+            Slot, Booking.slot_id == Slot.id
+        ).outerjoin(
+            Transaction, Transaction.booking_id == Booking.id
+        ).filter(
+            Booking.id.in_(list(booking_ids)),
+            AvailableGame.vendor_id == int(vendor_id),
+        ).order_by(
+            Booking.created_at.desc()
+        ).all()
+
+        latest_action_map = queue_sets.get("latest_action_map", {}) or {}
+        items = []
+        for row in rows:
+            details = _parse_json_details(row.squad_details)
+            resolved_date = _coerce_date_value(details.get("booked_date") or details.get("book_date") or row.booked_date)
+            if not resolved_date:
+                resolved_date = row.created_at.date() if row.created_at else datetime.now(IST).date()
+
+            if row.start_time and row.end_time:
+                try:
+                    slot_time = f"{row.start_time.strftime('%I:%M %p')} - {row.end_time.strftime('%I:%M %p')}"
+                except Exception:
+                    slot_time = "N/A"
+            else:
+                slot_time = "N/A"
+
+            action_meta = latest_action_map.get(int(row.booking_id), {})
+            items.append({
+                "booking_id": int(row.booking_id),
+                "user_id": int(row.user_id),
+                "username": row.username or "Unknown User",
+                "phone": row.phone,
+                "email": row.email,
+                "game_id": int(row.game_id) if row.game_id is not None else None,
+                "game_name": row.game_name or "Unknown Game",
+                "slot_id": int(row.slot_id) if row.slot_id is not None else None,
+                "time": slot_time,
+                "date": resolved_date.isoformat(),
+                "booking_status": str(row.booking_status or ""),
+                "queue_status": status,
+                "action": action_meta.get("action"),
+                "action_source": action_meta.get("action_source"),
+                "action_at": action_meta.get("action_at"),
+                "amount": float(row.single_slot_price or 0.0),
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+            })
+
+        response_payload = {
+            "success": True,
+            "vendor_id": int(vendor_id),
+            "mode": mode,
+            "status": status,
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "count": len(items),
+            "items": items,
+        }
+        if mode == "single":
+            response_payload["date"] = start_date.isoformat()
+        return jsonify(response_payload), 200
+    except Exception as exc:
+        current_app.logger.exception("Failed pay-at-cafe queue list vendor=%s err=%s", vendor_id, exc)
+        return jsonify({"success": False, "message": "Failed to fetch pay-at-cafe queue list"}), 500
 
 
 @booking_blueprint.route('/pay-at-cafe/pending/<int:vendor_id>', methods=['GET'])
