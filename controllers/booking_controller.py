@@ -4382,12 +4382,21 @@ def redeem_voucher():
 def get_user_bookings():
     user_id = g.auth_user_id 
     limit = request.args.get("limit", type=int) or int(current_app.config.get("USER_BOOKINGS_MAX_ITEMS", 120))
-    cache_key = f"user-bookings|u:{int(user_id)}|q:{request.query_string.decode('utf-8')}"
+    compact_requested = str(request.args.get("compact", "false")).lower() == "true"
+    source_hint = str(request.headers.get("X-Client-Source") or "").strip().lower()
+    use_compact = compact_requested or source_hint in {"app", "flutter", "mobile"}
+    cache_key = (
+        f"user-bookings|u:{int(user_id)}|q:{request.query_string.decode('utf-8')}"
+        f"|compact:{int(use_compact)}"
+    )
     cached = _read_cache_get(cache_key)
     if cached is not None:
         return jsonify(cached), 200
-    bookings = BookingService.get_user_bookings(user_id, limit=limit)
-    payload = [booking.to_dict() for booking in bookings]
+    if use_compact:
+        payload = BookingService.get_user_bookings_compact(user_id, limit=limit)
+    else:
+        bookings = BookingService.get_user_bookings(user_id, limit=limit)
+        payload = [booking.to_dict() for booking in bookings]
     _read_cache_set(
         cache_key,
         payload,

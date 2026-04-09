@@ -49,6 +49,87 @@ class BookingService:
         .all()
 
     @staticmethod
+    def get_user_bookings_compact(user_id, limit=120):
+        safe_limit = max(1, min(int(limit or 120), 300))
+        rows = db.session.execute(text("""
+            SELECT
+                b.id AS booking_id,
+                b.user_id,
+                b.status,
+                b.booking_mode,
+                b.created_at,
+                b.updated_at,
+                b.custom_start_time,
+                b.custom_end_time,
+                b.duration_hours,
+                ag.id AS game_id,
+                ag.vendor_id,
+                ag.game_name,
+                ag.single_slot_price,
+                s.id AS slot_id,
+                s.start_time,
+                s.end_time,
+                tx.booked_date
+            FROM bookings b
+            LEFT JOIN available_games ag ON ag.id = b.game_id
+            LEFT JOIN slots s ON s.id = b.slot_id
+            LEFT JOIN LATERAL (
+                SELECT t.booked_date
+                FROM transactions t
+                WHERE t.booking_id = b.id
+                ORDER BY t.created_at DESC NULLS LAST, t.id DESC
+                LIMIT 1
+            ) tx ON TRUE
+            WHERE b.user_id = :user_id
+            ORDER BY b.created_at DESC
+            LIMIT :limit
+        """), {
+            "user_id": int(user_id),
+            "limit": int(safe_limit),
+        }).mappings().all()
+
+        payload = []
+        for row in rows:
+            item = {
+                "booking_id": int(row["booking_id"]),
+                "user_id": int(row["user_id"]),
+                "status": row["status"],
+                "booking_mode": row["booking_mode"] or "regular",
+                "access_code": None,
+                "book_date": row["booked_date"].isoformat() if row["booked_date"] else None,
+                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
+                "extra_services": [],
+                "squad_details": {},
+                "squad_members": [],
+            }
+
+            if row["slot_id"] is not None:
+                item["slot"] = {
+                    "slot_id": int(row["slot_id"]),
+                    "gaming_type_id": {
+                        "game_id": int(row["game_id"]) if row["game_id"] is not None else None,
+                        "vendor_id": int(row["vendor_id"]) if row["vendor_id"] is not None else None,
+                        "game_name": row["game_name"],
+                        "single_slot_price": row["single_slot_price"],
+                        "cafe_name": None,
+                    },
+                    "time": {
+                        "start_time": str(row["start_time"]) if row["start_time"] else None,
+                        "end_time": str(row["end_time"]) if row["end_time"] else None,
+                    }
+                }
+
+            if str(item["booking_mode"]).lower() == "private":
+                item["custom_start_time"] = str(row["custom_start_time"]) if row["custom_start_time"] else None
+                item["custom_end_time"] = str(row["custom_end_time"]) if row["custom_end_time"] else None
+                item["duration_hours"] = float(row["duration_hours"]) if row["duration_hours"] is not None else None
+
+            payload.append(item)
+
+        return payload
+
+    @staticmethod
     def cancel_booking(booking_id):
         booking = Booking.query.get(booking_id)
         if not booking:
