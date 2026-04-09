@@ -3522,6 +3522,19 @@ def confirm_booking():
 
         current_app.logger.info(f"Confirm payload: {data}")
 
+        normalized_payment_mode = str(payment_mode or "").strip().lower()
+        if normalized_payment_mode in {"hash_wallet", "wallet_credit"}:
+            payment_mode = "wallet"
+            normalized_payment_mode = "wallet"
+        elif normalized_payment_mode in {"hour_pass", "pass_hour"}:
+            use_hour_pass = True
+            payment_mode = "hour_pass"
+            normalized_payment_mode = "hour_pass"
+        elif normalized_payment_mode in {"pass", "date_pass", "cafe_pass", "global_pass"}:
+            use_pass = True
+            payment_mode = "date_pass"
+            normalized_payment_mode = "date_pass"
+
         def _payment_label(mode_value: str) -> str:
             if mode_value == "wallet":
                 return "Hash Wallet"
@@ -3930,13 +3943,16 @@ def confirm_booking():
                     amount_payable -= voucher_discount
 
             # Payment processing
-            if payment_mode == "wallet" and amount_payable > 0:
+            normalized_payment_mode = str(payment_mode or "").strip().lower()
+            if normalized_payment_mode in {"wallet", "hash_wallet"} and amount_payable > 0:
                 BookingService.debit_wallet(user.id, booking.id, amount_payable)
                 payment_mode_used = "wallet"
             elif use_hour_pass:
                 payment_mode_used = "hour_pass"
             elif use_pass:
                 payment_mode_used = "date_pass"
+            elif normalized_payment_mode in {"cash", "pay_at_cafe"}:
+                payment_mode_used = "pay_at_cafe"
             else:
                 if amount_payable == 0:
                     payment_mode_used = "free"
@@ -5794,6 +5810,117 @@ def new_booking(vendor_id):
                 dashboard_status = "upcoming"
             BookingService.insert_into_vendor_dashboard_table(trans.id, console_id_val, dashboard_status)
             BookingService.insert_into_vendor_promo_table(trans.id, console_id_val)
+
+        # Emit real-time booking lifecycle after confirmation so dashboard cards update immediately.
+        if socketio:
+            console_rows = (
+                Console.query
+                .filter(Console.id.in_([
+                    int(meta.get("console_id"))
+                    for meta in booking_runtime.values()
+                    if int(meta.get("console_id") or -1) > 0
+                ]))
+                .all()
+            )
+            console_name_by_id = {int(c.id): str(c.model_number or f"HASH{c.id}") for c in console_rows}
+            for booking in bookings:
+                slot_obj = slot_map.get(int(booking.slot_id))
+                runtime_meta = booking_runtime.get(int(booking.id), {})
+                runtime_status = str(runtime_meta.get("dashboard_status") or "upcoming").strip().lower()
+                runtime_console_id = int(runtime_meta.get("console_id") or -1)
+                event_status = "checked_in" if runtime_status == "current" else "confirmed"
+                price_meta = slot_pricing.get(int(booking.id)) or {}
+                event_slot_price = float(price_meta.get("unit_price") or 0.0)
+
+                try:
+                    event_payload = build_booking_event_payload(
+                        vendor_id=vendor_id,
+                        booking_id=int(booking.id),
+                        slot_id=int(booking.slot_id),
+                        user_id=int(user.id),
+                        username=user.name,
+                        game_id=int(booking.game_id),
+                        game_name=available_game.game_name,
+                        date_value=booked_date_obj.isoformat(),
+                        slot_price=event_slot_price,
+                        start_time=(slot_obj.start_time if slot_obj else None),
+                        end_time=(slot_obj.end_time if slot_obj else None),
+                        console_id=(runtime_console_id if runtime_console_id > 0 else None),
+                        status=event_status,
+                        booking_status=runtime_status,
+                        squad_details=booking.squad_details or {},
+                    )
+                    emit_booking_event(socketio, event="booking", data=event_payload, vendor_id=vendor_id)
+                    socketio.emit("booking_admin", event_payload, to="dashboard_admin")
+                except Exception as emit_err:
+                    current_app.logger.warning(
+                        "new_booking booking emit failed booking_id=%s vendor_id=%s err=%s",
+                        booking.id,
+                        vendor_id,
+                        emit_err,
+                    )
+
+                if runtime_status == "current" and slot_obj:
+                    current_slot_payload = {
+                        "vendorId": int(vendor_id),
+                        "slotId": int(booking.slot_id),
+                        "slot_id": int(booking.slot_id),
+                        "bookId": int(booking.id),
+                        "bookingId": int(booking.id),
+                        "book_id": int(booking.id),
+                        "booking_id": int(booking.id),
+                        "startTime": slot_obj.start_time.strftime("%I:%M %p"),
+                        "endTime": slot_obj.end_time.strftime("%I:%M %p"),
+                        "start_time": slot_obj.start_time.isoformat(),
+                        "end_time": slot_obj.end_time.isoformat(),
+                        "status": "Booked",
+                        "consoleId": (runtime_console_id if runtime_console_id > 0 else None),
+                        "console_id": (runtime_console_id if runtime_console_id > 0 else None),
+                        "consoleType": (
+                            console_name_by_id.get(runtime_console_id)
+                            if runtime_console_id > 0 else None
+                        ),
+                        "consoleNumber": (
+                            str(runtime_console_id) if runtime_console_id > 0 else None
+                        ),
+                        "username": user.name,
+                        "userId": int(user.id),
+                        "user_id": int(user.id),
+                        "customer_phone": (
+                            user.contact_info.phone
+                            if getattr(user, "contact_info", None) and user.contact_info.phone
+                            else ""
+                        ),
+                        "customer_email": (
+                            user.contact_info.email
+                            if getattr(user, "contact_info", None) and user.contact_info.email
+                            else ""
+                        ),
+                        "game_id": int(booking.game_id),
+                        "date": booked_date_obj.isoformat(),
+                        "slot_price": event_slot_price,
+                        "single_slot_price": event_slot_price,
+                    }
+                    try:
+                        socketio.emit("current_slot", current_slot_payload, room=f"vendor_{int(vendor_id)}")
+                        if runtime_console_id > 0:
+                            socketio.emit(
+                                "console_availability",
+                                {
+                                    "vendorId": int(vendor_id),
+                                    "game_id": int(booking.game_id),
+                                    "console_id": int(runtime_console_id),
+                                    "is_available": False,
+                                },
+                                room=f"vendor_{int(vendor_id)}",
+                            )
+                    except Exception as current_emit_err:
+                        current_app.logger.warning(
+                            "new_booking current_slot emit failed booking_id=%s vendor_id=%s err=%s",
+                            booking.id,
+                            vendor_id,
+                            current_emit_err,
+                        )
 
         # Prepare booking details for email
         booking_details = []
@@ -10049,19 +10176,32 @@ def kiosk_book_next_slot(vendor_id):
             pass
 
         if should_start_now and socketio:
-            socketio.emit("current_slot", {
+            current_slot_payload = {
+                "vendorId": int(vendor_id),
+                "vendor_id": int(vendor_id),
+                "slotId": int(candidate["next_slot_id"]),
                 "slot_id": int(candidate["next_slot_id"]),
+                "bookId": int(new_booking.id),
+                "bookingId": int(new_booking.id),
                 "book_id": int(new_booking.id),
+                "booking_id": int(new_booking.id),
+                "startTime": candidate["next_start_dt"].strftime("%I:%M %p"),
+                "endTime": candidate["next_end_dt"].strftime("%I:%M %p"),
                 "start_time": candidate["next_start_dt"].isoformat(),
                 "end_time": candidate["next_end_dt"].isoformat(),
-                "status": "current",
+                "status": "Booked",
+                "consoleId": int(console_id),
                 "console_id": int(console_id),
+                "consoleNumber": str(console_id),
+                "userId": int(resolved_user_id),
                 "user_id": int(resolved_user_id),
                 "username": username,
                 "game_id": int(candidate["game_id"]),
                 "date": candidate["next_slot_date"].isoformat(),
+                "slot_price": float(final_amount),
                 "single_slot_price": float(final_amount),
-            }, room=room)
+            }
+            socketio.emit("current_slot", current_slot_payload, room=room)
 
         if socketio:
             remaining_row = db.session.execute(
