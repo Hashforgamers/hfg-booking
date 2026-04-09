@@ -117,6 +117,14 @@ def _to_jsonable(obj: Any) -> Any:
     # Fallback to string representation
     return str(obj)
 
+
+def sanitize_realtime_payload(data: Any) -> Any:
+    """
+    Public helper to coerce arbitrary payloads into JSON-serializable shapes
+    for direct socket emits.
+    """
+    return _to_jsonable(data)
+
 def _canonical_payload(data: Dict[str, Any], time_fmt: str) -> Dict[str, Any]:
     username = _coalesce(data.get("username"), data.get("user_name"))
     booking_id = _coalesce(data.get("bookingId"), data.get("booking_id"))
