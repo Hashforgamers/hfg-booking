@@ -18,9 +18,10 @@ from models.passModels import CafePass
 from models.extraServiceMenu import ExtraServiceMenu
 from sqlalchemy import or_
 from utils.realtime import emit_booking_event
-from flask import current_app, g
+from flask import current_app, g, has_app_context
 from sqlalchemy import text
 from typing import Optional
+from rq import get_current_job
 import uuid
 
 
@@ -425,14 +426,23 @@ class BookingService:
     @staticmethod
     def release_slot(slot_id, booking_id, book_date):
         """Function to release the slot after 10 seconds if not verified"""
-        from app import create_app
+        app = current_app._get_current_object() if has_app_context() else None
+        should_push_context = app is None
+        if should_push_context:
+            from app import create_app
+            app = create_app()
 
-        # Create the Flask app
-        app = create_app()
-
-        # Push the application context inside the job
-        with app.app_context():
+        def _run_release():
             try:
+                rq_job = get_current_job()
+                current_app.logger.info(
+                    "release_slot.start booking_id=%s slot_id=%s book_date=%s via_rq=%s rq_job_id=%s",
+                    booking_id,
+                    slot_id,
+                    str(book_date),
+                    bool(rq_job),
+                    rq_job.id if rq_job else None,
+                )
                 booking = Booking.query.get(booking_id)
 
                 if booking and booking.status in ["pending_verified", "cancelled"]:
@@ -479,12 +489,25 @@ class BookingService:
                         'booking_id': booking_id,
                         'booking_status': 'verification_failed'
                     })
+                else:
+                    current_app.logger.info(
+                        "release_slot.skip booking_id=%s slot_id=%s status=%s",
+                        booking_id,
+                        slot_id,
+                        getattr(booking, "status", None),
+                    )
 
             except Exception as e:
                 db.session.rollback()
                 current_app.logger.error(f"Failed to release slot: {str(e)}")
             finally:
                 db.session.remove()  # Ensure DB session cleanup
+
+        if should_push_context:
+            with app.app_context():
+                _run_release()
+        else:
+            _run_release()
 
     @staticmethod
     def insert_into_vendor_dashboard_table(trans_id, console_id, status=None):
