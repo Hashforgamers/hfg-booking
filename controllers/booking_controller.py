@@ -84,6 +84,7 @@ from services.security import auth_required_self
 
 from utils.realtime import build_booking_event_payload
 from utils.realtime import emit_booking_event
+from utils.realtime import sanitize_realtime_payload
 
 import uuid
 from collections import defaultdict
@@ -3493,7 +3494,7 @@ def confirm_booking():
 
                 # 2) Admin tap: emit every booking event to a dedicated admin room for the dashboard bridge
                 # This lets the dashboard receive ALL events upstream without pre-joining every vendor room.
-                socketio.emit("booking_admin", event_payload, to="dashboard_admin")
+                socketio.emit("booking_admin", sanitize_realtime_payload(event_payload), to="dashboard_admin")
 
                 current_app.logger.info(
                     "confirm_booking.emit_done booking_id=%s vendor_id=%s room=%s admin_room=%s",
@@ -4160,7 +4161,7 @@ def confirm_booking():
                     squad_details=booking.squad_details or {}
                 )
                 emit_booking_event(socketio, event="booking", data=event_payload, vendor_id=vendor.id)
-                socketio.emit("booking_admin", event_payload, to="dashboard_admin")
+                socketio.emit("booking_admin", sanitize_realtime_payload(event_payload), to="dashboard_admin")
             except Exception as e:
                 current_app.logger.exception(f"WebSocket emit failed: {e}")
 
@@ -4618,7 +4619,7 @@ def direct_booking():
         for payload in event_payloads:
             try:
                 emit_booking_event(socketio, event="booking", data=payload, vendor_id=vendor_id)
-                socketio.emit("booking_admin", payload, to="dashboard_admin")
+                socketio.emit("booking_admin", sanitize_realtime_payload(payload), to="dashboard_admin")
             except Exception as emit_err:
                 current_app.logger.warning(
                     "Direct booking emit failed booking_id=%s err=%s",
@@ -5912,7 +5913,7 @@ def new_booking(vendor_id):
                         squad_details=booking.squad_details or {},
                     )
                     emit_booking_event(socketio, event="booking", data=event_payload, vendor_id=vendor_id)
-                    socketio.emit("booking_admin", event_payload, to="dashboard_admin")
+                    socketio.emit("booking_admin", sanitize_realtime_payload(event_payload), to="dashboard_admin")
                 except Exception as emit_err:
                     current_app.logger.warning(
                         "new_booking booking emit failed booking_id=%s vendor_id=%s err=%s",
@@ -10232,7 +10233,7 @@ def kiosk_book_next_slot(vendor_id):
         )
         emit_booking_event(socketio, event="booking", data=event_payload, vendor_id=int(vendor_id))
         try:
-            socketio.emit("booking_admin", event_payload, to="dashboard_admin")
+            socketio.emit("booking_admin", sanitize_realtime_payload(event_payload), to="dashboard_admin")
         except Exception:
             pass
 
