@@ -64,7 +64,10 @@ def extract_bearer_token():
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         return None
-    return auth.split(" ", 1)[1].strip()
+    token = auth.split(" ", 1)[1].strip()
+    if len(token) > 8192:
+        return None
+    return token
 
 def auth_required(match_route_user=True, decrypt_user=False):
     """
@@ -86,6 +89,12 @@ def auth_required(match_route_user=True, decrypt_user=False):
 
             try:
                 secret = current_app.config["JWT_SECRET_KEY"]
+                if (
+                    bool(current_app.config.get("JWT_REQUIRE_STRONG_SECRET", True))
+                    and len(str(secret or "")) < 32
+                ):
+                    current_app.logger.error("JWT secret is below 32 bytes; refusing token auth")
+                    return jsonify({"message": "Service misconfigured"}), 500
 
                 # Decode without enforcing expiration
                 claims = jwt.decode(
@@ -103,8 +112,9 @@ def auth_required(match_route_user=True, decrypt_user=False):
                 # Handle expiration manually
                 exp = claims.get("exp")
                 if exp and int(time.time()) > exp:
-                    current_app.logger.warning("Token is expired, but proceeding anyway.")
                     g.token_expired = True
+                    if not bool(current_app.config.get("AUTH_ALLOW_EXPIRED_TOKENS", False)):
+                        return jsonify({"message": "Token expired"}), 401
                 else:
                     g.token_expired = False
 

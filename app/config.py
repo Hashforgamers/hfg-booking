@@ -85,6 +85,8 @@ class Config:
     # Auth performance + logging controls
     AUTH_DEBUG_LOGS = os.getenv("AUTH_DEBUG_LOGS", "false").lower() in ("true", "1", "t", "yes", "y")
     AUTH_DECRYPT_CACHE_TTL_SEC = int(os.getenv("AUTH_DECRYPT_CACHE_TTL_SEC", "300") or 300)
+    AUTH_ALLOW_EXPIRED_TOKENS = os.getenv("AUTH_ALLOW_EXPIRED_TOKENS", "false").lower() in ("true", "1", "t", "yes", "y")
+    JWT_REQUIRE_STRONG_SECRET = os.getenv("JWT_REQUIRE_STRONG_SECRET", "true").lower() in ("true", "1", "t", "yes", "y")
 
     # Bound user bookings payload size for consistent latency
     USER_BOOKINGS_MAX_ITEMS = int(os.getenv("USER_BOOKINGS_MAX_ITEMS", "120") or 120)
