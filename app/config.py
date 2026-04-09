@@ -70,3 +70,14 @@ class Config:
     # Pay-at-cafe email action token settings
     PAY_AT_CAFE_EMAIL_ACTION_SECRET = os.getenv("PAY_AT_CAFE_EMAIL_ACTION_SECRET", SECRET_KEY)
     PAY_AT_CAFE_EMAIL_ACTION_TTL_MINUTES = int(os.getenv("PAY_AT_CAFE_EMAIL_ACTION_TTL_MINUTES", "720") or 720)
+
+    # API performance / observability knobs
+    API_ENABLE_TIMING_HEADERS = os.getenv("API_ENABLE_TIMING_HEADERS", "true").lower() in ("true", "1", "t", "yes", "y")
+    API_SLOW_REQUEST_MS = int(os.getenv("API_SLOW_REQUEST_MS", "120") or 120)
+    API_PUBLIC_CACHE_CONTROL = os.getenv("API_PUBLIC_CACHE_CONTROL", "public, max-age=15, stale-while-revalidate=30")
+    API_PRIVATE_CACHE_CONTROL = os.getenv("API_PRIVATE_CACHE_CONTROL", "no-store")
+
+    # Endpoint-level read microcache profiles
+    READ_MICROCACHE_MAX_ITEMS = int(os.getenv("READ_MICROCACHE_MAX_ITEMS", "25000") or 25000)
+    BOOKING_PRICING_ESTIMATE_CACHE_TTL_SEC = int(os.getenv("BOOKING_PRICING_ESTIMATE_CACHE_TTL_SEC", "10") or 10)
+    USER_BOOKINGS_CACHE_TTL_SEC = int(os.getenv("USER_BOOKINGS_CACHE_TTL_SEC", "8") or 8)

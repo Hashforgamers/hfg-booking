@@ -79,6 +79,7 @@ import hashlib
 import razorpay
 from decimal import Decimal
 from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 from services.security import auth_required_self
 
 from utils.realtime import build_booking_event_payload
@@ -92,6 +93,29 @@ from utils.common import generate_fid, generate_access_code, get_razorpay_keys
 
 booking_blueprint = Blueprint('bookings', __name__)
 _ASYNC_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="booking-bg")
+_READ_MICROCACHE = {}
+_READ_MICROCACHE_LOCK = Lock()
+
+
+def _read_cache_get(cache_key):
+    now_ts = time.time()
+    with _READ_MICROCACHE_LOCK:
+        item = _READ_MICROCACHE.get(cache_key)
+        if not item:
+            return None
+        if item["expires_at"] <= now_ts:
+            _READ_MICROCACHE.pop(cache_key, None)
+            return None
+        return item["payload"]
+
+
+def _read_cache_set(cache_key, payload, ttl_sec):
+    ttl = max(int(ttl_sec or 0), 1)
+    max_items = int(current_app.config.get("READ_MICROCACHE_MAX_ITEMS", 25000))
+    with _READ_MICROCACHE_LOCK:
+        if len(_READ_MICROCACHE) >= max_items:
+            _READ_MICROCACHE.pop(next(iter(_READ_MICROCACHE)), None)
+        _READ_MICROCACHE[cache_key] = {"payload": payload, "expires_at": time.time() + ttl}
 
 
 
@@ -2126,6 +2150,17 @@ def booking_pricing_estimate():
             except (TypeError, ValueError):
                 return jsonify({"success": False, "message": "game_id must be a valid integer"}), 400
 
+        cache_key = (
+            "booking-pricing-estimate"
+            f"|vendor:{vendor_id}"
+            f"|game:{game_id or 0}"
+            f"|qs:{request.query_string.decode('utf-8')}"
+            f"|body:{json.dumps(payload, sort_keys=True, separators=(',', ':'))}"
+        )
+        cached = _read_cache_get(cache_key)
+        if cached is not None:
+            return jsonify(cached), 200
+
         available_game = _resolve_available_game_for_vendor(
             vendor_id=vendor_id,
             console_type=console_type,
@@ -2197,7 +2232,7 @@ def booking_pricing_estimate():
             normalized_squad_details["slot_base_multiplier"] = int(squad_player_count if uses_multi_slot_units else 1)
             normalized_squad_details["applied_extra_controller_qty"] = int(extra_controller_qty)
 
-        return jsonify({
+        response_payload = {
             "success": True,
             "vendor_id": vendor_id,
             "matched_game_id": int(available_game.id),
@@ -2220,7 +2255,13 @@ def booking_pricing_estimate():
                 "app_fee_amount": round(float(app_fee_amount or 0.0), 2),
                 "estimated_final_amount": round(estimated_final_amount, 2),
             },
-        }), 200
+        }
+        _read_cache_set(
+            cache_key,
+            response_payload,
+            int(current_app.config.get("BOOKING_PRICING_ESTIMATE_CACHE_TTL_SEC", 10)),
+        )
+        return jsonify(response_payload), 200
 
     except Exception as e:
         current_app.logger.exception("Failed to build booking pricing estimate")
@@ -4340,8 +4381,18 @@ def redeem_voucher():
 @auth_required_self(decrypt_user=True) 
 def get_user_bookings():
     user_id = g.auth_user_id 
+    cache_key = f"user-bookings|u:{int(user_id)}|q:{request.query_string.decode('utf-8')}"
+    cached = _read_cache_get(cache_key)
+    if cached is not None:
+        return jsonify(cached), 200
     bookings = BookingService.get_user_bookings(user_id)
-    return jsonify([booking.to_dict() for booking in bookings])
+    payload = [booking.to_dict() for booking in bookings]
+    _read_cache_set(
+        cache_key,
+        payload,
+        int(current_app.config.get("USER_BOOKINGS_CACHE_TTL_SEC", 8)),
+    )
+    return jsonify(payload), 200
 
 @booking_blueprint.route('/bookings/<int:booking_id>', methods=['DELETE'])
 def cancel_booking(booking_id):
