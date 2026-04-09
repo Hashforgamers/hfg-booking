@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import re
 from typing import Any, Dict, List, Optional
+import time
+from threading import Lock
 
 from db.extensions import db
 from models.consoleCatalog import ConsoleCatalog
@@ -170,6 +172,12 @@ LEGACY_CONSOLE_ALIAS: Dict[str, str] = {
     "room": "private_room",
 }
 
+_CATALOG_MERGE_CACHE: Dict[str, Dict[str, Any]] = {}
+_CATALOG_MERGE_CACHE_LOCK = Lock()
+_CATALOG_MERGE_CACHE_TTL_SEC = 300
+_DEFAULT_CATALOG_SEEDED = False
+_DEFAULT_CATALOG_SEEDED_LOCK = Lock()
+
 
 def _slugify(raw: Any) -> str:
     value = str(raw or "").strip().lower()
@@ -186,15 +194,23 @@ def normalize_console_slug(raw: Any) -> str:
 
 
 def ensure_default_console_catalog_seed() -> None:
+    global _DEFAULT_CATALOG_SEEDED
+    with _DEFAULT_CATALOG_SEEDED_LOCK:
+        if _DEFAULT_CATALOG_SEEDED:
+            return
     try:
         existing = {row.slug for row in ConsoleCatalog.query.with_entities(ConsoleCatalog.slug).all()}
         missing = [entry for entry in DEFAULT_CONSOLE_CATALOG if entry["slug"] not in existing]
         if not missing:
+            with _DEFAULT_CATALOG_SEEDED_LOCK:
+                _DEFAULT_CATALOG_SEEDED = True
             return
 
         for entry in missing:
             db.session.add(ConsoleCatalog(**entry))
         db.session.commit()
+        with _DEFAULT_CATALOG_SEEDED_LOCK:
+            _DEFAULT_CATALOG_SEEDED = True
     except Exception:
         db.session.rollback()
 
@@ -215,6 +231,13 @@ def _row_to_dict(row: Any) -> Dict[str, Any]:
 
 
 def get_merged_console_catalog(vendor_id: Optional[int] = None, include_inactive: bool = False) -> List[Dict[str, Any]]:
+    cache_key = f"{int(vendor_id) if vendor_id is not None else 0}:{int(include_inactive)}"
+    now_ts = time.time()
+    with _CATALOG_MERGE_CACHE_LOCK:
+        cached = _CATALOG_MERGE_CACHE.get(cache_key)
+        if cached and float(cached.get("expires_at", 0)) > now_ts:
+            return cached["payload"]
+
     ensure_default_console_catalog_seed()
 
     q = ConsoleCatalog.query
@@ -228,7 +251,10 @@ def get_merged_console_catalog(vendor_id: Optional[int] = None, include_inactive
         merged[item["slug"]] = item
 
     if vendor_id is None:
-        return sorted(merged.values(), key=lambda x: str(x.get("display_name") or x["slug"]).lower())
+        payload = sorted(merged.values(), key=lambda x: str(x.get("display_name") or x["slug"]).lower())
+        with _CATALOG_MERGE_CACHE_LOCK:
+            _CATALOG_MERGE_CACHE[cache_key] = {"payload": payload, "expires_at": now_ts + _CATALOG_MERGE_CACHE_TTL_SEC}
+        return payload
 
     override_q = VendorConsoleOverride.query.filter(VendorConsoleOverride.vendor_id == int(vendor_id))
     if not include_inactive:
@@ -280,7 +306,10 @@ def get_merged_console_catalog(vendor_id: Optional[int] = None, include_inactive
             "source": "vendor_override",
         }
 
-    return sorted(merged.values(), key=lambda x: str(x.get("display_name") or x["slug"]).lower())
+    payload = sorted(merged.values(), key=lambda x: str(x.get("display_name") or x["slug"]).lower())
+    with _CATALOG_MERGE_CACHE_LOCK:
+        _CATALOG_MERGE_CACHE[cache_key] = {"payload": payload, "expires_at": now_ts + _CATALOG_MERGE_CACHE_TTL_SEC}
+    return payload
 
 
 def resolve_console_capabilities(vendor_id: Optional[int], raw_console: Any) -> Dict[str, Any]:
@@ -418,6 +447,8 @@ def upsert_vendor_console_override(vendor_id: int, payload: Dict[str, Any]) -> D
     override.controller_policy = controller_policy
     override.is_active = bool(payload.get("is_active", True))
     db.session.flush()
+    with _CATALOG_MERGE_CACHE_LOCK:
+        _CATALOG_MERGE_CACHE.clear()
     return _override_to_dict(override)
 
 
@@ -433,4 +464,6 @@ def set_vendor_console_override_active(vendor_id: int, slug: str, is_active: boo
         return None
     override.is_active = bool(is_active)
     db.session.flush()
+    with _CATALOG_MERGE_CACHE_LOCK:
+        _CATALOG_MERGE_CACHE.clear()
     return _override_to_dict(override)
