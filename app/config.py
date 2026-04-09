@@ -81,3 +81,10 @@ class Config:
     READ_MICROCACHE_MAX_ITEMS = int(os.getenv("READ_MICROCACHE_MAX_ITEMS", "25000") or 25000)
     BOOKING_PRICING_ESTIMATE_CACHE_TTL_SEC = int(os.getenv("BOOKING_PRICING_ESTIMATE_CACHE_TTL_SEC", "10") or 10)
     USER_BOOKINGS_CACHE_TTL_SEC = int(os.getenv("USER_BOOKINGS_CACHE_TTL_SEC", "8") or 8)
+
+    # Auth performance + logging controls
+    AUTH_DEBUG_LOGS = os.getenv("AUTH_DEBUG_LOGS", "false").lower() in ("true", "1", "t", "yes", "y")
+    AUTH_DECRYPT_CACHE_TTL_SEC = int(os.getenv("AUTH_DECRYPT_CACHE_TTL_SEC", "300") or 300)
+
+    # Bound user bookings payload size for consistent latency
+    USER_BOOKINGS_MAX_ITEMS = int(os.getenv("USER_BOOKINGS_MAX_ITEMS", "120") or 120)

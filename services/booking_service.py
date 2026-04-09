@@ -11,7 +11,7 @@ from models.paymentTransactionMapping import PaymentTransactionMapping
 from models.hashWallet import HashWallet
 from models.hashWalletTransaction import HashWalletTransaction
 from models.passModels import UserPass
-from sqlalchemy.orm import joinedload
+from sqlalchemy.orm import joinedload, selectinload
 from models.bookingExtraService import BookingExtraService
 from models.extraServiceMenuImage import ExtraServiceMenuImage
 from models.passModels import CafePass
@@ -32,17 +32,20 @@ class BookingService:
         BookingService.socketio = socketio_instance  # Set the socketio instance
 
     @staticmethod
-    def get_user_bookings(user_id):
+    def get_user_bookings(user_id, limit=120):
+        safe_limit = max(1, min(int(limit or 120), 300))
         return db.session.query(Booking)\
         .options(
             joinedload(Booking.slot),
             joinedload(Booking.transaction),
             joinedload(Booking.access_code_entry),
-            joinedload(Booking.booking_extra_services)
-                .joinedload(BookingExtraService.extra_service_menu)  # Note: using menu_item, not extra_service_menu
-                .joinedload(ExtraServiceMenu.images)
+            selectinload(Booking.booking_extra_services)
+                .selectinload(BookingExtraService.extra_service_menu)
+                .selectinload(ExtraServiceMenu.images)
         )\
         .filter(Booking.user_id == user_id)\
+        .order_by(Booking.created_at.desc())\
+        .limit(safe_limit)\
         .all()
 
     @staticmethod

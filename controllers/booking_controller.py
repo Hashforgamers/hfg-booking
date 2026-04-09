@@ -4381,11 +4381,12 @@ def redeem_voucher():
 @auth_required_self(decrypt_user=True) 
 def get_user_bookings():
     user_id = g.auth_user_id 
+    limit = request.args.get("limit", type=int) or int(current_app.config.get("USER_BOOKINGS_MAX_ITEMS", 120))
     cache_key = f"user-bookings|u:{int(user_id)}|q:{request.query_string.decode('utf-8')}"
     cached = _read_cache_get(cache_key)
     if cached is not None:
         return jsonify(cached), 200
-    bookings = BookingService.get_user_bookings(user_id)
+    bookings = BookingService.get_user_bookings(user_id, limit=limit)
     payload = [booking.to_dict() for booking in bookings]
     _read_cache_set(
         cache_key,
