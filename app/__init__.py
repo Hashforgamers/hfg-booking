@@ -1,4 +1,4 @@
-from flask import Flask, make_response
+from flask import Flask, make_response, g, request
 from flask_cors import CORS
 from flask_socketio import SocketIO
 from db.extensions import db, migrate, mail
@@ -14,6 +14,8 @@ from rq_scheduler import Scheduler
 
 import logging
 import os
+import time
+import uuid
 
 # Allow all origins for SocketIO
 socketio = SocketIO(
@@ -27,6 +29,8 @@ socketio = SocketIO(
 def create_app():
     app = Flask(__name__)
     app.config.from_object(Config)
+    app.json.sort_keys = False
+    app.json.compact = True
 
     db.init_app(app)
     migrate.init_app(app, db)
@@ -49,6 +53,23 @@ def create_app():
     app.register_blueprint(game_blueprint, url_prefix="/api")
     app.register_blueprint(pass_blueprint, url_prefix='/api')
 
+    def _is_public_cacheable_path(path: str) -> bool:
+        return (
+            path.startswith("/api/getSlots/vendor/")
+            or path.startswith("/api/games/vendor/")
+            or path.startswith("/api/vendor/") and path.endswith("/passes/available")
+            or path.startswith("/api/bookings/pricing-estimate")
+        )
+
+    @app.before_request
+    def _start_request_timer():
+        g.request_start_ts = time.perf_counter()
+        incoming_request_id = (
+            request.headers.get("X-Request-Id")
+            or request.headers.get("X-Correlation-Id")
+        )
+        g.request_id = incoming_request_id or str(uuid.uuid4())
+
     @app.after_request
     def force_cors_headers(response):
         # Safety net: keep CORS headers present even on error paths/timeouts from Flask handlers.
@@ -57,6 +78,33 @@ def create_app():
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
         response.headers["Access-Control-Expose-Headers"] = "Content-Type, Authorization"
         response.headers["Access-Control-Max-Age"] = "86400"
+        response.headers["X-Request-Id"] = getattr(g, "request_id", "")
+
+        if app.config.get("API_ENABLE_TIMING_HEADERS", True):
+            start_ts = getattr(g, "request_start_ts", None)
+            if start_ts is not None:
+                elapsed_ms = (time.perf_counter() - start_ts) * 1000.0
+                response.headers["X-Response-Time-Ms"] = f"{elapsed_ms:.2f}"
+                slow_ms = int(app.config.get("API_SLOW_REQUEST_MS", 120) or 120)
+                if elapsed_ms >= slow_ms:
+                    app.logger.warning(
+                        "slow_request request_id=%s method=%s path=%s status=%s elapsed_ms=%.2f",
+                        getattr(g, "request_id", "-"),
+                        request.method,
+                        request.path,
+                        response.status_code,
+                        elapsed_ms,
+                    )
+
+        if "Cache-Control" not in response.headers and request.method == "GET" and response.status_code == 200:
+            has_auth_header = bool(request.headers.get("Authorization"))
+            if not has_auth_header and _is_public_cacheable_path(request.path):
+                response.headers["Cache-Control"] = app.config.get(
+                    "API_PUBLIC_CACHE_CONTROL",
+                    "public, max-age=15, stale-while-revalidate=30",
+                )
+            else:
+                response.headers["Cache-Control"] = app.config.get("API_PRIVATE_CACHE_CONTROL", "no-store")
         return response
 
     # Global preflight fallback so browser OPTIONS never hard-fails with 404.
