@@ -96,6 +96,9 @@ booking_blueprint = Blueprint('bookings', __name__)
 _ASYNC_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="booking-bg")
 _READ_MICROCACHE = {}
 _READ_MICROCACHE_LOCK = Lock()
+_SCHEMA_INIT_LOCK = Lock()
+_VENDOR_PAY_AT_CAFE_SETTINGS_READY = False
+_PAY_AT_CAFE_ACTION_LOGS_READY = False
 
 
 def _read_cache_get(cache_key):
@@ -117,6 +120,23 @@ def _read_cache_set(cache_key, payload, ttl_sec):
         if len(_READ_MICROCACHE) >= max_items:
             _READ_MICROCACHE.pop(next(iter(_READ_MICROCACHE)), None)
         _READ_MICROCACHE[cache_key] = {"payload": payload, "expires_at": time.time() + ttl}
+
+
+def _read_cache_invalidate_prefix(prefix: str):
+    if not prefix:
+        return 0
+    removed = 0
+    with _READ_MICROCACHE_LOCK:
+        keys = [k for k in _READ_MICROCACHE.keys() if str(k).startswith(prefix)]
+        for key in keys:
+            _READ_MICROCACHE.pop(key, None)
+            removed += 1
+    return removed
+
+
+def _invalidate_pay_at_cafe_vendor_cache(vendor_id: int):
+    prefix = f"pay-at-cafe|v:{int(vendor_id)}|"
+    return _read_cache_invalidate_prefix(prefix)
 
 
 
@@ -2554,6 +2574,12 @@ def _render_pay_at_cafe_email_action_page(success: bool, title: str, message: st
 
 
 def _ensure_vendor_pay_at_cafe_settings_table():
+    global _VENDOR_PAY_AT_CAFE_SETTINGS_READY
+    if _VENDOR_PAY_AT_CAFE_SETTINGS_READY:
+        return
+    with _SCHEMA_INIT_LOCK:
+        if _VENDOR_PAY_AT_CAFE_SETTINGS_READY:
+            return
     db.session.execute(
         text(
             """
@@ -2568,6 +2594,7 @@ def _ensure_vendor_pay_at_cafe_settings_table():
         )
     )
     db.session.commit()
+    _VENDOR_PAY_AT_CAFE_SETTINGS_READY = True
 
 
 def _get_vendor_pay_at_cafe_settings(vendor_id: int) -> dict:
@@ -2663,6 +2690,7 @@ def _save_vendor_pay_at_cafe_settings(vendor_id: int, payload: dict) -> dict:
         },
     )
     db.session.commit()
+    _invalidate_pay_at_cafe_vendor_cache(int(vendor_id))
     return {
         "vendor_id": int(vendor_id),
         "auto_accept_enabled": auto_accept,
@@ -2672,6 +2700,12 @@ def _save_vendor_pay_at_cafe_settings(vendor_id: int, payload: dict) -> dict:
 
 
 def _ensure_pay_at_cafe_action_logs_table():
+    global _PAY_AT_CAFE_ACTION_LOGS_READY
+    if _PAY_AT_CAFE_ACTION_LOGS_READY:
+        return
+    with _SCHEMA_INIT_LOCK:
+        if _PAY_AT_CAFE_ACTION_LOGS_READY:
+            return
     db.session.execute(
         text(
             """
@@ -2696,6 +2730,7 @@ def _ensure_pay_at_cafe_action_logs_table():
         )
     )
     db.session.commit()
+    _PAY_AT_CAFE_ACTION_LOGS_READY = True
 
 
 def _log_pay_at_cafe_action(vendor_id: int, booking_ids, action: str, action_source: str, reason: str = ""):
@@ -2987,6 +3022,8 @@ def create_booking():
             db.session.commit()
             log.info("bookings.post.db_committed cid=%s bookings_count=%s skipped=%s processed=%s",
                      cid, len(booking_mappings), skipped, processed)
+            if is_pay_at_cafe:
+                _invalidate_pay_at_cafe_vendor_cache(int(vendor_id))
         except Exception as commit_err:
             db.session.rollback()
             log.exception("bookings.post.db_commit_failed cid=%s error=%s", cid, commit_err)
@@ -8083,6 +8120,16 @@ def get_pay_at_cafe_queue_summary(vendor_id: int):
         if date_error:
             return jsonify({"success": False, "message": date_error}), 400
 
+        force_refresh = str(request.args.get("refresh") or request.args.get("no_cache") or "").strip().lower() in {"1", "true", "yes"}
+        cache_key = (
+            f"pay-at-cafe|v:{int(vendor_id)}|queue-summary"
+            f"|q:{request.query_string.decode('utf-8')}"
+        )
+        if not force_refresh:
+            cached = _read_cache_get(cache_key)
+            if cached is not None:
+                return jsonify(cached), 200
+
         _ensure_pay_at_cafe_action_logs_table()
 
         pending_rows = db.session.query(Booking.id).join(
@@ -8143,6 +8190,11 @@ def get_pay_at_cafe_queue_summary(vendor_id: int):
         }
         if mode == "single":
             response_payload["date"] = start_date.isoformat()
+        _read_cache_set(
+            cache_key,
+            response_payload,
+            int(current_app.config.get("PAY_AT_CAFE_QUEUE_SUMMARY_CACHE_TTL_SEC", 8)),
+        )
         return jsonify(response_payload), 200
     except Exception as exc:
         current_app.logger.exception("Failed pay-at-cafe queue summary vendor=%s err=%s", vendor_id, exc)
@@ -8379,6 +8431,15 @@ def get_pending_pay_at_cafe_bookings(vendor_id):
     """Get all pending pay-at-cafe bookings for a vendor"""
     try:
         current_app.logger.info(f"Fetching pending pay at cafe bookings for vendor {vendor_id}")
+        force_refresh = str(request.args.get("refresh") or request.args.get("no_cache") or "").strip().lower() in {"1", "true", "yes"}
+        cache_key = (
+            f"pay-at-cafe|v:{int(vendor_id)}|pending"
+            f"|q:{request.query_string.decode('utf-8')}"
+        )
+        if not force_refresh:
+            cached = _read_cache_get(cache_key)
+            if cached is not None:
+                return jsonify(cached), 200
         settings = _get_vendor_pay_at_cafe_settings(vendor_id)
         auto_reject_enabled = bool(settings.get("auto_reject_enabled"))
         auto_reject_after_minutes = int(settings.get("auto_reject_after_minutes") or 15)
@@ -8563,13 +8624,19 @@ def get_pending_pay_at_cafe_bookings(vendor_id):
             len(set(auto_rejected_ids)),
         )
         
-        return jsonify({
+        response_payload = {
             'success': True,
             'notifications': notifications,
             'count': len(notifications),
             'stale_skipped_count': len(stale_skipped),
             'auto_rejected_count': len(set(auto_rejected_ids)),
-        }), 200
+        }
+        _read_cache_set(
+            cache_key,
+            response_payload,
+            int(current_app.config.get("PAY_AT_CAFE_PENDING_CACHE_TTL_SEC", 8)),
+        )
+        return jsonify(response_payload), 200
 
     except Exception as e:
         current_app.logger.exception(f"Error fetching pending pay at cafe bookings: {e}")
@@ -8917,6 +8984,7 @@ def accept_pay_at_cafe_booking():
 
         # Commit all changes
         db.session.commit()
+        _invalidate_pay_at_cafe_vendor_cache(int(vendor_id))
         if accepted_booking_ids:
             try:
                 source_reason = {
@@ -9087,6 +9155,7 @@ def reject_pay_at_cafe_booking():
         
         # Commit changes
         db.session.commit()
+        _invalidate_pay_at_cafe_vendor_cache(int(vendor_id))
         if rejected_booking_ids:
             try:
                 _log_pay_at_cafe_action(
