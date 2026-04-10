@@ -4420,9 +4420,20 @@ def redeem_voucher():
 def get_user_bookings():
     user_id = g.auth_user_id 
     limit = request.args.get("limit", type=int) or int(current_app.config.get("USER_BOOKINGS_MAX_ITEMS", 120))
-    compact_requested = str(request.args.get("compact", "false")).lower() == "true"
+    compact_raw = request.args.get("compact")
+    compact_requested = (
+        str(compact_raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+        if compact_raw is not None else None
+    )
     source_hint = str(request.headers.get("X-Client-Source") or "").strip().lower()
-    use_compact = compact_requested or source_hint in {"app", "flutter", "mobile"}
+    # Default to compact payload for latency-sensitive app flows.
+    # Full payload is still available with ?compact=false.
+    if compact_requested is None:
+        use_compact = True
+    else:
+        use_compact = bool(compact_requested)
+    if source_hint in {"app", "flutter", "mobile"}:
+        use_compact = True
     cache_key = (
         f"user-bookings|u:{int(user_id)}|q:{request.query_string.decode('utf-8')}"
         f"|compact:{int(use_compact)}"
@@ -4438,7 +4449,7 @@ def get_user_bookings():
     _read_cache_set(
         cache_key,
         payload,
-        int(current_app.config.get("USER_BOOKINGS_CACHE_TTL_SEC", 8)),
+        int(current_app.config.get("USER_BOOKINGS_CACHE_TTL_SEC", 20)),
     )
     return jsonify(payload), 200
 
