@@ -2,6 +2,7 @@ import os
 from services.config_load import load_key_from_file
 
 class Config:
+    APP_ENV = os.getenv("APP_ENV", os.getenv("FLASK_ENV", "development")).lower()
     SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change-me")
     JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "dev-jwt-secret-change-me")
     DEBUG = os.getenv("DEBUG_MODE", "false").lower() == "true"
@@ -76,6 +77,8 @@ class Config:
     API_SLOW_REQUEST_MS = int(os.getenv("API_SLOW_REQUEST_MS", "120") or 120)
     API_PUBLIC_CACHE_CONTROL = os.getenv("API_PUBLIC_CACHE_CONTROL", "public, max-age=15, stale-while-revalidate=30")
     API_PRIVATE_CACHE_CONTROL = os.getenv("API_PRIVATE_CACHE_CONTROL", "no-store")
+    TRUST_PROXY = os.getenv("TRUST_PROXY", "true").lower() in ("true", "1", "t", "yes", "y")
+    CORS_ALLOWED_ORIGINS = os.getenv("CORS_ALLOWED_ORIGINS", "*")
 
     # Endpoint-level read microcache profiles
     READ_MICROCACHE_MAX_ITEMS = int(os.getenv("READ_MICROCACHE_MAX_ITEMS", "25000") or 25000)
@@ -90,3 +93,7 @@ class Config:
 
     # Bound user bookings payload size for consistent latency
     USER_BOOKINGS_MAX_ITEMS = int(os.getenv("USER_BOOKINGS_MAX_ITEMS", "120") or 120)
+
+    SOCKETIO_PING_INTERVAL_SEC = int(os.getenv("SOCKETIO_PING_INTERVAL_SEC", "25") or 25)
+    SOCKETIO_PING_TIMEOUT_SEC = int(os.getenv("SOCKETIO_PING_TIMEOUT_SEC", "60") or 60)
+    SOCKETIO_MAX_HTTP_BUFFER_BYTES = int(os.getenv("SOCKETIO_MAX_HTTP_BUFFER_BYTES", str(1_000_000)) or 1_000_000)
