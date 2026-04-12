@@ -16,19 +16,53 @@ import logging
 import os
 import time
 import uuid
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 # Allow all origins for SocketIO
 socketio = SocketIO(
     async_mode="eventlet",
     cors_allowed_origins="*",
+    ping_interval=int(os.getenv("SOCKETIO_PING_INTERVAL_SEC", "25") or 25),
+    ping_timeout=int(os.getenv("SOCKETIO_PING_TIMEOUT_SEC", "60") or 60),
+    max_http_buffer_size=int(os.getenv("SOCKETIO_MAX_HTTP_BUFFER_BYTES", str(1_000_000)) or 1_000_000),
     logger=os.getenv("SOCKETIO_LOGGER", "false").lower() == "true",
     engineio_logger=os.getenv("ENGINEIO_LOGGER", "false").lower() == "true"
 )
+
+def _is_insecure_secret(value: str, placeholders: set[str]) -> bool:
+    if not value:
+        return True
+    candidate = str(value).strip()
+    if candidate in placeholders:
+        return True
+    return len(candidate) < 32
+
+
+def _validate_production_config(app: Flask) -> None:
+    app_env = str(app.config.get("APP_ENV", "development")).lower()
+    is_production = app_env in {"prod", "production"}
+    if not is_production:
+        return
+    weak_secret = _is_insecure_secret(
+        app.config.get("SECRET_KEY", ""),
+        {"dev-secret-change-me", "changeme"},
+    )
+    weak_jwt_secret = _is_insecure_secret(
+        app.config.get("JWT_SECRET_KEY", ""),
+        {"dev-jwt-secret-change-me", "dev", "changeme"},
+    )
+    if weak_secret or weak_jwt_secret:
+        raise RuntimeError(
+            "In production, SECRET_KEY and JWT_SECRET_KEY must be strong non-default values with length >= 32."
+        )
 
 
 def create_app():
     app = Flask(__name__)
     app.config.from_object(Config)
+    _validate_production_config(app)
+    if app.config.get("TRUST_PROXY", True):
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
     app.json.sort_keys = False
     app.json.compact = True
 
@@ -40,7 +74,7 @@ def create_app():
     CORS(
         app,
         resources={r"/*": {
-            "origins": "*",
+            "origins": app.config.get("CORS_ALLOWED_ORIGINS", "*"),
             "allow_headers": "*",
             "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
             "expose_headers": ["Content-Type", "Authorization"],
@@ -130,7 +164,11 @@ def create_app():
     scheduler = Scheduler(queue=queue, connection=redis_conn)
     app.extensions["scheduler"] = scheduler
 
-    socketio.init_app(app, message_queue=app.config["REDIS_URL"])
+    socketio.init_app(
+        app,
+        message_queue=app.config["REDIS_URL"],
+        cors_allowed_origins=app.config.get("CORS_ALLOWED_ORIGINS", "*"),
+    )
     register_socketio_events(socketio)
 
     return app
