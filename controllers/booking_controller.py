@@ -19,6 +19,7 @@ from models.console import Console
 from models.voucher import Voucher
 from models.voucherRedemptionLog import VoucherRedemptionLog
 from models.paymentTransactionMapping import PaymentTransactionMapping
+from models.bookingGatewayPayment import BookingGatewayPayment
 from models.userHashCoin import UserHashCoin
 from models.accessBookingCode import AccessBookingCode
 from models.bookingExtraService  import BookingExtraService
@@ -2814,12 +2815,20 @@ def _trigger_pay_at_cafe_action_async(booking_id: int, vendor_id: int, action: s
 
 
 @booking_blueprint.route('/create_order', methods=['POST'])
+@auth_required_self(decrypt_user=True)
 def create_order():
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
 
     amount = data.get('amount')  # in paisa
     currency = data.get('currency', 'INR')
-    receipt = data.get('receipt', f'order_rcpt_{int(time.time())}')
+    try:
+        amount = int(amount)
+    except (TypeError, ValueError):
+        return jsonify({"error": "amount must be a positive integer in paise"}), 400
+    if amount <= 0 or str(currency).upper() != "INR":
+        return jsonify({"error": "only positive INR orders are supported"}), 400
+    # Do not let client-controlled receipts/notes be used as booking evidence.
+    receipt = f"bk_{int(g.auth_user_id)}_{uuid.uuid4().hex[:24]}"
 
     RAZORPAY_KEY_ID = current_app.config.get("RAZORPAY_KEY_ID")
     RAZORPAY_KEY_SECRET = current_app.config.get("RAZORPAY_KEY_SECRET")
@@ -2831,12 +2840,16 @@ def create_order():
 
     payload = {
         "amount": amount,
-        "currency": currency,
+        "currency": "INR",
         "receipt": receipt,
-        "payment_capture": 1
+        "payment_capture": 1,
+        "notes": {
+            "source": "hfg_booking",
+            "user_id": str(int(g.auth_user_id)),
+        },
     }
 
-    response = requests.post("https://api.razorpay.com/v1/orders", headers=headers, json=payload)
+    response = requests.post("https://api.razorpay.com/v1/orders", headers=headers, json=payload, timeout=10)
 
     if response.ok:
         return jsonify(response.json()), 200
@@ -2845,8 +2858,9 @@ def create_order():
     return jsonify({"error": "Order creation failed"}), response.status_code
 
 @booking_blueprint.route('/capture_payment', methods=['POST'])
+@auth_required_self(decrypt_user=True)
 def capture_payment():
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     payment_id = data.get('razorpay_payment_id')
     order_id = data.get('razorpay_order_id')
     signature = data.get('razorpay_signature')
@@ -2865,7 +2879,7 @@ def capture_payment():
         hashlib.sha256
     ).hexdigest()
 
-    if generated_signature != signature:
+    if not hmac.compare_digest(generated_signature, signature):
         return jsonify({"message": "Invalid payment signature"}), 400
 
     # Initialize Razorpay client
@@ -2874,6 +2888,12 @@ def capture_payment():
     try:
         # Fetch payment to check status
         payment = razorpay_client.payment.fetch(payment_id)
+        if str(payment.get("order_id") or "") != str(order_id):
+            return jsonify({"message": "Payment does not belong to the supplied order"}), 400
+        order = razorpay_client.order.fetch(order_id)
+        owner_note = (order.get("notes") or {}).get("user_id") or (payment.get("notes") or {}).get("user_id")
+        if str(owner_note or "") != str(int(g.auth_user_id)):
+            return jsonify({"message": "Payment order does not belong to this user"}), 403
 
         if payment['status'] == 'authorized':
             # Capture payment manually if not auto-captured during order creation
@@ -3210,6 +3230,7 @@ def release_slot():
         return jsonify({"message": "Failed to release slot(s)", "error": str(e)}), 500
 
 @booking_blueprint.route('/generate_payment_link', methods=['POST'])
+@auth_required_self(decrypt_user=True)
 def generate_payment_link():
     """
     Creates a Razorpay Payment Link and returns the URL.
@@ -3241,6 +3262,7 @@ def generate_payment_link():
         "currency": "INR",
         "accept_partial": False,
         "description": "Payment for your order",
+        "notes": {"source": "hfg_booking", "user_id": str(int(g.auth_user_id))},
         "customer": {
             "name": "Customer Name",  # Optional, add if you have it
             "contact": customer_contact,
@@ -3578,12 +3600,14 @@ def confirm_booking():
 
 @booking_blueprint.route('/bookings/confirm', methods=['POST'])
 @booking_blueprint.route('/confirm/bookings', methods=['POST'])
+@auth_required_self(decrypt_user=True)
 def confirm_booking():
     try:
         data = request.get_json(force=True)
 
         booking_ids = data.get('booking_id')
         payment_id = data.get('payment_id')
+        razorpay_order_id = data.get('razorpay_order_id') or data.get('order_id')
         book_date_str = data.get('book_date')
         voucher_code = data.get('voucher_code')
         payment_mode = data.get('payment_mode', "payment_gateway")
@@ -3660,6 +3684,8 @@ def confirm_booking():
         RAZORPAY_KEY_SECRET = current_app.config.get("RAZORPAY_KEY_SECRET")
         razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
         razorpay_payment_verified = True
+        razorpay_payment = None
+        gateway_payment_ledger = None
 
         # Verify Razorpay payment if using gateway
         if payment_mode == "payment_gateway" and not use_hour_pass:
@@ -3668,6 +3694,26 @@ def confirm_booking():
             try:
                 payment = razorpay_client.payment.fetch(payment_id)
                 if payment['status'] == 'captured':
+                    if razorpay_order_id and str(payment.get("order_id") or "") != str(razorpay_order_id):
+                        return jsonify({"message": "Payment does not belong to the supplied order"}), 400
+                    order = razorpay_client.order.fetch(payment.get("order_id"))
+                    owner_note = (order.get("notes") or {}).get("user_id") or (payment.get("notes") or {}).get("user_id")
+                    if str(owner_note or "") != str(int(g.auth_user_id)):
+                        return jsonify({"message": "Payment order does not belong to this user"}), 403
+                    existing_payment = BookingGatewayPayment.query.filter_by(payment_id=str(payment_id)).with_for_update().first()
+                    if existing_payment:
+                        return jsonify({"message": "Payment has already been used for another booking"}), 409
+                    razorpay_payment = payment
+                    gateway_payment_ledger = BookingGatewayPayment(
+                        payment_id=str(payment_id),
+                        order_id=str(payment.get("order_id") or ""),
+                        user_id=int(g.auth_user_id),
+                        amount=Decimal(str(payment.get("amount") or 0)) / Decimal("100"),
+                        currency=str(payment.get("currency") or "").upper(),
+                        status="processing",
+                    )
+                    db.session.add(gateway_payment_ledger)
+                    db.session.flush()
                     razorpay_payment_verified = True
                 else:
                     return jsonify({"message": "Payment not successful"}), 400
@@ -3699,10 +3745,13 @@ def confirm_booking():
                 joinedload(Booking.squad_members),
             )
             .filter(Booking.id.in_(booking_ids))
+            .with_for_update()
             .all()
         )
         if not booking_objects:
             return jsonify({'message': 'No pending bookings found for confirmation'}), 404
+        if any(int(booking.user_id or 0) != int(g.auth_user_id) for booking in booking_objects):
+            return jsonify({'message': 'You can only confirm your own bookings'}), 403
         booking_map = {b.id: b for b in booking_objects}
         first_booking = booking_objects[0] if booking_objects else None
         first_game = first_booking.game if first_booking else None
@@ -4334,6 +4383,15 @@ def confirm_booking():
                     job["net_total_paid"] = float(job.get("net_total_paid") or 0.0) + max(float(extra_controller_fare_total or 0.0) - float(controller_app_fee or 0.0), 0.0)
                     vendor_mail_jobs[controller_vendor.id] = job
 
+        if razorpay_payment is not None:
+            expected_paise = int((Decimal(str(total_amount_paid)) * Decimal("100")).quantize(Decimal("1")))
+            if (
+                int(razorpay_payment.get("amount") or 0) != expected_paise
+                or str(razorpay_payment.get("currency") or "").upper() != "INR"
+            ):
+                db.session.rollback()
+                return jsonify({"message": "Captured payment amount does not match the booking total"}), 400
+            gateway_payment_ledger.status = "settled"
         db.session.commit()
         _send_booking_mail_async(current_app._get_current_object(), mail_jobs)
         if vendor_mail_jobs:
@@ -4454,13 +4512,19 @@ def get_user_bookings():
     return jsonify(payload), 200
 
 @booking_blueprint.route('/bookings/<int:booking_id>', methods=['DELETE'])
+@auth_required_self(decrypt_user=True)
 def cancel_booking(booking_id):
     try:
         result = cancel_bookings_with_refund(
             booking_ids=[booking_id],
             repayment_type="none",
             reason="Cancelled by client",
+            actor_scope="app",
+            actor_user_id=g.auth_user_id,
+            enforce_user_ownership=True,
         )
+        if result.get("unauthorized_ids"):
+            return jsonify({"message": "You can only cancel your own bookings"}), 403
         return jsonify(result)
     except ValueError:
         return jsonify({"message": "Booking not found"}), 404

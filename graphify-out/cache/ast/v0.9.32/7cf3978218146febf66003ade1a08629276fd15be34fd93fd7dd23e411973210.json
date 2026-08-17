@@ -1,0 +1,1 @@
+{"nodes": [{"id": "$graphify-root$_sql_20260316_app_fee_sql", "label": "20260316_app_fee.sql", "file_type": "code", "source_file": "sql/20260316_app_fee.sql", "source_location": null}, {"id": "transactions", "label": "transactions", "file_type": "code", "source_file": "", "source_location": "", "origin_file": "$graphify-root$/sql/20260316_app_fee.sql"}], "edges": []}
