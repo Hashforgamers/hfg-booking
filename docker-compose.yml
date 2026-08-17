@@ -8,23 +8,25 @@ services:
     environment:
       FLASK_APP: app.py
       FLASK_RUN_HOST: 0.0.0.0
-      DEBUG_MODE: "true"
+      DEBUG_MODE: ${DEBUG_MODE:-false}
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY is required}
 
-      DATABASE_URI: "postgresql://neondb_owner:Od9UnVJ2Wvfr@ep-patient-sound-a8cq577j-pooler.eastus2.azure.neon.tech/neondb?sslmode=require"
+      DATABASE_URI: ${DATABASE_URI:?DATABASE_URI is required}
 
-      REDIS_URL: "rediss://red-culflulds78s73bqveqg:h6uqD1Bivbn7K5y3RRSECELE2Jwp2us3@oregon-redis.render.com:6379/0"
-      REDIS_SSL: "true"
+      REDIS_URL: ${REDIS_URL:?REDIS_URL is required}
+      REDIS_SSL: ${REDIS_SSL:-true}
 
-      MAIL_SERVER: mail.smtp2go.com
-      MAIL_PORT: "2525"
-      MAIL_USE_TLS: "true"
-      MAIL_USE_SSL: "false"
-      MAIL_USERNAME: support@hashforgamers.co.in
-      MAIL_PASSWORD: "h3b:@yasDm"
-      MAIL_DEFAULT_SENDER: support@hashforgamers.co.in
+      MAIL_SERVER: ${MAIL_SERVER:-}
+      MAIL_PORT: ${MAIL_PORT:-587}
+      MAIL_USE_TLS: ${MAIL_USE_TLS:-true}
+      MAIL_USE_SSL: ${MAIL_USE_SSL:-false}
+      MAIL_USERNAME: ${MAIL_USERNAME:-}
+      MAIL_PASSWORD: ${MAIL_PASSWORD:-}
+      MAIL_DEFAULT_SENDER: ${MAIL_DEFAULT_SENDER:-no-reply@hashforgamers.co.in}
 
-      RAZORPAY_KEY_ID: dummyValue
-      RAZORPAY_KEY_SECRET: dummyvalue
+      RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:?RAZORPAY_KEY_ID is required}
+      RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:?RAZORPAY_KEY_SECRET is required}
 
       # Cancellation policy defaults (app cancellations)
       CANCELLATION_FEE_ENABLED: "true"
