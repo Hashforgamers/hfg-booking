@@ -9,7 +9,7 @@ python-socketio
 flask-cors
 gevent>=24.10.1
 redis
-gevent-websocket
+gevent-websocket==0.10.1
 rq
 rq-scheduler
 rq-dashboard

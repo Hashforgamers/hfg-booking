@@ -61,7 +61,7 @@ services:
 
     command: >
       sh -c "
-        gunicorn -k gevent -w 1 app:app -b 0.0.0.0:5054 --timeout 120 &
+        gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 1 app:app -b 0.0.0.0:5054 --timeout 120 &
         rq worker booking_tasks --url \"$$REDIS_URL\" &
         rq-dashboard --redis-url \"$$REDIS_URL\" --port 9181 &
         rqscheduler --url \"$$REDIS_URL\" --interval 60
