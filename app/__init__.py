@@ -20,7 +20,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 # Allow all origins for SocketIO
 socketio = SocketIO(
-    async_mode="eventlet",
+    async_mode="gevent",
     cors_allowed_origins="*",
     ping_interval=int(os.getenv("SOCKETIO_PING_INTERVAL_SEC", "25") or 25),
     ping_timeout=int(os.getenv("SOCKETIO_PING_TIMEOUT_SEC", "60") or 60),

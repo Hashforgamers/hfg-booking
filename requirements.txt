@@ -7,7 +7,7 @@ Flask-Mail
 Flask-SocketIO
 python-socketio
 flask-cors
-gevent
+gevent>=24.10.1
 redis
 gevent-websocket
 rq
@@ -20,6 +20,5 @@ razorpay
 firebase-admin
 pyjwt
 cryptography
-gunicorn
+gunicorn[gevent]>=26.0.0,<27.0.0
 flask-socketio
-eventlet
