@@ -82,6 +82,7 @@ from decimal import Decimal
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 from services.security import auth_required_self
+from services.vendor_access import require_vendor_permission
 
 from utils.realtime import build_booking_event_payload
 from utils.realtime import emit_booking_event
@@ -10772,7 +10773,21 @@ def credit_unused_slots_to_wallet(vendor_id):
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@booking_blueprint.route('/vendor/<int:vendor_id>/monthly-credit/eligibility/<int:user_id>', methods=['GET'])
+@require_vendor_permission("booking.manage", "credit.manage")
+def monthly_credit_eligibility(vendor_id, user_id):
+    account = MonthlyCreditAccount.query.filter_by(vendor_id=vendor_id, user_id=user_id).first()
+    rows = [] if account is None else [{
+        "user_id": account.user_id,
+        "is_active": account.is_active,
+        "credit_limit": float(account.credit_limit or 0),
+        "outstanding_amount": float(account.outstanding_amount or 0),
+    }]
+    return jsonify(success=True, accounts=rows)
+
+
 @booking_blueprint.route('/vendor/<int:vendor_id>/monthly-credit/accounts', methods=['GET', 'PUT'])
+@require_vendor_permission("credit.manage")
 def monthly_credit_accounts(vendor_id):
     try:
         if request.method == 'GET':
@@ -10837,6 +10852,7 @@ def monthly_credit_accounts(vendor_id):
 
 
 @booking_blueprint.route('/vendor/<int:vendor_id>/monthly-credit/statement/<int:user_id>', methods=['GET'])
+@require_vendor_permission("credit.manage")
 def monthly_credit_statement(vendor_id, user_id):
     try:
         account = MonthlyCreditAccount.query.filter_by(vendor_id=vendor_id, user_id=user_id).first()
@@ -10897,6 +10913,7 @@ def monthly_credit_statement(vendor_id, user_id):
 
 
 @booking_blueprint.route('/vendor/<int:vendor_id>/monthly-credit/settle', methods=['POST'])
+@require_vendor_permission("credit.manage")
 def settle_monthly_credit(vendor_id):
     """
     Settle monthly credit outstanding at month-end.
