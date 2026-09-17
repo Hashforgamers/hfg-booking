@@ -10464,66 +10464,67 @@ def kiosk_book_next_slot(vendor_id):
         return jsonify({"success": False, "message": "Server error", "error": str(e)}), 500
 
 
+@booking_blueprint.route('/vendor/<int:vendor_id>/booking-records', methods=['GET'])
 @booking_blueprint.route('/vendor/<int:vendor_id>/slot-bookings', methods=['GET'])
 def get_slot_bookings(vendor_id):
-    """
-    Get all bookings for specific slot(s) and date
-    Query params: slot_ids (comma-separated), date (YYYY-MM-DD)
-    """
+    """Read slot bookings or paginated vendor booking records."""
     try:
-        # Get query parameters
-        slot_ids_param = request.args.get('slot_ids')  # e.g., "1,2,3"
-        date_param = request.args.get('date')  # e.g., "2026-01-17"
-        
-        if not slot_ids_param or not date_param:
-            return jsonify({
-                'success': False,
-                'message': 'slot_ids and date are required'
-            }), 400
-        
-        # Parse slot IDs
+        records_view = request.path.endswith('/booking-records')
+        booking_date = None
+        filters = [Transaction.vendor_id == vendor_id]
+        page, page_size = 1, 25
         try:
-            slot_ids = [int(sid.strip()) for sid in slot_ids_param.split(',')]
-        except ValueError:
-            return jsonify({
-                'success': False,
-                'message': 'Invalid slot_ids format'
-            }), 400
-        
-        booking_date = _coerce_date_value(date_param)
-        if not booking_date:
-            return jsonify({
-                'success': False,
-                'message': 'Invalid date format. Use YYYY-MM-DD or YYYYMMDD'
-            }), 400
-        
-        current_app.logger.info(
-            f"Fetching bookings for vendor={vendor_id} slots={slot_ids} date={booking_date}"
-        )
-        
-        # Query bookings with all related data
-        # ✅ FIXED: Changed ContactInfo.user_id to ContactInfo.parent_id
-        bookings_query = db.session.query(Booking)\
-            .join(Transaction, Transaction.booking_id == Booking.id)\
-            .join(User, User.id == Booking.user_id)\
-            .join(ContactInfo, (ContactInfo.parent_id == User.id) & (ContactInfo.parent_type == 'user'))\
-            .outerjoin(BookingExtraService, BookingExtraService.booking_id == Booking.id)\
-            .outerjoin(ExtraServiceMenu, ExtraServiceMenu.id == BookingExtraService.menu_item_id)\
-            .filter(
-                Booking.slot_id.in_(slot_ids),
-                Transaction.booked_date == booking_date,
-                Transaction.vendor_id == vendor_id,
-                Booking.status.in_(['confirmed', 'checked_in', 'completed', 'pending_verified', 'pending_acceptance'])
-            )\
-            .options(
-                joinedload(Booking.transaction),
-                joinedload(Booking.slot),
-                joinedload(Booking.booking_extra_services).joinedload(BookingExtraService.extra_service_menu),
-                joinedload(Booking.squad_members)
-            )\
-            .distinct()\
-            .all()
-        
+            if records_view:
+                page = max(1, int(request.args.get('page', 1)))
+                for param, column, lower in [
+                    ('date_from', Transaction.booked_date, True),
+                    ('date_to', Transaction.booked_date, False),
+                ]:
+                    raw = request.args.get(param)
+                    if raw:
+                        value = _coerce_date_value(raw)
+                        if not value:
+                            raise ValueError('Invalid date filter')
+                        filters.append(column >= value if lower else column <= value)
+                if request.args.get('date_from') and request.args.get('date_to'):
+                    if _coerce_date_value(request.args['date_from']) > _coerce_date_value(request.args['date_to']):
+                        raise ValueError('Start date must be before end date')
+                time_from = request.args.get('time_from')
+                time_to = request.args.get('time_to')
+                for raw, lower in [(time_from, True), (time_to, False)]:
+                    if raw:
+                        value = datetime.strptime(raw, '%H:%M').time()
+                        filters.append(Slot.start_time >= value if lower else Slot.start_time <= value)
+                if time_from and time_to and time_from > time_to:
+                    # Overnight start-time window, e.g. 22:00–02:00.
+                    filters = filters[:-2]
+                    filters.append(or_(Slot.start_time >= datetime.strptime(time_from, '%H:%M').time(),
+                                       Slot.start_time <= datetime.strptime(time_to, '%H:%M').time()))
+            else:
+                slot_ids_param = request.args.get('slot_ids')
+                booking_date = _coerce_date_value(request.args.get('date'))
+                if not slot_ids_param or not booking_date:
+                    raise ValueError('Valid slot_ids and date are required')
+                slot_ids = [int(sid.strip()) for sid in slot_ids_param.split(',')]
+                filters.extend([Booking.slot_id.in_(slot_ids), Transaction.booked_date == booking_date,
+                                Booking.status.in_(['confirmed', 'checked_in', 'completed', 'pending_verified', 'pending_acceptance'])])
+        except (ValueError, TypeError):
+            return jsonify({'success': False, 'message': 'Invalid booking filters. Check dates, times, and page.'}), 400
+
+        query = (db.session.query(Booking)
+                 .join(Transaction, Transaction.booking_id == Booking.id)
+                 .join(Slot, Slot.id == Booking.slot_id)
+                 .filter(*filters)
+                 .options(joinedload(Booking.transaction), joinedload(Booking.slot),
+                          joinedload(Booking.booking_extra_services).joinedload(BookingExtraService.extra_service_menu),
+                          joinedload(Booking.squad_members))
+                 .distinct())
+        total = query.count() if records_view else None
+        query = query.order_by(Booking.id.desc())
+        if records_view:
+            query = query.offset((page - 1) * page_size).limit(page_size)
+        bookings_query = query.all()
+
         current_app.logger.info(f"Found {len(bookings_query)} bookings")
         
         # Format response
@@ -10589,7 +10590,7 @@ def get_slot_bookings(vendor_id):
                 'booking_mode': booking.booking_mode,
                 'created_at': booking.created_at.isoformat() if booking.created_at else None,
                 'amount_paid': float(booking.transaction.amount) if booking.transaction else 0,
-                'booking_date': booking.transaction.booked_date.isoformat() if booking.transaction and booking.transaction.booked_date else booking_date.isoformat(),
+                'booking_date': booking.transaction.booked_date.isoformat() if booking.transaction and booking.transaction.booked_date else (booking_date.isoformat() if booking_date else None),
                 'slot_start_time': booking.slot.start_time.strftime('%I:%M %p') if booking.slot and booking.slot.start_time else None,
                 'slot_end_time': booking.slot.end_time.strftime('%I:%M %p') if booking.slot and booking.slot.end_time else None,
                 'squad_enabled': squad_enabled,
@@ -10601,7 +10602,10 @@ def get_slot_bookings(vendor_id):
         return jsonify({
             'success': True,
             'bookings': bookings_data,
-            'count': len(bookings_data)
+            'count': len(bookings_data),
+            'total': total if records_view else len(bookings_data),
+            'page': page,
+            'page_size': page_size
         }), 200
         
     except Exception as e:
