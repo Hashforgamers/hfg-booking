@@ -1,3 +1,4 @@
+import html
 # controllers/pass_controller.py
 from flask import Blueprint, request, jsonify, current_app, g
 from services.pass_service import PassService
@@ -411,19 +412,20 @@ def send_dashboard_pass_otp():
 
         vendor = Vendor.query.filter_by(id=int(vendor_id)).first()
         vendor_name = vendor.cafe_name if vendor else f"Vendor #{vendor_id}"
-        subject = "Pass OTP Verification • Hash For Gamers"
+        subject = "Verify your pass redemption | Hash For Gamers"
         plain_body = (
-            f"Hi {user.name},\n\n"
+            f"Hello {user.name},\n\n"
             f"Your OTP for pass redemption at {vendor_name} is {otp_code}.\n"
             f"This OTP is valid for {_PASS_OTP_TTL_SECONDS // 60} minutes.\n\n"
             f"If this wasn't you, ignore this message."
         )
         html_fragment = f"""
-            <p style="margin:0 0 12px 0;">Hi <strong>{user.name}</strong>,</p>
-            <p style="margin:0 0 12px 0;">Your OTP for pass redemption at <strong>{vendor_name}</strong> is:</p>
-            <div style="font-size:30px;letter-spacing:8px;font-weight:700;color:#22c55e;margin:10px 0 14px 0;">{otp_code}</div>
-            <p style="margin:0 0 10px 0;color:#cbd5e1;">Pass UID: <strong>{pass_uid}</strong></p>
+            <p style="margin:0 0 12px 0;">Hello <strong>{html.escape(str(user.name))}</strong>,</p>
+            <p style="margin:0 0 12px 0;">Use this verification code to redeem your pass at <strong>{html.escape(str(vendor_name))}</strong>:</p>
+            <div style="font-size:30px;letter-spacing:5px;font-weight:700;color:#22c55e;margin:10px 0 14px 0;">{otp_code}</div>
+            <p style="margin:0 0 10px 0;color:#cbd5e1;">Pass UID: <strong>{html.escape(str(pass_uid))}</strong></p>
             <p style="margin:0;color:#cbd5e1;">This OTP expires in <strong>{_PASS_OTP_TTL_SECONDS // 60} minutes</strong>.</p>
+            <p style="color:#94a3b8;font-size:13px;">Do not share this code. If you did not request it, no action is required.</p>
         """
         send_email(subject=subject, recipients=[user.contact_info.email], body=plain_body, html_fragment=html_fragment)
 
