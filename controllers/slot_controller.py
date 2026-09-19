@@ -24,6 +24,12 @@ _expected_blocks_cache = {}
 _expected_blocks_cache_lock = threading.Lock()
 
 
+def _force_slot_refresh():
+    # Support both explicit refresh and existing dashboard timestamp cache busters.
+    return (str(request.args.get("refresh") or request.args.get("no_cache") or "").lower()
+            in {"1", "true", "yes"} or bool(request.args.get("t")))
+
+
 def _slot_duration_minutes(start_time, end_time):
     """Return positive duration in minutes for HH:MM:SS times, handling overnight edge."""
     if not start_time or not end_time:
@@ -351,7 +357,7 @@ def get_slots_on_game_id(vendorId, gameId, date):
         now_ts = time.time()
         with _slots_single_cache_lock:
             cached = _slots_single_cache.get(cache_key)
-        if cached and cached["expires_at"] > now_ts:
+        if not _force_slot_refresh() and cached and cached["expires_at"] > now_ts:
             response = jsonify(cached["payload"])
             response.headers["X-Cache"] = "HIT"
             return response, 200
@@ -472,7 +478,7 @@ def get_slots_batch(vendorId):
         now_ts = time.time()
         with _slots_batch_cache_lock:
             cached_entry = _slots_batch_cache.get(cache_key)
-        if cached_entry and cached_entry["expires_at"] > now_ts:
+        if not _force_slot_refresh() and cached_entry and cached_entry["expires_at"] > now_ts:
             response = jsonify(cached_entry["payload"])
             response.headers["X-Cache"] = "HIT"
             response.headers["X-Response-Time-ms"] = f"{(time.perf_counter() - started_at) * 1000:.2f}"

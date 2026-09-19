@@ -425,7 +425,7 @@ class BookingService:
 
     @staticmethod
     def release_slot(slot_id, booking_id, book_date):
-        """Function to release the slot after 10 seconds if not verified"""
+        """Release an unverified booking once, atomically with its capacity."""
         app = current_app._get_current_object() if has_app_context() else None
         should_push_context = app is None
         if should_push_context:
@@ -443,9 +443,10 @@ class BookingService:
                     bool(rq_job),
                     rq_job.id if rq_job else None,
                 )
-                booking = Booking.query.get(booking_id)
+                booking = (Booking.query.filter_by(id=booking_id, slot_id=slot_id)
+                           .with_for_update().first())
 
-                if booking and booking.status in ["pending_verified", "cancelled"]:
+                if booking and booking.status == "pending_verified":
                     squad_details = booking.squad_details if isinstance(booking.squad_details, dict) else {}
                     slot_units = (
                         max(1, int(squad_details.get("player_count") or squad_details.get("playerCount") or 1))
@@ -460,8 +461,7 @@ class BookingService:
                     ).fetchone()
 
                     if not available_game:
-                        current_app.logger.error("Vendor not found for this slot.")
-                        return
+                        raise ValueError("Vendor not found for this slot")
 
                     vendor_id = available_game[0]
 
@@ -473,22 +473,22 @@ class BookingService:
                         WHERE slot_id = :slot_id
                         AND date = :book_date;
                     """)
-                    db.session.execute(update_query, {"slot_id": slot_id, "book_date": book_date, "slot_units": slot_units})
+                    updated = db.session.execute(update_query, {"slot_id": slot_id, "book_date": book_date, "slot_units": slot_units})
+                    if updated.rowcount != 1:
+                        raise ValueError("Expected one vendor slot row for release")
+                    booking.status = 'verification_failed'
                     db.session.commit()
-
-                    # ✅ Update booking status
-                    if booking.status == "pending_verified":
-                        booking.status = 'verification_failed'
-                        db.session.commit()
 
                     # ✅ Emit WebSocket event to update slot status
                     socketio = current_app.extensions['socketio']
-                    socketio.emit('booking', {
+                    emit_booking_event(socketio, event='booking', data={
+                        'vendor_id': vendor_id,
+                        'status': 'verification_failed',
                         'slot_id': slot_id,
                         'slot_status': 'available',
                         'booking_id': booking_id,
                         'booking_status': 'verification_failed'
-                    })
+                    }, vendor_id=vendor_id)
                 else:
                     current_app.logger.info(
                         "release_slot.skip booking_id=%s slot_id=%s status=%s",
@@ -500,6 +500,7 @@ class BookingService:
             except Exception as e:
                 db.session.rollback()
                 current_app.logger.error(f"Failed to release slot: {str(e)}")
+                raise
             finally:
                 db.session.remove()  # Ensure DB session cleanup
 
