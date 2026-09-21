@@ -3746,7 +3746,8 @@ def confirm_booking():
                 joinedload(Booking.squad_members),
             )
             .filter(Booking.id.in_(booking_ids))
-            .with_for_update()
+            # Joined optional relations cannot be locked by PostgreSQL.
+            .with_for_update(of=Booking)
             .all()
         )
         if not booking_objects:
