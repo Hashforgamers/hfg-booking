@@ -10,8 +10,8 @@
     "semantic_hash": "351d675c2d2d596c22fe08382267a888"
   },
   "app/__init__.py": {
-    "mtime": 1787394908.015319,
-    "ast_hash": "37122d8496905002154d7ad44409bcd1",
+    "mtime": 1790023546.12412,
+    "ast_hash": "3b80b536bf679d354c7f5cb46dee7c27",
     "semantic_hash": ""
   },
   "app/config.py": {
@@ -407,6 +407,21 @@
   "tests/test_slot_cache.py": {
     "mtime": 1789808514.835873,
     "ast_hash": "ad8117eff1ce44d1961e78ca097c9fad",
+    "semantic_hash": ""
+  },
+  "controllers/cafe_checkout_controller.py": {
+    "mtime": 1790050030.758762,
+    "ast_hash": "3074e354d3e4bbb540ef70e05516879d",
+    "semantic_hash": ""
+  },
+  "services/cafe_payment_policy.py": {
+    "mtime": 1790067473.4302273,
+    "ast_hash": "a6311db417f4ab2abec4a2f518e21429",
+    "semantic_hash": ""
+  },
+  "sql/20260922_cafe_login.sql": {
+    "mtime": 1790023652.098519,
+    "ast_hash": "3f6e041eb68aef87b46d99bd992d6a7a",
     "semantic_hash": ""
   }
 }

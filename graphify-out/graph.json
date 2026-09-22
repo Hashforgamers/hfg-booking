@@ -131,8 +131,8 @@
       "source_location": "L127",
       "_origin": "ast",
       "id": "controllers_booking_controller_read_cache_invalidate_prefix",
-      "community": 15,
-      "community_name": "accept_pay_at_cafe_booking",
+      "community": 50,
+      "community_name": "_invalidate_pay_at_cafe_vendor_cache",
       "norm_label": "_read_cache_invalidate_prefix()"
     },
     {
@@ -142,8 +142,8 @@
       "source_location": "L139",
       "_origin": "ast",
       "id": "controllers_booking_controller_invalidate_pay_at_cafe_vendor_cache",
-      "community": 15,
-      "community_name": "accept_pay_at_cafe_booking",
+      "community": 50,
+      "community_name": "_invalidate_pay_at_cafe_vendor_cache",
       "norm_label": "_invalidate_pay_at_cafe_vendor_cache()"
     },
     {
@@ -165,7 +165,7 @@
       "_origin": "ast",
       "id": "controllers_booking_controller_json_text_equals",
       "community": 15,
-      "community_name": "accept_pay_at_cafe_booking",
+      "community_name": "reject_pay_at_cafe_booking",
       "norm_label": "_json_text_equals()"
     },
     {
@@ -176,7 +176,7 @@
       "_origin": "ast",
       "id": "controllers_booking_controller_parse_json_details",
       "community": 15,
-      "community_name": "accept_pay_at_cafe_booking",
+      "community_name": "reject_pay_at_cafe_booking",
       "norm_label": "_parse_json_details()"
     },
     {
@@ -242,7 +242,7 @@
       "_origin": "ast",
       "id": "controllers_booking_controller_resolve_pay_at_cafe_batch",
       "community": 15,
-      "community_name": "accept_pay_at_cafe_booking",
+      "community_name": "reject_pay_at_cafe_booking",
       "norm_label": "_resolve_pay_at_cafe_batch()"
     },
     {
@@ -494,8 +494,8 @@
       "source_location": "L971",
       "_origin": "ast",
       "id": "controllers_booking_controller_safe_decode_jwt_claims",
-      "community": 22,
-      "community_name": "resolve_transaction_actor",
+      "community": 18,
+      "community_name": "_safe_decode_jwt_claims",
       "norm_label": "_safe_decode_jwt_claims()"
     },
     {
@@ -505,8 +505,8 @@
       "source_location": "L989",
       "_origin": "ast",
       "id": "controllers_booking_controller_resolve_transaction_actor",
-      "community": 22,
-      "community_name": "resolve_transaction_actor",
+      "community": 0,
+      "community_name": "new_booking",
       "norm_label": "resolve_transaction_actor()"
     },
     {
@@ -847,7 +847,7 @@
       "_origin": "ast",
       "id": "controllers_booking_controller_calculate_slot_minutes",
       "community": 22,
-      "community_name": "resolve_transaction_actor",
+      "community_name": "credit_unused_slots_to_wallet",
       "norm_label": "calculate_slot_minutes()"
     },
     {
@@ -990,7 +990,7 @@
       "_origin": "ast",
       "id": "controllers_booking_controller_ensure_vendor_pay_at_cafe_settings_table",
       "community": 50,
-      "community_name": "_get_vendor_pay_at_cafe_settings",
+      "community_name": "_invalidate_pay_at_cafe_vendor_cache",
       "norm_label": "_ensure_vendor_pay_at_cafe_settings_table()"
     },
     {
@@ -1001,7 +1001,7 @@
       "_origin": "ast",
       "id": "controllers_booking_controller_get_vendor_pay_at_cafe_settings",
       "community": 50,
-      "community_name": "_get_vendor_pay_at_cafe_settings",
+      "community_name": "_invalidate_pay_at_cafe_vendor_cache",
       "norm_label": "_get_vendor_pay_at_cafe_settings()"
     },
     {
@@ -1012,7 +1012,7 @@
       "_origin": "ast",
       "id": "controllers_booking_controller_save_vendor_pay_at_cafe_settings",
       "community": 50,
-      "community_name": "_get_vendor_pay_at_cafe_settings",
+      "community_name": "_invalidate_pay_at_cafe_vendor_cache",
       "norm_label": "_save_vendor_pay_at_cafe_settings()"
     },
     {
@@ -1033,8 +1033,8 @@
       "source_location": "L2738",
       "_origin": "ast",
       "id": "controllers_booking_controller_log_pay_at_cafe_action",
-      "community": 15,
-      "community_name": "accept_pay_at_cafe_booking",
+      "community": 0,
+      "community_name": "new_booking",
       "norm_label": "_log_pay_at_cafe_action()"
     },
     {
@@ -1055,8 +1055,8 @@
       "source_location": "L2820",
       "_origin": "ast",
       "id": "controllers_booking_controller_create_order",
-      "community": 8,
-      "community_name": "route",
+      "community": 20,
+      "community_name": "auth_required_self",
       "norm_label": "create_order()"
     },
     {
@@ -1066,8 +1066,8 @@
       "source_location": "L2863",
       "_origin": "ast",
       "id": "controllers_booking_controller_capture_payment",
-      "community": 8,
-      "community_name": "route",
+      "community": 20,
+      "community_name": "auth_required_self",
       "norm_label": "capture_payment()"
     },
     {
@@ -1088,8 +1088,8 @@
       "source_location": "L3187",
       "_origin": "ast",
       "id": "controllers_booking_controller_release_slot",
-      "community": 27,
-      "community_name": "release_slot_controller",
+      "community": 15,
+      "community_name": "reject_pay_at_cafe_booking",
       "norm_label": "release_slot()"
     },
     {
@@ -1099,8 +1099,8 @@
       "source_location": "L3235",
       "_origin": "ast",
       "id": "controllers_booking_controller_generate_payment_link",
-      "community": 8,
-      "community_name": "route",
+      "community": 20,
+      "community_name": "auth_required_self",
       "norm_label": "generate_payment_link()"
     },
     {
@@ -1121,8 +1121,8 @@
       "source_location": "L4442",
       "_origin": "ast",
       "id": "controllers_booking_controller_redeem_voucher",
-      "community": 28,
-      "community_name": "Voucher",
+      "community": 20,
+      "community_name": "auth_required_self",
       "norm_label": "redeem_voucher()"
     },
     {
@@ -1165,8 +1165,8 @@
       "source_location": "L4756",
       "_origin": "ast",
       "id": "controllers_booking_controller_reject_booking",
-      "community": 6,
-      "community_name": "mail_service.py",
+      "community": 12,
+      "community_name": "BookingService",
       "norm_label": "reject_booking()"
     },
     {
@@ -1385,8 +1385,8 @@
       "source_location": "L8010",
       "_origin": "ast",
       "id": "controllers_booking_controller_now_utc",
-      "community": 27,
-      "community_name": "release_slot_controller",
+      "community": 15,
+      "community_name": "reject_pay_at_cafe_booking",
       "norm_label": "now_utc()"
     },
     {
@@ -1396,8 +1396,8 @@
       "source_location": "L8013",
       "_origin": "ast",
       "id": "controllers_booking_controller_to_utc",
-      "community": 27,
-      "community_name": "release_slot_controller",
+      "community": 15,
+      "community_name": "reject_pay_at_cafe_booking",
       "norm_label": "to_utc()"
     },
     {
@@ -1407,8 +1407,8 @@
       "source_location": "L8022",
       "_origin": "ast",
       "id": "controllers_booking_controller_release_slot_controller",
-      "community": 27,
-      "community_name": "release_slot_controller",
+      "community": 15,
+      "community_name": "reject_pay_at_cafe_booking",
       "norm_label": "release_slot_controller()"
     },
     {
@@ -1419,7 +1419,7 @@
       "_origin": "ast",
       "id": "controllers_booking_controller_get_pay_at_cafe_settings",
       "community": 50,
-      "community_name": "_get_vendor_pay_at_cafe_settings",
+      "community_name": "_invalidate_pay_at_cafe_vendor_cache",
       "norm_label": "get_pay_at_cafe_settings()"
     },
     {
@@ -1430,7 +1430,7 @@
       "_origin": "ast",
       "id": "controllers_booking_controller_update_pay_at_cafe_settings",
       "community": 50,
-      "community_name": "_get_vendor_pay_at_cafe_settings",
+      "community_name": "_invalidate_pay_at_cafe_vendor_cache",
       "norm_label": "update_pay_at_cafe_settings()"
     },
     {
@@ -1517,8 +1517,8 @@
       "source_location": "L8825",
       "_origin": "ast",
       "id": "controllers_booking_controller_accept_pay_at_cafe_booking",
-      "community": 15,
-      "community_name": "accept_pay_at_cafe_booking",
+      "community": 0,
+      "community_name": "new_booking",
       "norm_label": "accept_pay_at_cafe_booking()"
     },
     {
@@ -1529,7 +1529,7 @@
       "_origin": "ast",
       "id": "controllers_booking_controller_reject_pay_at_cafe_booking",
       "community": 15,
-      "community_name": "accept_pay_at_cafe_booking",
+      "community_name": "reject_pay_at_cafe_booking",
       "norm_label": "reject_pay_at_cafe_booking()"
     },
     {
@@ -1716,7 +1716,7 @@
       "_origin": "ast",
       "id": "controllers_booking_controller_credit_unused_slots_to_wallet",
       "community": 22,
-      "community_name": "resolve_transaction_actor",
+      "community_name": "credit_unused_slots_to_wallet",
       "norm_label": "credit_unused_slots_to_wallet()"
     },
     {
@@ -1782,7 +1782,7 @@
       "_origin": "ast",
       "id": "controllers_booking_controller_rationale_193",
       "community": 15,
-      "community_name": "accept_pay_at_cafe_booking",
+      "community_name": "reject_pay_at_cafe_booking",
       "norm_label": "dialect-safe json text comparison (sqlalchemy 2.0 removed .astext)."
     },
     {
@@ -1826,7 +1826,7 @@
       "_origin": "ast",
       "id": "controllers_booking_controller_rationale_309",
       "community": 15,
-      "community_name": "accept_pay_at_cafe_booking",
+      "community_name": "reject_pay_at_cafe_booking",
       "norm_label": "resolve pay-at-cafe squad bookings by batch_id with a safe fallback that avoids..."
     },
     {
@@ -1891,8 +1891,8 @@
       "source_location": "L972",
       "_origin": "ast",
       "id": "controllers_booking_controller_rationale_972",
-      "community": 22,
-      "community_name": "resolve_transaction_actor",
+      "community": 18,
+      "community_name": "_safe_decode_jwt_claims",
       "norm_label": "decode jwt payload without signature verification for telemetry/audit tagging...."
     },
     {
@@ -1902,8 +1902,8 @@
       "source_location": "L990",
       "_origin": "ast",
       "id": "controllers_booking_controller_rationale_990",
-      "community": 22,
-      "community_name": "resolve_transaction_actor",
+      "community": 0,
+      "community_name": "new_booking",
       "norm_label": "resolve source + staff attribution for transaction audit logs."
     },
     {
@@ -1946,8 +1946,8 @@
       "source_location": "L3236",
       "_origin": "ast",
       "id": "controllers_booking_controller_rationale_3236",
-      "community": 8,
-      "community_name": "route",
+      "community": 20,
+      "community_name": "auth_required_self",
       "norm_label": "creates a razorpay payment link and returns the url. expects json: { \"amount\":..."
     },
     {
@@ -1957,8 +1957,8 @@
       "source_location": "L4757",
       "_origin": "ast",
       "id": "controllers_booking_controller_rationale_4757",
-      "community": 6,
-      "community_name": "mail_service.py",
+      "community": 12,
+      "community_name": "BookingService",
       "norm_label": "reject a direct booking and handle slot release & repayment."
     },
     {
@@ -2045,8 +2045,8 @@
       "source_location": "L8023",
       "_origin": "ast",
       "id": "controllers_booking_controller_rationale_8023",
-      "community": 27,
-      "community_name": "release_slot_controller",
+      "community": 15,
+      "community_name": "reject_pay_at_cafe_booking",
       "norm_label": "releases bookings stuck in 'pending_verified' that are older than 2 minutes...."
     },
     {
@@ -2078,8 +2078,8 @@
       "source_location": "L8826",
       "_origin": "ast",
       "id": "controllers_booking_controller_rationale_8826",
-      "community": 15,
-      "community_name": "accept_pay_at_cafe_booking",
+      "community": 0,
+      "community_name": "new_booking",
       "norm_label": "accept a pay-at-cafe booking and change status to confirmed"
     },
     {
@@ -2090,7 +2090,7 @@
       "_origin": "ast",
       "id": "controllers_booking_controller_rationale_9129",
       "community": 15,
-      "community_name": "accept_pay_at_cafe_booking",
+      "community_name": "reject_pay_at_cafe_booking",
       "norm_label": "reject a pay-at-cafe booking and change status to cancelled"
     },
     {
@@ -2156,7 +2156,7 @@
       "_origin": "ast",
       "id": "controllers_booking_controller_rationale_10707",
       "community": 22,
-      "community_name": "resolve_transaction_actor",
+      "community_name": "credit_unused_slots_to_wallet",
       "norm_label": "credit unused booked slots to user's time wallet. body: { \"user_id\": 1,..."
     },
     {
@@ -2169,6 +2169,94 @@
       "community": 0,
       "community_name": "new_booking",
       "norm_label": "settle monthly credit outstanding at month-end. body: { \"user_id\": 1, \"amount\":..."
+    },
+    {
+      "label": "cafe_checkout_controller.py",
+      "file_type": "code",
+      "source_file": "controllers/cafe_checkout_controller.py",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "controllers_cafe_checkout_controller",
+      "community": 20,
+      "community_name": "auth_required_self",
+      "norm_label": "cafe_checkout_controller.py"
+    },
+    {
+      "label": "issue_token()",
+      "file_type": "code",
+      "source_file": "controllers/cafe_checkout_controller.py",
+      "source_location": "L17",
+      "_origin": "ast",
+      "id": "controllers_cafe_checkout_controller_issue_token",
+      "community": 20,
+      "community_name": "auth_required_self",
+      "norm_label": "issue_token()"
+    },
+    {
+      "label": "post",
+      "file_type": "code",
+      "source_file": "",
+      "source_location": "",
+      "_origin": "ast",
+      "id": "post",
+      "community": 20,
+      "community_name": "auth_required_self",
+      "norm_label": "post"
+    },
+    {
+      "label": "cafe_checkout_token()",
+      "file_type": "code",
+      "source_file": "controllers/cafe_checkout_controller.py",
+      "source_location": "L27",
+      "_origin": "ast",
+      "id": "controllers_cafe_checkout_controller_cafe_checkout_token",
+      "community": 20,
+      "community_name": "auth_required_self",
+      "norm_label": "cafe_checkout_token()"
+    },
+    {
+      "label": "digest()",
+      "file_type": "code",
+      "source_file": "controllers/cafe_checkout_controller.py",
+      "source_location": "L33",
+      "_origin": "ast",
+      "id": "controllers_cafe_checkout_controller_digest",
+      "community": 20,
+      "community_name": "auth_required_self",
+      "norm_label": "digest()"
+    },
+    {
+      "label": "request_login()",
+      "file_type": "code",
+      "source_file": "controllers/cafe_checkout_controller.py",
+      "source_location": "L38",
+      "_origin": "ast",
+      "id": "controllers_cafe_checkout_controller_request_login",
+      "community": 20,
+      "community_name": "auth_required_self",
+      "norm_label": "request_login()"
+    },
+    {
+      "label": "verify_login()",
+      "file_type": "code",
+      "source_file": "controllers/cafe_checkout_controller.py",
+      "source_location": "L70",
+      "_origin": "ast",
+      "id": "controllers_cafe_checkout_controller_verify_login",
+      "community": 20,
+      "community_name": "auth_required_self",
+      "norm_label": "verify_login()"
+    },
+    {
+      "label": "Short-lived gamer checkout identity, using existing Hash auth or email OTP.",
+      "file_type": "rationale",
+      "source_file": "controllers/cafe_checkout_controller.py",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "controllers_cafe_checkout_controller_rationale_1",
+      "community": 20,
+      "community_name": "auth_required_self",
+      "norm_label": "short-lived gamer checkout identity, using existing hash auth or email otp."
     },
     {
       "label": "game_controller.py",
@@ -2353,8 +2441,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "controllers_gaming_type_controller",
-      "community": 9,
-      "community_name": "Flask",
+      "community": 11,
+      "community_name": "gaming_type_controller.py",
       "norm_label": "gaming_type_controller.py"
     },
     {
@@ -2364,8 +2452,8 @@
       "source_location": "",
       "_origin": "ast",
       "id": "controllers_gaming_type_controller_py_route",
-      "community": 9,
-      "community_name": "Flask",
+      "community": 11,
+      "community_name": "gaming_type_controller.py",
       "norm_label": "route"
     },
     {
@@ -2375,8 +2463,8 @@
       "source_location": "L7",
       "_origin": "ast",
       "id": "controllers_gaming_type_controller_get_gaming_types",
-      "community": 9,
-      "community_name": "Flask",
+      "community": 11,
+      "community_name": "gaming_type_controller.py",
       "norm_label": "get_gaming_types()"
     },
     {
@@ -2386,8 +2474,8 @@
       "source_location": "L12",
       "_origin": "ast",
       "id": "controllers_gaming_type_controller_create_gaming_type",
-      "community": 9,
-      "community_name": "Flask",
+      "community": 11,
+      "community_name": "gaming_type_controller.py",
       "norm_label": "create_gaming_type()"
     },
     {
@@ -2397,8 +2485,8 @@
       "source_location": "L18",
       "_origin": "ast",
       "id": "controllers_gaming_type_controller_delete_gaming_type",
-      "community": 9,
-      "community_name": "Flask",
+      "community": 11,
+      "community_name": "gaming_type_controller.py",
       "norm_label": "delete_gaming_type()"
     },
     {
@@ -2518,8 +2606,8 @@
       "source_location": "",
       "_origin": "ast",
       "id": "controllers_pass_controller_py_route",
-      "community": 17,
-      "community_name": "route",
+      "community": 13,
+      "community_name": "pass_controller.py",
       "norm_label": "route"
     },
     {
@@ -2529,8 +2617,8 @@
       "source_location": "L165",
       "_origin": "ast",
       "id": "controllers_pass_controller_validate_pass",
-      "community": 17,
-      "community_name": "route",
+      "community": 13,
+      "community_name": "pass_controller.py",
       "norm_label": "validate_pass()"
     },
     {
@@ -2541,7 +2629,7 @@
       "_origin": "ast",
       "id": "controllers_pass_controller_get_dashboard_user_valid_passes",
       "community": 17,
-      "community_name": "route",
+      "community_name": "PassService",
       "norm_label": "get_dashboard_user_valid_passes()"
     },
     {
@@ -2596,7 +2684,7 @@
       "_origin": "ast",
       "id": "controllers_pass_controller_get_user_active_passes",
       "community": 17,
-      "community_name": "route",
+      "community_name": "PassService",
       "norm_label": "get_user_active_passes()"
     },
     {
@@ -2606,8 +2694,8 @@
       "source_location": "L714",
       "_origin": "ast",
       "id": "controllers_pass_controller_get_pass_history",
-      "community": 17,
-      "community_name": "route",
+      "community": 13,
+      "community_name": "pass_controller.py",
       "norm_label": "get_pass_history()"
     },
     {
@@ -2628,8 +2716,8 @@
       "source_location": "L760",
       "_origin": "ast",
       "id": "controllers_pass_controller_create_hour_pass",
-      "community": 20,
-      "community_name": "auth_required_self",
+      "community": 13,
+      "community_name": "pass_controller.py",
       "norm_label": "create_hour_pass()"
     },
     {
@@ -2661,8 +2749,8 @@
       "source_location": "L166",
       "_origin": "ast",
       "id": "controllers_pass_controller_rationale_166",
-      "community": 17,
-      "community_name": "route",
+      "community": 13,
+      "community_name": "pass_controller.py",
       "norm_label": "validate pass uid and return pass details. used by dashboard before redemption."
     },
     {
@@ -2673,7 +2761,7 @@
       "_origin": "ast",
       "id": "controllers_pass_controller_rationale_252",
       "community": 17,
-      "community_name": "route",
+      "community_name": "PassService",
       "norm_label": "dashboard helper: return valid hour-based passes for a selected user at a..."
     },
     {
@@ -2728,7 +2816,7 @@
       "_origin": "ast",
       "id": "controllers_pass_controller_rationale_695",
       "community": 17,
-      "community_name": "route",
+      "community_name": "PassService",
       "norm_label": "get all active passes for authenticated user."
     },
     {
@@ -2738,8 +2826,8 @@
       "source_location": "L715",
       "_origin": "ast",
       "id": "controllers_pass_controller_rationale_715",
-      "community": 17,
-      "community_name": "route",
+      "community": 13,
+      "community_name": "pass_controller.py",
       "norm_label": "get redemption history for a pass."
     },
     {
@@ -2760,8 +2848,8 @@
       "source_location": "L761",
       "_origin": "ast",
       "id": "controllers_pass_controller_rationale_761",
-      "community": 20,
-      "community_name": "auth_required_self",
+      "community": 13,
+      "community_name": "pass_controller.py",
       "norm_label": "create hour-based pass after purchase (called after payment confirmation)."
     },
     {
@@ -3299,8 +3387,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "models_accessbookingcode",
-      "community": 11,
-      "community_name": "Booking",
+      "community": 7,
+      "community_name": "slot_controller.py",
       "norm_label": "accessbookingcode.py"
     },
     {
@@ -3310,8 +3398,8 @@
       "source_location": "L6",
       "_origin": "ast",
       "id": "models_accessbookingcode_accessbookingcode",
-      "community": 11,
-      "community_name": "Booking",
+      "community": 7,
+      "community_name": "slot_controller.py",
       "norm_label": "accessbookingcode"
     },
     {
@@ -3321,8 +3409,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "models_availablegame",
-      "community": 4,
-      "community_name": "extensions.py",
+      "community": 14,
+      "community_name": "pass_service.py",
       "norm_label": "availablegame.py"
     },
     {
@@ -3332,8 +3420,8 @@
       "source_location": "L15",
       "_origin": "ast",
       "id": "models_availablegame_availablegame",
-      "community": 11,
-      "community_name": "Booking",
+      "community": 14,
+      "community_name": "pass_service.py",
       "norm_label": "availablegame"
     },
     {
@@ -3343,8 +3431,8 @@
       "source_location": "L34",
       "_origin": "ast",
       "id": "models_availablegame_availablegame_to_dict_for_booking",
-      "community": 11,
-      "community_name": "Booking",
+      "community": 14,
+      "community_name": "pass_service.py",
       "norm_label": ".to_dict_for_booking()"
     },
     {
@@ -3354,8 +3442,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "models_booking",
-      "community": 11,
-      "community_name": "Booking",
+      "community": 7,
+      "community_name": "slot_controller.py",
       "norm_label": "booking.py"
     },
     {
@@ -3365,8 +3453,8 @@
       "source_location": "L15",
       "_origin": "ast",
       "id": "models_booking_current_time_ist",
-      "community": 11,
-      "community_name": "Booking",
+      "community": 7,
+      "community_name": "slot_controller.py",
       "norm_label": "current_time_ist()"
     },
     {
@@ -3376,8 +3464,8 @@
       "source_location": "L19",
       "_origin": "ast",
       "id": "models_booking_booking",
-      "community": 11,
-      "community_name": "Booking",
+      "community": 7,
+      "community_name": "slot_controller.py",
       "norm_label": "booking"
     },
     {
@@ -3387,8 +3475,8 @@
       "source_location": "L59",
       "_origin": "ast",
       "id": "models_booking_booking_repr",
-      "community": 11,
-      "community_name": "Booking",
+      "community": 7,
+      "community_name": "slot_controller.py",
       "norm_label": ".__repr__()"
     },
     {
@@ -3398,8 +3486,8 @@
       "source_location": "L62",
       "_origin": "ast",
       "id": "models_booking_booking_to_dict",
-      "community": 11,
-      "community_name": "Booking",
+      "community": 7,
+      "community_name": "slot_controller.py",
       "norm_label": ".to_dict()"
     },
     {
@@ -3409,8 +3497,8 @@
       "source_location": "L63",
       "_origin": "ast",
       "id": "models_booking_rationale_63",
-      "community": 11,
-      "community_name": "Booking",
+      "community": 7,
+      "community_name": "slot_controller.py",
       "norm_label": "updated to include private booking fields"
     },
     {
@@ -3431,8 +3519,8 @@
       "source_location": "L5",
       "_origin": "ast",
       "id": "models_bookingextraservice_bookingextraservice",
-      "community": 4,
-      "community_name": "extensions.py",
+      "community": 0,
+      "community_name": "new_booking",
       "norm_label": "bookingextraservice"
     },
     {
@@ -3475,8 +3563,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "models_bookingsquadmember",
-      "community": 11,
-      "community_name": "Booking",
+      "community": 7,
+      "community_name": "slot_controller.py",
       "norm_label": "bookingsquadmember.py"
     },
     {
@@ -3486,8 +3574,8 @@
       "source_location": "L7",
       "_origin": "ast",
       "id": "models_bookingsquadmember_bookingsquadmember",
-      "community": 11,
-      "community_name": "Booking",
+      "community": 7,
+      "community_name": "slot_controller.py",
       "norm_label": "bookingsquadmember"
     },
     {
@@ -3497,8 +3585,8 @@
       "source_location": "L22",
       "_origin": "ast",
       "id": "models_bookingsquadmember_bookingsquadmember_to_dict",
-      "community": 11,
-      "community_name": "Booking",
+      "community": 7,
+      "community_name": "slot_controller.py",
       "norm_label": ".to_dict()"
     },
     {
@@ -3508,8 +3596,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "models_console",
-      "community": 4,
-      "community_name": "extensions.py",
+      "community": 14,
+      "community_name": "pass_service.py",
       "norm_label": "console.py"
     },
     {
@@ -3849,8 +3937,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "models_hashwallet",
-      "community": 4,
-      "community_name": "extensions.py",
+      "community": 10,
+      "community_name": "cancel_bookings_with_refund",
       "norm_label": "hashwallet.py"
     },
     {
@@ -3860,8 +3948,8 @@
       "source_location": "L5",
       "_origin": "ast",
       "id": "models_hashwallet_hashwallet",
-      "community": 4,
-      "community_name": "extensions.py",
+      "community": 10,
+      "community_name": "cancel_bookings_with_refund",
       "norm_label": "hashwallet"
     },
     {
@@ -3871,8 +3959,8 @@
       "source_location": "L12",
       "_origin": "ast",
       "id": "models_hashwallet_hashwallet_repr",
-      "community": 4,
-      "community_name": "extensions.py",
+      "community": 10,
+      "community_name": "cancel_bookings_with_refund",
       "norm_label": ".__repr__()"
     },
     {
@@ -3893,8 +3981,8 @@
       "source_location": "L6",
       "_origin": "ast",
       "id": "models_hashwallettransaction_hashwallettransaction",
-      "community": 4,
-      "community_name": "extensions.py",
+      "community": 12,
+      "community_name": "BookingService",
       "norm_label": "hashwallettransaction"
     },
     {
@@ -3904,8 +3992,8 @@
       "source_location": "L16",
       "_origin": "ast",
       "id": "models_hashwallettransaction_hashwallettransaction_repr",
-      "community": 4,
-      "community_name": "extensions.py",
+      "community": 12,
+      "community_name": "BookingService",
       "norm_label": ".__repr__()"
     },
     {
@@ -3993,7 +4081,7 @@
       "_origin": "ast",
       "id": "models_passmodels",
       "community": 14,
-      "community_name": "PassService",
+      "community_name": "pass_service.py",
       "norm_label": "passmodels.py"
     },
     {
@@ -4004,7 +4092,7 @@
       "_origin": "ast",
       "id": "models_passmodels_passtype",
       "community": 14,
-      "community_name": "PassService",
+      "community_name": "pass_service.py",
       "norm_label": "passtype"
     },
     {
@@ -4015,7 +4103,7 @@
       "_origin": "ast",
       "id": "models_passmodels_passtype_repr",
       "community": 14,
-      "community_name": "PassService",
+      "community_name": "pass_service.py",
       "norm_label": ".__repr__()"
     },
     {
@@ -4025,7 +4113,7 @@
       "source_location": "L34",
       "_origin": "ast",
       "id": "models_passmodels_cafepass",
-      "community": 14,
+      "community": 17,
       "community_name": "PassService",
       "norm_label": "cafepass"
     },
@@ -4036,7 +4124,7 @@
       "source_location": "L58",
       "_origin": "ast",
       "id": "models_passmodels_cafepass_repr",
-      "community": 14,
+      "community": 17,
       "community_name": "PassService",
       "norm_label": ".__repr__()"
     },
@@ -4047,7 +4135,7 @@
       "source_location": "L61",
       "_origin": "ast",
       "id": "models_passmodels_cafepass_validate",
-      "community": 14,
+      "community": 17,
       "community_name": "PassService",
       "norm_label": ".validate()"
     },
@@ -4058,7 +4146,7 @@
       "source_location": "L79",
       "_origin": "ast",
       "id": "models_passmodels_cafepass_to_dict",
-      "community": 14,
+      "community": 17,
       "community_name": "PassService",
       "norm_label": ".to_dict()"
     },
@@ -4114,7 +4202,7 @@
       "_origin": "ast",
       "id": "models_passmodels_passredemptionlog",
       "community": 14,
-      "community_name": "PassService",
+      "community_name": "pass_service.py",
       "norm_label": "passredemptionlog"
     },
     {
@@ -4125,7 +4213,7 @@
       "_origin": "ast",
       "id": "models_passmodels_passredemptionlog_repr",
       "community": 14,
-      "community_name": "PassService",
+      "community_name": "pass_service.py",
       "norm_label": ".__repr__()"
     },
     {
@@ -4136,7 +4224,7 @@
       "_origin": "ast",
       "id": "models_passmodels_passredemptionlog_to_dict",
       "community": 14,
-      "community_name": "PassService",
+      "community_name": "pass_service.py",
       "norm_label": ".to_dict()"
     },
     {
@@ -4146,7 +4234,7 @@
       "source_location": "L62",
       "_origin": "ast",
       "id": "models_passmodels_rationale_62",
-      "community": 14,
+      "community": 17,
       "community_name": "PassService",
       "norm_label": "validate pass configuration"
     },
@@ -4168,8 +4256,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "models_paymenttransactionmapping",
-      "community": 12,
-      "community_name": "BookingService",
+      "community": 4,
+      "community_name": "extensions.py",
       "norm_label": "paymenttransactionmapping.py"
     },
     {
@@ -4201,8 +4289,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "models_slot",
-      "community": 18,
-      "community_name": "Slot",
+      "community": 7,
+      "community_name": "slot_controller.py",
       "norm_label": "slot.py"
     },
     {
@@ -4212,8 +4300,8 @@
       "source_location": "L7",
       "_origin": "ast",
       "id": "models_slot_slot",
-      "community": 18,
-      "community_name": "Slot",
+      "community": 7,
+      "community_name": "slot_controller.py",
       "norm_label": "slot"
     },
     {
@@ -4223,8 +4311,8 @@
       "source_location": "L24",
       "_origin": "ast",
       "id": "models_slot_slot_repr",
-      "community": 18,
-      "community_name": "Slot",
+      "community": 7,
+      "community_name": "slot_controller.py",
       "norm_label": ".__repr__()"
     },
     {
@@ -4234,8 +4322,8 @@
       "source_location": "L27",
       "_origin": "ast",
       "id": "models_slot_slot_to_dict",
-      "community": 18,
-      "community_name": "Slot",
+      "community": 7,
+      "community_name": "slot_controller.py",
       "norm_label": ".to_dict()"
     },
     {
@@ -4245,8 +4333,8 @@
       "source_location": "L40",
       "_origin": "ast",
       "id": "models_slot_slot_to_dict_for_booking",
-      "community": 18,
-      "community_name": "Slot",
+      "community": 7,
+      "community_name": "slot_controller.py",
       "norm_label": ".to_dict_for_booking()"
     },
     {
@@ -4256,8 +4344,8 @@
       "source_location": "L28",
       "_origin": "ast",
       "id": "models_slot_rationale_28",
-      "community": 18,
-      "community_name": "Slot",
+      "community": 7,
+      "community_name": "slot_controller.py",
       "norm_label": "return a dictionary representation of the slot object."
     },
     {
@@ -4267,8 +4355,8 @@
       "source_location": "L41",
       "_origin": "ast",
       "id": "models_slot_rationale_41",
-      "community": 18,
-      "community_name": "Slot",
+      "community": 7,
+      "community_name": "slot_controller.py",
       "norm_label": "return a dictionary representation of the slot object."
     },
     {
@@ -4301,7 +4389,7 @@
       "_origin": "ast",
       "id": "models_timewallet",
       "community": 22,
-      "community_name": "resolve_transaction_actor",
+      "community_name": "credit_unused_slots_to_wallet",
       "norm_label": "timewallet.py"
     },
     {
@@ -4312,7 +4400,7 @@
       "_origin": "ast",
       "id": "models_timewallet_timewalletaccount",
       "community": 22,
-      "community_name": "resolve_transaction_actor",
+      "community_name": "credit_unused_slots_to_wallet",
       "norm_label": "timewalletaccount"
     },
     {
@@ -4323,7 +4411,7 @@
       "_origin": "ast",
       "id": "models_timewallet_timewalletledger",
       "community": 22,
-      "community_name": "resolve_transaction_actor",
+      "community_name": "credit_unused_slots_to_wallet",
       "norm_label": "timewalletledger"
     },
     {
@@ -4333,8 +4421,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "models_transaction",
-      "community": 7,
-      "community_name": "slot_controller.py",
+      "community": 4,
+      "community_name": "extensions.py",
       "norm_label": "transaction.py"
     },
     {
@@ -4411,7 +4499,7 @@
       "_origin": "ast",
       "id": "models_vendor",
       "community": 14,
-      "community_name": "PassService",
+      "community_name": "pass_service.py",
       "norm_label": "vendor.py"
     },
     {
@@ -4422,7 +4510,7 @@
       "_origin": "ast",
       "id": "models_vendor_vendor",
       "community": 14,
-      "community_name": "PassService",
+      "community_name": "pass_service.py",
       "norm_label": "vendor"
     },
     {
@@ -4433,7 +4521,7 @@
       "_origin": "ast",
       "id": "models_vendor_vendor_to_dict_for_booking",
       "community": 14,
-      "community_name": "PassService",
+      "community_name": "pass_service.py",
       "norm_label": ".to_dict_for_booking()"
     },
     {
@@ -4498,8 +4586,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "models_voucher",
-      "community": 28,
-      "community_name": "Voucher",
+      "community": 20,
+      "community_name": "auth_required_self",
       "norm_label": "voucher.py"
     },
     {
@@ -4509,8 +4597,8 @@
       "source_location": "L6",
       "_origin": "ast",
       "id": "models_voucher_voucher",
-      "community": 28,
-      "community_name": "Voucher",
+      "community": 20,
+      "community_name": "auth_required_self",
       "norm_label": "voucher"
     },
     {
@@ -4520,8 +4608,8 @@
       "source_location": "L18",
       "_origin": "ast",
       "id": "models_voucher_voucher_repr",
-      "community": 28,
-      "community_name": "Voucher",
+      "community": 20,
+      "community_name": "auth_required_self",
       "norm_label": ".__repr__()"
     },
     {
@@ -4630,8 +4718,8 @@
       "source_location": "L161",
       "_origin": "ast",
       "id": "services_booking_service_bookingservice_create_booking",
-      "community": 12,
-      "community_name": "BookingService",
+      "community": 21,
+      "community_name": "create_booking",
       "norm_label": ".create_booking()"
     },
     {
@@ -4641,8 +4729,8 @@
       "source_location": "L427",
       "_origin": "ast",
       "id": "services_booking_service_bookingservice_release_slot",
-      "community": 27,
-      "community_name": "release_slot_controller",
+      "community": 15,
+      "community_name": "reject_pay_at_cafe_booking",
       "norm_label": ".release_slot()"
     },
     {
@@ -4674,8 +4762,8 @@
       "source_location": "L606",
       "_origin": "ast",
       "id": "services_booking_service_bookingservice_update_dashboard_booking_status",
-      "community": 6,
-      "community_name": "mail_service.py",
+      "community": 12,
+      "community_name": "BookingService",
       "norm_label": ".update_dashboard_booking_status()"
     },
     {
@@ -4696,8 +4784,8 @@
       "source_location": "L638",
       "_origin": "ast",
       "id": "services_booking_service_bookingservice_debit_wallet",
-      "community": 4,
-      "community_name": "extensions.py",
+      "community": 12,
+      "community_name": "BookingService",
       "norm_label": ".debit_wallet()"
     },
     {
@@ -4729,8 +4817,8 @@
       "source_location": "L172",
       "_origin": "ast",
       "id": "services_booking_service_rationale_172",
-      "community": 12,
-      "community_name": "BookingService",
+      "community": 21,
+      "community_name": "create_booking",
       "norm_label": "create a booking with specified mode. args: booking_mode: 'regular' or..."
     },
     {
@@ -4740,8 +4828,8 @@
       "source_location": "L428",
       "_origin": "ast",
       "id": "services_booking_service_rationale_428",
-      "community": 27,
-      "community_name": "release_slot_controller",
+      "community": 15,
+      "community_name": "reject_pay_at_cafe_booking",
       "norm_label": "release an unverified booking once, atomically with its capacity."
     },
     {
@@ -4773,8 +4861,8 @@
       "source_location": "L607",
       "_origin": "ast",
       "id": "services_booking_service_rationale_607",
-      "community": 6,
-      "community_name": "mail_service.py",
+      "community": 12,
+      "community_name": "BookingService",
       "norm_label": "updates the booking status in the vendor dashboard table for a given..."
     },
     {
@@ -4787,6 +4875,39 @@
       "community": 12,
       "community_name": "BookingService",
       "norm_label": "return the best valid pass or none."
+    },
+    {
+      "label": "cafe_payment_policy.py",
+      "file_type": "code",
+      "source_file": "services/cafe_payment_policy.py",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "services_cafe_payment_policy",
+      "community": 9,
+      "community_name": "Flask",
+      "norm_label": "cafe_payment_policy.py"
+    },
+    {
+      "label": "enforce_cafe_payment_policy()",
+      "file_type": "code",
+      "source_file": "services/cafe_payment_policy.py",
+      "source_location": "L7",
+      "_origin": "ast",
+      "id": "services_cafe_payment_policy_enforce_cafe_payment_policy",
+      "community": 9,
+      "community_name": "Flask",
+      "norm_label": "enforce_cafe_payment_policy()"
+    },
+    {
+      "label": "Enforce migrated cafe policies before legacy checkout can collect money.",
+      "file_type": "rationale",
+      "source_file": "services/cafe_payment_policy.py",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "services_cafe_payment_policy_rationale_1",
+      "community": 9,
+      "community_name": "Flask",
+      "norm_label": "enforce migrated cafe policies before legacy checkout can collect money."
     },
     {
       "label": "config_load.py",
@@ -4905,8 +5026,8 @@
       "source_location": "L350",
       "_origin": "ast",
       "id": "services_console_catalog_service_legacy_console_group",
-      "community": 0,
-      "community_name": "new_booking",
+      "community": 2,
+      "community_name": "game_controller.py",
       "norm_label": "legacy_console_group()"
     },
     {
@@ -5081,8 +5202,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "services_gaming_type_service",
-      "community": 9,
-      "community_name": "Flask",
+      "community": 11,
+      "community_name": "gaming_type_controller.py",
       "norm_label": "gaming_type_service.py"
     },
     {
@@ -5092,8 +5213,8 @@
       "source_location": "L3",
       "_origin": "ast",
       "id": "services_gaming_type_service_gamingtypeservice",
-      "community": 9,
-      "community_name": "Flask",
+      "community": 11,
+      "community_name": "gaming_type_controller.py",
       "norm_label": "gamingtypeservice"
     },
     {
@@ -5103,8 +5224,8 @@
       "source_location": "L5",
       "_origin": "ast",
       "id": "services_gaming_type_service_gamingtypeservice_get_all_gaming_types",
-      "community": 9,
-      "community_name": "Flask",
+      "community": 11,
+      "community_name": "gaming_type_controller.py",
       "norm_label": ".get_all_gaming_types()"
     },
     {
@@ -5114,8 +5235,8 @@
       "source_location": "L12",
       "_origin": "ast",
       "id": "services_gaming_type_service_gamingtypeservice_create_gaming_type",
-      "community": 9,
-      "community_name": "Flask",
+      "community": 11,
+      "community_name": "gaming_type_controller.py",
       "norm_label": ".create_gaming_type()"
     },
     {
@@ -5125,8 +5246,8 @@
       "source_location": "L26",
       "_origin": "ast",
       "id": "services_gaming_type_service_gamingtypeservice_delete_gaming_type",
-      "community": 9,
-      "community_name": "Flask",
+      "community": 11,
+      "community_name": "gaming_type_controller.py",
       "norm_label": ".delete_gaming_type()"
     },
     {
@@ -5136,8 +5257,8 @@
       "source_location": "L6",
       "_origin": "ast",
       "id": "services_gaming_type_service_rationale_6",
-      "community": 9,
-      "community_name": "Flask",
+      "community": 11,
+      "community_name": "gaming_type_controller.py",
       "norm_label": "fetch all available gaming types."
     },
     {
@@ -5147,8 +5268,8 @@
       "source_location": "L13",
       "_origin": "ast",
       "id": "services_gaming_type_service_rationale_13",
-      "community": 9,
-      "community_name": "Flask",
+      "community": 11,
+      "community_name": "gaming_type_controller.py",
       "norm_label": "create a new gaming type. :param data: dictionary containing 'name'"
     },
     {
@@ -5158,8 +5279,8 @@
       "source_location": "L27",
       "_origin": "ast",
       "id": "services_gaming_type_service_rationale_27",
-      "community": 9,
-      "community_name": "Flask",
+      "community": 11,
+      "community_name": "gaming_type_controller.py",
       "norm_label": "delete an existing gaming type. :param gaming_type_id: id of the gaming type to..."
     },
     {
@@ -5280,7 +5401,7 @@
       "_origin": "ast",
       "id": "services_pass_service",
       "community": 14,
-      "community_name": "PassService",
+      "community_name": "pass_service.py",
       "norm_label": "pass_service.py"
     },
     {
@@ -5290,7 +5411,7 @@
       "source_location": "L17",
       "_origin": "ast",
       "id": "services_pass_service_passservice",
-      "community": 14,
+      "community": 17,
       "community_name": "PassService",
       "norm_label": "passservice"
     },
@@ -5301,7 +5422,7 @@
       "source_location": "L20",
       "_origin": "ast",
       "id": "services_pass_service_passservice_calculate_slot_hours",
-      "community": 14,
+      "community": 17,
       "community_name": "PassService",
       "norm_label": ".calculate_slot_hours()"
     },
@@ -5312,7 +5433,7 @@
       "source_location": "",
       "_origin": "ast",
       "id": "decimal",
-      "community": 14,
+      "community": 17,
       "community_name": "PassService",
       "norm_label": "decimal"
     },
@@ -5390,7 +5511,7 @@
       "_origin": "ast",
       "id": "services_pass_service_passservice_get_user_active_passes",
       "community": 17,
-      "community_name": "route",
+      "community_name": "PassService",
       "norm_label": ".get_user_active_passes()"
     },
     {
@@ -5400,7 +5521,7 @@
       "source_location": "L21",
       "_origin": "ast",
       "id": "services_pass_service_rationale_21",
-      "community": 14,
+      "community": 17,
       "community_name": "PassService",
       "norm_label": "calculate hours for a slot based on pass configuration. args: slot_id: slot id..."
     },
@@ -5456,7 +5577,7 @@
       "_origin": "ast",
       "id": "services_pass_service_rationale_348",
       "community": 17,
-      "community_name": "route",
+      "community_name": "PassService",
       "norm_label": "get all active passes for user (both date-based and hour-based). args: user_id:..."
     },
     {
@@ -5510,8 +5631,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "services_referral_service",
-      "community": 28,
-      "community_name": "Voucher",
+      "community": 20,
+      "community_name": "auth_required_self",
       "norm_label": "referral_service.py"
     },
     {
@@ -5521,8 +5642,8 @@
       "source_location": "L7",
       "_origin": "ast",
       "id": "services_referral_service_create_referral_voucher",
-      "community": 28,
-      "community_name": "Voucher",
+      "community": 20,
+      "community_name": "auth_required_self",
       "norm_label": "create_referral_voucher()"
     },
     {
@@ -5631,8 +5752,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "services_slot_service",
-      "community": 18,
-      "community_name": "Slot",
+      "community": 7,
+      "community_name": "slot_controller.py",
       "norm_label": "slot_service.py"
     },
     {
@@ -5642,8 +5763,8 @@
       "source_location": "L3",
       "_origin": "ast",
       "id": "services_slot_service_slotservice",
-      "community": 18,
-      "community_name": "Slot",
+      "community": 7,
+      "community_name": "slot_controller.py",
       "norm_label": "slotservice"
     },
     {
@@ -5653,8 +5774,8 @@
       "source_location": "L5",
       "_origin": "ast",
       "id": "services_slot_service_slotservice_get_all_slots",
-      "community": 18,
-      "community_name": "Slot",
+      "community": 7,
+      "community_name": "slot_controller.py",
       "norm_label": ".get_all_slots()"
     },
     {
@@ -5664,8 +5785,8 @@
       "source_location": "L9",
       "_origin": "ast",
       "id": "services_slot_service_slotservice_create_slot",
-      "community": 18,
-      "community_name": "Slot",
+      "community": 7,
+      "community_name": "slot_controller.py",
       "norm_label": ".create_slot()"
     },
     {
@@ -5675,8 +5796,8 @@
       "source_location": "L16",
       "_origin": "ast",
       "id": "services_slot_service_slotservice_update_slot",
-      "community": 18,
-      "community_name": "Slot",
+      "community": 7,
+      "community_name": "slot_controller.py",
       "norm_label": ".update_slot()"
     },
     {
@@ -5686,8 +5807,8 @@
       "source_location": "L26",
       "_origin": "ast",
       "id": "services_slot_service_slotservice_delete_slot",
-      "community": 18,
-      "community_name": "Slot",
+      "community": 7,
+      "community_name": "slot_controller.py",
       "norm_label": ".delete_slot()"
     },
     {
@@ -5975,6 +6096,17 @@
       "community": 35,
       "community_name": "20260817_booking_gateway_payment_reconciliation.sql",
       "norm_label": "booking_gateway_payments"
+    },
+    {
+      "label": "20260922_cafe_login.sql",
+      "file_type": "code",
+      "source_file": "sql/20260922_cafe_login.sql",
+      "source_location": null,
+      "_origin": "ast",
+      "id": "sql_20260922_cafe_login",
+      "community": 27,
+      "community_name": "20260922_cafe_login.sql",
+      "norm_label": "20260922_cafe_login.sql"
     },
     {
       "label": "test_release_slot.py",
@@ -6368,8 +6500,8 @@
       "source_location": "L230",
       "_origin": "ast",
       "id": "utils_realtime_build_booking_event_payload",
-      "community": 3,
-      "community_name": "kiosk_book_next_slot",
+      "community": 0,
+      "community_name": "new_booking",
       "norm_label": "build_booking_event_payload()"
     },
     {
@@ -6954,6 +7086,18 @@
       "context": "export",
       "confidence": "EXTRACTED",
       "source_file": "app/__init__.py",
+      "source_location": "L89",
+      "weight": 1.0,
+      "_origin": "ast",
+      "source": "app_init",
+      "target": "controllers_cafe_checkout_controller",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "re_exports",
+      "context": "export",
+      "confidence": "EXTRACTED",
+      "source_file": "app/__init__.py",
       "source_location": "L7",
       "weight": 1.0,
       "_origin": "ast",
@@ -7034,6 +7178,30 @@
       "confidence_score": 1.0
     },
     {
+      "relation": "re_exports",
+      "context": "export",
+      "confidence": "EXTRACTED",
+      "source_file": "app/__init__.py",
+      "source_location": "L91",
+      "weight": 1.0,
+      "_origin": "ast",
+      "source": "app_init",
+      "target": "services_cafe_payment_policy",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "imports",
+      "context": "import",
+      "confidence": "EXTRACTED",
+      "source_file": "app/__init__.py",
+      "source_location": "L91",
+      "weight": 1.0,
+      "_origin": "ast",
+      "source": "app_init",
+      "target": "services_cafe_payment_policy_enforce_cafe_payment_policy",
+      "confidence_score": 1.0
+    },
+    {
       "relation": "calls",
       "context": "call",
       "confidence": "EXTRACTED",
@@ -7090,6 +7258,18 @@
       "weight": 1.0,
       "_origin": "ast",
       "source": "controllers_booking_controller",
+      "target": "flask",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "imports_from",
+      "context": "import",
+      "confidence": "EXTRACTED",
+      "source_file": "controllers/cafe_checkout_controller.py",
+      "source_location": "L8",
+      "weight": 1.0,
+      "_origin": "ast",
+      "source": "controllers_cafe_checkout_controller",
       "target": "flask",
       "confidence_score": 1.0
     },
@@ -7162,6 +7342,18 @@
       "weight": 1.0,
       "_origin": "ast",
       "source": "services_booking_service",
+      "target": "flask",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "imports_from",
+      "context": "import",
+      "confidence": "EXTRACTED",
+      "source_file": "services/cafe_payment_policy.py",
+      "source_location": "L2",
+      "weight": 1.0,
+      "_origin": "ast",
+      "source": "services_cafe_payment_policy",
       "target": "flask",
       "confidence_score": 1.0
     },
@@ -7242,12 +7434,24 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "app/__init__.py",
-      "source_location": "L172",
+      "source_location": "L176",
       "weight": 1.0,
       "_origin": "ast",
       "source": "app_init_create_app",
       "target": "events_socketio_events_register_socketio_events",
       "confidence_score": 1.0
+    },
+    {
+      "relation": "indirect_call",
+      "context": "argument",
+      "confidence": "INFERRED",
+      "confidence_score": 0.8,
+      "source_file": "app/__init__.py",
+      "source_location": "L92",
+      "weight": 1.0,
+      "_origin": "ast",
+      "source": "app_init_create_app",
+      "target": "services_cafe_payment_policy_enforce_cafe_payment_policy"
     },
     {
       "relation": "imports",
@@ -16043,6 +16247,204 @@
     {
       "relation": "contains",
       "confidence": "EXTRACTED",
+      "source_file": "controllers/cafe_checkout_controller.py",
+      "source_location": "L27",
+      "weight": 1.0,
+      "_origin": "ast",
+      "source": "controllers_cafe_checkout_controller",
+      "target": "controllers_cafe_checkout_controller_cafe_checkout_token",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "controllers/cafe_checkout_controller.py",
+      "source_location": "L33",
+      "weight": 1.0,
+      "_origin": "ast",
+      "source": "controllers_cafe_checkout_controller",
+      "target": "controllers_cafe_checkout_controller_digest",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "controllers/cafe_checkout_controller.py",
+      "source_location": "L17",
+      "weight": 1.0,
+      "_origin": "ast",
+      "source": "controllers_cafe_checkout_controller",
+      "target": "controllers_cafe_checkout_controller_issue_token",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "controllers/cafe_checkout_controller.py",
+      "source_location": "L38",
+      "weight": 1.0,
+      "_origin": "ast",
+      "source": "controllers_cafe_checkout_controller",
+      "target": "controllers_cafe_checkout_controller_request_login",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "controllers/cafe_checkout_controller.py",
+      "source_location": "L70",
+      "weight": 1.0,
+      "_origin": "ast",
+      "source": "controllers_cafe_checkout_controller",
+      "target": "controllers_cafe_checkout_controller_verify_login",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "imports_from",
+      "context": "import",
+      "confidence": "EXTRACTED",
+      "source_file": "controllers/cafe_checkout_controller.py",
+      "source_location": "L11",
+      "weight": 1.0,
+      "_origin": "ast",
+      "source": "controllers_cafe_checkout_controller",
+      "target": "db_extensions",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "imports_from",
+      "context": "import",
+      "confidence": "EXTRACTED",
+      "source_file": "controllers/cafe_checkout_controller.py",
+      "source_location": "L12",
+      "weight": 1.0,
+      "_origin": "ast",
+      "source": "controllers_cafe_checkout_controller",
+      "target": "services_security",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "imports",
+      "context": "import",
+      "confidence": "EXTRACTED",
+      "source_file": "controllers/cafe_checkout_controller.py",
+      "source_location": "L12",
+      "weight": 1.0,
+      "_origin": "ast",
+      "source": "controllers_cafe_checkout_controller",
+      "target": "services_security_auth_required_self",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "rationale_for",
+      "confidence": "EXTRACTED",
+      "source_file": "controllers/cafe_checkout_controller.py",
+      "source_location": "L1",
+      "weight": 1.0,
+      "_origin": "ast",
+      "source": "controllers_cafe_checkout_controller_rationale_1",
+      "target": "controllers_cafe_checkout_controller",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "calls",
+      "context": "call",
+      "confidence": "EXTRACTED",
+      "source_file": "controllers/cafe_checkout_controller.py",
+      "source_location": "L30",
+      "weight": 1.0,
+      "_origin": "ast",
+      "source": "controllers_cafe_checkout_controller_cafe_checkout_token",
+      "target": "controllers_cafe_checkout_controller_issue_token",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "calls",
+      "context": "call",
+      "confidence": "EXTRACTED",
+      "source_file": "controllers/cafe_checkout_controller.py",
+      "source_location": "L83",
+      "weight": 1.0,
+      "_origin": "ast",
+      "source": "controllers_cafe_checkout_controller_verify_login",
+      "target": "controllers_cafe_checkout_controller_issue_token",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "source_file": "controllers/cafe_checkout_controller.py",
+      "source_location": "L25",
+      "weight": 1.0,
+      "context": "decorator",
+      "_origin": "ast",
+      "source": "controllers_cafe_checkout_controller_cafe_checkout_token",
+      "target": "post",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "source_file": "controllers/cafe_checkout_controller.py",
+      "source_location": "L37",
+      "weight": 1.0,
+      "context": "decorator",
+      "_origin": "ast",
+      "source": "controllers_cafe_checkout_controller_request_login",
+      "target": "post",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "source_file": "controllers/cafe_checkout_controller.py",
+      "source_location": "L69",
+      "weight": 1.0,
+      "context": "decorator",
+      "_origin": "ast",
+      "source": "controllers_cafe_checkout_controller_verify_login",
+      "target": "post",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "source_file": "controllers/cafe_checkout_controller.py",
+      "source_location": "L26",
+      "weight": 1.0,
+      "context": "decorator",
+      "_origin": "ast",
+      "source": "controllers_cafe_checkout_controller_cafe_checkout_token",
+      "target": "services_security_auth_required_self",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "calls",
+      "context": "call",
+      "confidence": "EXTRACTED",
+      "source_file": "controllers/cafe_checkout_controller.py",
+      "source_location": "L43",
+      "weight": 1.0,
+      "_origin": "ast",
+      "source": "controllers_cafe_checkout_controller_request_login",
+      "target": "controllers_cafe_checkout_controller_digest",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "calls",
+      "context": "call",
+      "confidence": "EXTRACTED",
+      "source_file": "controllers/cafe_checkout_controller.py",
+      "source_location": "L78",
+      "weight": 1.0,
+      "_origin": "ast",
+      "source": "controllers_cafe_checkout_controller_verify_login",
+      "target": "controllers_cafe_checkout_controller_digest",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
       "source_file": "controllers/game_controller.py",
       "source_location": "L218",
       "weight": 1.0,
@@ -19042,6 +19444,18 @@
       "relation": "imports_from",
       "context": "import",
       "confidence": "EXTRACTED",
+      "source_file": "services/cafe_payment_policy.py",
+      "source_location": "L4",
+      "weight": 1.0,
+      "_origin": "ast",
+      "source": "services_cafe_payment_policy",
+      "target": "db_extensions",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "imports_from",
+      "context": "import",
+      "confidence": "EXTRACTED",
       "source_file": "services/console_catalog_service.py",
       "source_location": "L8",
       "weight": 1.0,
@@ -21537,6 +21951,28 @@
       "_origin": "ast",
       "source": "services_booking_service_rationale_661",
       "target": "services_booking_service_bookingservice_get_user_pass",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "services/cafe_payment_policy.py",
+      "source_location": "L7",
+      "weight": 1.0,
+      "_origin": "ast",
+      "source": "services_cafe_payment_policy",
+      "target": "services_cafe_payment_policy_enforce_cafe_payment_policy",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "rationale_for",
+      "confidence": "EXTRACTED",
+      "source_file": "services/cafe_payment_policy.py",
+      "source_location": "L1",
+      "weight": 1.0,
+      "_origin": "ast",
+      "source": "services_cafe_payment_policy_rationale_1",
+      "target": "services_cafe_payment_policy",
       "confidence_score": 1.0
     },
     {
@@ -24200,5 +24636,5 @@
     }
   ],
   "hyperedges": [],
-  "built_at_commit": "d1b56187c1690ef1b473cedceeafe216b5e49dca"
+  "built_at_commit": "6f9bffbc2013d96ea00f45204a98af57fbcc60c9"
 }

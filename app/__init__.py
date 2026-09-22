@@ -86,6 +86,10 @@ def create_app():
     app.register_blueprint(slot_blueprint, url_prefix="/api")
     app.register_blueprint(game_blueprint, url_prefix="/api")
     app.register_blueprint(pass_blueprint, url_prefix='/api')
+    from controllers.cafe_checkout_controller import cafe_checkout_blueprint
+    app.register_blueprint(cafe_checkout_blueprint, url_prefix='/api')
+    from services.cafe_payment_policy import enforce_cafe_payment_policy
+    app.before_request(enforce_cafe_payment_policy)
 
     def _is_public_cacheable_path(path: str) -> bool:
         return (
