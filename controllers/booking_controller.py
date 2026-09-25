@@ -6130,7 +6130,7 @@ def new_booking(vendor_id):
             booking_mode=booking_mode,
         )
 
-        # Send booking confirmation email
+        # Prepare email data; delivery is queued after the committed booking.
         cafe_name = db.session.query(Vendor).filter_by(id=vendor_id).first().cafe_name
         
         email_meal_details = []
@@ -6149,7 +6149,7 @@ def new_booking(vendor_id):
             source_channel=actor["source_channel"],
         )
         try:
-            booking_mail(
+            _send_booking_mail_async(current_app._get_current_object(), [dict(
                 gamer_name=name,
                 gamer_phone=phone,
                 gamer_email=email,
@@ -6163,7 +6163,7 @@ def new_booking(vendor_id):
                 waive_off_amount=waive_off_total,
                 app_fee_amount=float(app_fee_total or 0.0),
                 net_total=max(float(total_paid or 0.0) - float(app_fee_total or 0.0), 0.0),
-            )
+            )])
         except Exception as mail_error:
             current_app.logger.exception("booking_mail failed for vendor=%s booking_ids=%s err=%s",
                                          vendor_id, [b.id for b in bookings], mail_error)
