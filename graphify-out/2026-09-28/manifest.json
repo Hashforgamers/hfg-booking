@@ -20,8 +20,8 @@
     "semantic_hash": ""
   },
   "controllers/booking_controller.py": {
-    "mtime": 1790595900.2795098,
-    "ast_hash": "1773b54af29c7a9643321dfc3eb4ebc9",
+    "mtime": 1790595768.2423935,
+    "ast_hash": "57f9823f6b74441bc946acd3098928a0",
     "semantic_hash": ""
   },
   "controllers/game_controller.py": {
@@ -437,21 +437,6 @@
   "docs/mobile-payment-cafe-context.md": {
     "mtime": 1790278492.4553869,
     "ast_hash": "1771983ee88790d64cebf87fe28e7516",
-    "semantic_hash": ""
-  },
-  "services/customer_search.py": {
-    "mtime": 1790595900.284217,
-    "ast_hash": "cf282956afef1694bbc551161d620208",
-    "semantic_hash": ""
-  },
-  "sql/20260928_customer_search_indexes.sql": {
-    "mtime": 1790595900.28609,
-    "ast_hash": "2e39d4455b462842b41bb1bd6c8bcac4",
-    "semantic_hash": ""
-  },
-  "tests/test_customer_search.py": {
-    "mtime": 1790595978.331787,
-    "ast_hash": "1c5a4ce44a694ae1fd063c17e6c20c0b",
     "semantic_hash": ""
   }
 }
