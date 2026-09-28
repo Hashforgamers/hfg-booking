@@ -107,14 +107,19 @@ Tracks:
 ### Booking Controller
 
 #### POST /create_order
-Creates a Razorpay payment order
+Creates a Razorpay payment order (`/api/create_order` on the booking service).
+Requires the existing Hash gamer bearer token and cafe context: send the actual
+selected `vendor_id`, or an existing `game_id` / `booking_id`. Amounts here are
+integer paise. The server generates the receipt; a client receipt is not used.
+See [mobile payment integration](docs/mobile-payment-cafe-context.md) for capture,
+payment links and policy errors.
 
-**Request:**
+**Request (illustrative cafe ID; replace with the selected cafe):**
 ```json
 {
   "amount": 50000,
   "currency": "INR",
-  "receipt": "order_rcpt_123"
+  "vendor_id": 123
 }
 ```
 

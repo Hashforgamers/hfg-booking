@@ -511,6 +511,52 @@ class BookingService:
             _run_release()
 
     @staticmethod
+    def insert_vendor_booking_rows(vendor_id, transactions, bookings, user, game, slots, runtime):
+        """Batch dashboard/promo writes in the caller's transaction using loaded data."""
+        dashboard_rows, promo_rows = [], []
+        booking_by_id = {int(booking.id): booking for booking in bookings}
+        for transaction in transactions:
+            booking = booking_by_id[int(transaction.booking_id)]
+            slot = slots[int(booking.slot_id)]
+            meta = runtime[int(booking.id)]
+            dashboard_rows.append({
+                "username": user.name,
+                "user_id": user.id,
+                "start_time": slot.start_time,
+                "end_time": slot.end_time,
+                "date": transaction.booked_date,
+                "book_id": booking.id,
+                "game_id": booking.game_id,
+                "game_name": game.game_name,
+                "console_id": int(meta["console_id"]),
+                "book_status": (
+                    "current" if meta["dashboard_status"] == "current"
+                    else "extra" if booking.status == "extra" else "upcoming"
+                ),
+            })
+            promo_rows.append({
+                "booking_id": booking.id,
+                "transaction_id": transaction.id,
+                "promo_code": "NOPROMO",
+                "discount_applied": "0",
+                "actual_price": transaction.amount or 0.0,
+            })
+
+        if not dashboard_rows:
+            return
+        vendor_id = int(vendor_id)
+        db.session.execute(text(f"""
+            INSERT INTO VENDOR_{vendor_id}_DASHBOARD
+            (username, user_id, start_time, end_time, date, book_id, game_id, game_name, console_id, book_status)
+            VALUES (:username, :user_id, :start_time, :end_time, :date, :book_id, :game_id, :game_name, :console_id, :book_status)
+        """), dashboard_rows)
+        db.session.execute(text(f"""
+            INSERT INTO VENDOR_{vendor_id}_PROMO_DETAIL
+            (booking_id, transaction_id, promo_code, discount_applied, actual_price)
+            VALUES (:booking_id, :transaction_id, :promo_code, :discount_applied, :actual_price)
+        """), promo_rows)
+
+    @staticmethod
     def insert_into_vendor_dashboard_table(trans_id, console_id, status=None):
         """Inserts booking and transaction details into the vendor dashboard table."""
 

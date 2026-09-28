@@ -5060,6 +5060,7 @@ def new_booking(vendor_id):
     Creates a new booking for the given vendor with optional extra services/meals
     Supports both regular and private booking modes via toggle
     """
+    started_at = time.perf_counter()
     try:
         current_app.logger.info("New Booking Triggered")
         data = request.get_json(silent=True) or {}
@@ -5634,7 +5635,7 @@ def new_booking(vendor_id):
             booking.status = "confirmed"
             booking.updated_at = datetime.utcnow()
 
-        db.session.commit()
+        db.session.flush()
 
         # Create transaction entries
         transactions = []
@@ -5874,10 +5875,7 @@ def new_booking(vendor_id):
         # Resolve runtime lifecycle and console assignment.
         # If slot is live in IST, assign console now and start as current.
         booked_for_date_obj = booked_date_obj
-        slot_map = {
-            int(s.id): s
-            for s in Slot.query.filter(Slot.id.in_([b.slot_id for b in bookings])).all()
-        }
+        slot_map = runtime_slot_map
         booking_runtime = {}
         for booking in bookings:
             slot_obj = slot_map.get(int(booking.slot_id))
@@ -5973,19 +5971,16 @@ def new_booking(vendor_id):
                 "console_id": runtime_console_id,
             }
 
+        # Persist transaction and dashboard records together. Reuse the loaded
+        # objects instead of re-querying and committing each record separately.
+        BookingService.insert_vendor_booking_rows(
+            vendor_id, transactions, bookings, user, available_game, slot_map, booking_runtime
+        )
         db.session.commit()
-
-        # Dashboard and promo table entries
-        for trans in transactions:
-            meta = booking_runtime.get(int(trans.booking_id))
-            if meta:
-                console_id_val = int(meta["console_id"])
-                dashboard_status = str(meta["dashboard_status"])
-            else:
-                console_id_val = int(console_id) if console_id is not None else -1
-                dashboard_status = "upcoming"
-            BookingService.insert_into_vendor_dashboard_table(trans.id, console_id_val, dashboard_status)
-            BookingService.insert_into_vendor_promo_table(trans.id, console_id_val)
+        current_app.logger.info(
+            "new_booking.persisted vendor_id=%s bookings=%s elapsed_ms=%.1f",
+            vendor_id, len(bookings), (time.perf_counter() - started_at) * 1000,
+        )
 
         # Emit real-time booking lifecycle after confirmation so dashboard cards update immediately.
         if socketio:
@@ -6101,7 +6096,7 @@ def new_booking(vendor_id):
         # Prepare booking details for email
         booking_details = []
         for booking in bookings:
-            slot_obj = db.session.query(Slot).filter_by(id=booking.slot_id).first()
+            slot_obj = slot_map.get(int(booking.slot_id))
             slot_time = f"{str(slot_obj.start_time)} - {str(slot_obj.end_time)}" if slot_obj else "N/A"
             booking_details.append({
                 "booking_id": booking.id,
@@ -6130,7 +6125,7 @@ def new_booking(vendor_id):
             booking_mode=booking_mode,
         )
 
-        # Send booking confirmation email
+        # Prepare email data; delivery is queued after the committed booking.
         cafe_name = db.session.query(Vendor).filter_by(id=vendor_id).first().cafe_name
         
         email_meal_details = []
@@ -6149,7 +6144,7 @@ def new_booking(vendor_id):
             source_channel=actor["source_channel"],
         )
         try:
-            booking_mail(
+            _send_booking_mail_async(current_app._get_current_object(), [dict(
                 gamer_name=name,
                 gamer_phone=phone,
                 gamer_email=email,
@@ -6163,7 +6158,7 @@ def new_booking(vendor_id):
                 waive_off_amount=waive_off_total,
                 app_fee_amount=float(app_fee_total or 0.0),
                 net_total=max(float(total_paid or 0.0) - float(app_fee_total or 0.0), 0.0),
-            )
+            )])
         except Exception as mail_error:
             current_app.logger.exception("booking_mail failed for vendor=%s booking_ids=%s err=%s",
                                          vendor_id, [b.id for b in bookings], mail_error)
@@ -6235,6 +6230,10 @@ def new_booking(vendor_id):
             response['failed_slot_details'] = failed_slot_details
             response['message'] = f"Created {len(bookings)} bookings ({booking_mode} mode), {len(failed_slots)} slots failed"
 
+        current_app.logger.info(
+            "new_booking.completed vendor_id=%s bookings=%s elapsed_ms=%.1f",
+            vendor_id, len(bookings), (time.perf_counter() - started_at) * 1000,
+        )
         return jsonify(response), 200
 
     except Exception as e:
@@ -7782,78 +7781,11 @@ def get_user_details(vendor_id):
         # Fast search mode for typeahead (branch-only when booked_only=true).
         if query_text or "field" in request.args or "booked_only" in request.args:
             if booked_only:
-                # Fast-path for large vendors: recent transaction user IDs first, then user lookup.
-                recent_user_rows = (
-                    db.session.query(Transaction.user_id)
-                    .filter(
-                        Transaction.vendor_id == vendor_id_int,
-                        Transaction.user_id.isnot(None),
-                    )
-                    .order_by(Transaction.id.desc())
-                    .limit(max(limit * 40, 200))
-                    .all()
-                )
-
-                ordered_user_ids = []
-                seen_user_ids = set()
-                for row in recent_user_rows:
-                    uid = int(row[0]) if row and row[0] else None
-                    if not uid or uid in seen_user_ids:
-                        continue
-                    seen_user_ids.add(uid)
-                    ordered_user_ids.append(uid)
-                    if len(ordered_user_ids) >= max(limit * 8, 80):
-                        break
-
-                if not ordered_user_ids:
-                    return jsonify([]), 200
-
-                recent_branch_users = (
-                    db.session.query(
-                        User.id.label("id"),
-                        User.name.label("name"),
-                        ContactInfo.email.label("email"),
-                        ContactInfo.phone.label("phone"),
-                    )
-                    .outerjoin(
-                        ContactInfo,
-                        and_(
-                            ContactInfo.parent_id == User.id,
-                            ContactInfo.parent_type == "user",
-                        ),
-                    )
-                    .filter(User.id.in_(ordered_user_ids))
-                )
-
-                if query_text:
-                    token = f"{query_text.lower()}%"
-                    if field == "name":
-                        recent_branch_users = recent_branch_users.filter(func.lower(User.name).like(token))
-                    elif field == "phone":
-                        recent_branch_users = recent_branch_users.filter(func.lower(func.coalesce(ContactInfo.phone, "")).like(token))
-                    elif field == "email":
-                        recent_branch_users = recent_branch_users.filter(func.lower(func.coalesce(ContactInfo.email, "")).like(token))
-                    else:
-                        recent_branch_users = recent_branch_users.filter(
-                            or_(
-                                func.lower(User.name).like(token),
-                                func.lower(func.coalesce(ContactInfo.phone, "")).like(token),
-                                func.lower(func.coalesce(ContactInfo.email, "")).like(token),
-                            )
-                        )
-
-                rows = recent_branch_users.limit(max(limit * 2, limit)).all()
-                row_map = {int(row.id): row for row in rows if row and row.id}
-                sorted_rows = [row_map[uid] for uid in ordered_user_ids if uid in row_map][:limit]
-                return jsonify([
-                    {
-                        "id": row.id,
-                        "name": row.name,
-                        "email": row.email,
-                        "phone": row.phone,
-                    }
-                    for row in sorted_rows
-                ]), 200
+                # Search all historical customers, not a sample of recent transactions.
+                # EXISTS avoids multiplying customers by their booking count.
+                from services.customer_search import search_booked_customers
+                rows = search_booked_customers(db.session, vendor_id_int, query_text, field, limit)
+                return jsonify(rows), 200
 
             # Non-booked-only search mode still remains vendor-scoped via known user IDs.
             user_ids = _collect_vendor_user_ids(vendor_id_int)
