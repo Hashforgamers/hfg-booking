@@ -5187,13 +5187,6 @@ def new_booking(vendor_id):
         if not console_type:
             return jsonify({"message": "Console type is required"}), 400
 
-        # ✅ Get all available games for vendor
-        all_games = db.session.query(AvailableGame).filter_by(vendor_id=vendor_id).all()
-        
-        current_app.logger.info(f"🔍 Available games for vendor {vendor_id}:")
-        for game in all_games:
-            current_app.logger.info(f"  Game ID {game.id}: name='{game.game_name}', price={game.single_slot_price}")
-
         # Resolve game with compatibility mapping (legacy types + new catalog slugs).
         available_game = _resolve_available_game_for_vendor(
             vendor_id=vendor_id,
@@ -5283,7 +5276,7 @@ def new_booking(vendor_id):
             f"Price={available_game.single_slot_price}, Requested_Type={console_type}, Mode={booking_mode}"
         )
 
-        vendor_squad_policy = _load_squad_pricing_policy(vendor_id)
+        vendor_squad_policy = _load_squad_pricing_policy(vendor_id) if squad_enabled else {}
 
         # Validate squad size against console policy:
         # - PC: squad discount rule-engine
@@ -5500,7 +5493,9 @@ def new_booking(vendor_id):
             ]
 
         # Get socketio instance
-        socketio = current_app.extensions.get('socketio')
+        from services.booking_realtime import DeferredBookingRealtime
+        realtime = current_app.extensions.get('socketio')
+        socketio = DeferredBookingRealtime(realtime) if realtime else None
 
         # ✅ MODIFIED: Use BookingService.create_booking with booking_mode
         bookings = []
@@ -5534,6 +5529,7 @@ def new_booking(vendor_id):
                     booking_mode=booking_mode,  # ✅ PASS BOOKING MODE HERE
                     squad_details=normalized_squad_details if squad_enabled else None,
                     slot_units=slot_units_required,
+                    emit_events=False,
                 )
                 
                 bookings.append(booking)
@@ -6234,6 +6230,8 @@ def new_booking(vendor_id):
             "new_booking.completed vendor_id=%s bookings=%s elapsed_ms=%.1f",
             vendor_id, len(bookings), (time.perf_counter() - started_at) * 1000,
         )
+        if socketio:
+            socketio.dispatch()
         return jsonify(response), 200
 
     except Exception as e:

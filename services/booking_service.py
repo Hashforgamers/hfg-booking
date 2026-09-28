@@ -168,6 +168,7 @@ class BookingService:
         booking_mode: str = 'regular',  # ✅ NEW PARAMETER
         squad_details: Optional[dict] = None,
         slot_units: int = 1,
+        emit_events: bool = True,
     ):
         """
         Create a booking with specified mode.
@@ -345,6 +346,11 @@ class BookingService:
             log.exception("create_booking.booking_persist_failed cid=%s vendor_id=%s slot_id=%s error=%s",
                           cid, vendor_id, slot_id, e)
             raise
+
+        # Dashboard creation sends only the final confirmed event after saving.
+        if not emit_events:
+            db.session.commit()
+            return booking
 
         # STEP 5: Resolve username (non-fatal)
         try:
