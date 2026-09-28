@@ -4910,6 +4910,40 @@ def reject_booking():
    # except Exception as e:
     #    return jsonify({"message": f"Error fetching booking details: {str(e)}"}), 500
 
+@booking_blueprint.route('/vendor/<int:vendor_id>/upcoming/<int:booking_id>/slot', methods=['GET', 'PUT'])
+@require_vendor_permission("booking.manage")
+def manage_upcoming_slot(vendor_id, booking_id):
+    try:
+        if request.method == 'PUT':
+            from services.upcoming_slots import move_slot
+            data = request.get_json(silent=True) or {}
+            target_date = datetime.strptime(str(data.get('date') or ''), '%Y-%m-%d').date()
+            move_slot(db.session, vendor_id, booking_id, int(data.get('slot_id')), target_date,
+                      datetime.now(IST).replace(tzinfo=None))
+            db.session.commit()
+        row = db.session.execute(text("""
+            SELECT b.id AS booking_id, b.slot_id, b.game_id, b.status,
+                   s.start_time, s.end_time, MIN(t.booked_date) AS date
+            FROM bookings b JOIN available_games g ON g.id=b.game_id
+            JOIN slots s ON s.id=b.slot_id JOIN transactions t ON t.booking_id=b.id
+            WHERE b.id=:id AND g.vendor_id=:vendor
+            GROUP BY b.id, s.start_time, s.end_time
+        """), {'id': booking_id, 'vendor': vendor_id}).mappings().first()
+        if not row:
+            return jsonify(message='Booking not found'), 404
+        result = dict(row)
+        for key in ('date', 'start_time', 'end_time'):
+            result[key] = result[key].isoformat() if result[key] else None
+        return jsonify(success=True, slot=result)
+    except (ValueError, TypeError) as exc:
+        db.session.rollback()
+        return jsonify(message=str(exc)), 400
+    except Exception:
+        db.session.rollback()
+        current_app.logger.exception('Upcoming slot edit failed')
+        return jsonify(message='Could not update this slot. Refresh booking details before retrying.'), 500
+
+
 @booking_blueprint.route('/update_booking/<int:booking_id>', methods=['PUT'])
 def update_booking(booking_id):
     try:
