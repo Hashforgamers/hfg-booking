@@ -163,7 +163,7 @@ def get_effective_price(vendor_id: int, available_game) -> float:
                 and_(
                     ConsolePricingOffer.start_date == ConsolePricingOffer.end_date,
                     ConsolePricingOffer.start_time <= current_time,
-                    ConsolePricingOffer.end_time >= current_time
+                    ConsolePricingOffer.end_time > current_time
                 ),
                 and_(
                     ConsolePricingOffer.start_date == current_date,
@@ -173,7 +173,7 @@ def get_effective_price(vendor_id: int, available_game) -> float:
                 and_(
                     ConsolePricingOffer.start_date < current_date,
                     ConsolePricingOffer.end_date == current_date,
-                    ConsolePricingOffer.end_time >= current_time
+                    ConsolePricingOffer.end_time > current_time
                 ),
                 and_(
                     ConsolePricingOffer.start_date < current_date,
@@ -185,7 +185,7 @@ def get_effective_price(vendor_id: int, available_game) -> float:
         .first()
     )
     if current_offer is not None:
-        return float(current_offer.offered_price)
+        return min(float(current_offer.offered_price), float(available_game.single_slot_price))
     return float(available_game.single_slot_price)
 
 
@@ -632,7 +632,7 @@ def _compute_pay_at_cafe_pricing(vendor_id: int, available_game, squad_details: 
                 "Pay-at-cafe controller pricing missing vendor_id=%s game_id=%s qty=%s",
                 vendor_id, available_game.id, controller_qty
             )
-            controller_amount = 0.0
+            raise ValueError("Controller pricing is not configured for this console")
         else:
             controller_amount = float(computed_controller_fare or 0.0)
 
@@ -665,59 +665,19 @@ def get_effective_price_for_schedule(vendor_id: int, available_game, booking_dat
     except ValueError:
         return float(available_game.single_slot_price or 0.0)
 
-    slot_start = getattr(slot_obj, "start_time", None)
-    slot_end = getattr(slot_obj, "end_time", None)
-
-    query = (
-        ConsolePricingOffer.query
-        .filter(
-            ConsolePricingOffer.vendor_id == vendor_id,
-            ConsolePricingOffer.available_game_id == available_game.id,
-            ConsolePricingOffer.is_active == True,
-            ConsolePricingOffer.start_date <= booking_date,
-            ConsolePricingOffer.end_date >= booking_date,
-        )
-    )
-
-    if slot_start is not None and slot_end is not None:
-        query = query.filter(
-            or_(
-                and_(
-                    ConsolePricingOffer.start_date == ConsolePricingOffer.end_date,
-                    ConsolePricingOffer.start_time <= slot_start,
-                    ConsolePricingOffer.end_time >= slot_end,
-                ),
-                and_(
-                    ConsolePricingOffer.start_date == booking_date,
-                    ConsolePricingOffer.end_date > booking_date,
-                    ConsolePricingOffer.start_time <= slot_start,
-                ),
-                and_(
-                    ConsolePricingOffer.start_date < booking_date,
-                    ConsolePricingOffer.end_date == booking_date,
-                    ConsolePricingOffer.end_time >= slot_end,
-                ),
-                and_(
-                    ConsolePricingOffer.start_date < booking_date,
-                    ConsolePricingOffer.end_date > booking_date,
-                )
-            )
-        )
-
-    current_offer = query.order_by(ConsolePricingOffer.offered_price.asc()).first()
-    if current_offer is not None:
-        _log_pricing_event(
-            "schedule_offer",
-            vendor_id=vendor_id,
-            game_id=getattr(available_game, "id", None),
-            booking_date=booking_date,
-            slot_start=slot_start,
-            slot_end=slot_end,
-            offer_id=current_offer.id,
-            offered_price=float(current_offer.offered_price or 0.0),
-        )
-        return float(current_offer.offered_price)
-    return float(available_game.single_slot_price or 0.0)
+    from services.pricing_math import effective_price, slot_window
+    if slot_obj is None:
+        # Date-only estimates cannot assume that an offer covers an unspecified slot.
+        return float(available_game.single_slot_price or 0)
+    start, end = slot_window(booking_date, slot_obj.start_time, slot_obj.end_time)
+    offers = ConsolePricingOffer.query.filter(
+        ConsolePricingOffer.vendor_id == vendor_id,
+        ConsolePricingOffer.available_game_id == available_game.id,
+        ConsolePricingOffer.is_active == True,
+        ConsolePricingOffer.start_date <= end.date(),
+        ConsolePricingOffer.end_date >= start.date(),
+    ).all()
+    return float(effective_price(available_game.single_slot_price, offers, start, end))
 
 
 def _resolve_available_game_for_vendor(vendor_id: int, console_type: str = None, console_id: int = None, game_id: int = None):
@@ -767,9 +727,11 @@ def _resolve_available_game_for_vendor(vendor_id: int, console_type: str = None,
 def calculate_extra_controller_fare(vendor_id: int, available_game_id: int, quantity: int):
     """
     Calculate controller fare using tiered pricing rules.
-    If no rule exists, returns None and caller may fallback to legacy fare.
+    If no rule exists, returns None; paid checkout must reject missing pricing.
     """
-    if quantity <= 0:
+    if type(quantity) is not int or not 0 <= quantity <= 64:
+        raise ValueError("Controller quantity must be an integer from 0 to 64")
+    if quantity == 0:
         return 0.0
 
     rule = ControllerPricingRule.query.filter_by(
@@ -781,23 +743,9 @@ def calculate_extra_controller_fare(vendor_id: int, available_game_id: int, quan
     if not rule:
         return None
 
-    base_price = float(rule.base_price or 0)
-    active_tiers = sorted(
-        [tier for tier in rule.tiers if tier.is_active],
-        key=lambda t: t.quantity
-    )
-
-    # Minimum-cost composition: base controller price + any active bundle tiers.
-    dp = [float("inf")] * (quantity + 1)
-    dp[0] = 0.0
-
-    for q in range(1, quantity + 1):
-        dp[q] = min(dp[q], dp[q - 1] + base_price)
-        for tier in active_tiers:
-            if tier.quantity <= q:
-                dp[q] = min(dp[q], dp[q - tier.quantity] + float(tier.total_price))
-
-    return float(dp[quantity] if dp[quantity] != float("inf") else quantity * base_price)
+    from services.pricing_math import controller_total
+    return float(controller_total(rule.base_price,
+        [{'quantity':tier.quantity, 'total_price':tier.total_price} for tier in rule.tiers if tier.is_active], quantity))
 
 
 def _resolve_console_capabilities(console_name: str, vendor_id: int = None) -> dict:
@@ -891,13 +839,16 @@ def _load_squad_pricing_policy(vendor_id: int, supported_groups: dict = None):
     }
     rows = (
         SquadPricingRule.query
-        .filter_by(vendor_id=int(vendor_id), is_active=True)
+        .filter_by(vendor_id=int(vendor_id))
         .all()
     )
 
+    for group in {str(row.console_group).lower() for row in rows}:
+        if group in supported_groups:
+            policy[group] = {players: 0.0 for players in range(2, int(supported_groups[group])+1)}
     for row in rows:
         group = str(row.console_group or "").strip().lower()
-        if group not in supported_groups:
+        if not row.is_active or group not in supported_groups:
             continue
         max_rule_players = int(supported_groups.get(group) or 2)
         if int(row.player_count) < 2 or int(row.player_count) > max_rule_players:
@@ -3890,7 +3841,7 @@ def confirm_booking():
                     and_(
                         ConsolePricingOffer.start_date == ConsolePricingOffer.end_date,
                         ConsolePricingOffer.start_time <= current_time,
-                        ConsolePricingOffer.end_time >= current_time
+                        ConsolePricingOffer.end_time > current_time
                     ),
                     and_(
                         ConsolePricingOffer.start_date == current_date,
@@ -3900,7 +3851,7 @@ def confirm_booking():
                     and_(
                         ConsolePricingOffer.start_date < current_date,
                         ConsolePricingOffer.end_date == current_date,
-                        ConsolePricingOffer.end_time >= current_time
+                        ConsolePricingOffer.end_time > current_time
                     ),
                     and_(
                         ConsolePricingOffer.start_date < current_date,
@@ -5070,9 +5021,12 @@ def new_booking(vendor_id):
         booking_type = data.get("bookingType") or "direct"
         user_id = data.get("userId")
         waive_off_total = float(data.get("waiveOffAmount", 0.0))
-        extra_controller_fare = float(data.get("extraControllerFare", 0.0))
+        extra_controller_fare = 0.0  # Always calculated from server pricing.
         try:
-            extra_controller_qty = int(data.get("extraControllerQty", 0) or 0)
+            raw_controller_qty = data.get("extraControllerQty", 0)
+            extra_controller_qty = int(raw_controller_qty)
+            if isinstance(raw_controller_qty, bool) or str(raw_controller_qty) != str(extra_controller_qty):
+                raise ValueError("Controller quantity must be a whole number")
         except (TypeError, ValueError):
             return jsonify({"message": "extraControllerQty must be a valid integer"}), 400
         selected_meals = data.get("selectedMeals", [])
@@ -5241,8 +5195,9 @@ def new_booking(vendor_id):
                 )
                 available_game = scoped_game
 
-        if extra_controller_qty < 0:
-            return jsonify({"message": "extraControllerQty cannot be negative"}), 400
+        extra_controller_fare = 0.0
+        if not 0 <= extra_controller_qty <= 64:
+            return jsonify({"message": "extraControllerQty must be between 0 and 64"}), 400
 
         if not is_controller_pricing_supported(available_game.game_name, vendor_id=vendor_id):
             # PC/VR and other unsupported console types should never carry controller surcharge.
@@ -5257,10 +5212,10 @@ def new_booking(vendor_id):
 
             if computed_controller_fare is not None:
                 extra_controller_fare = computed_controller_fare
-            elif extra_controller_fare <= 0:
+            else:
                 return jsonify({
                     "message": "Controller pricing is not configured for this console type. "
-                               "Configure it in dashboard or send extraControllerFare as fallback."
+                               "Configure it in Console Pricing before booking."
                 }), 400
 
         # ✅ LOG the final selected game with booking mode
@@ -5319,6 +5274,8 @@ def new_booking(vendor_id):
             )
             if computed_controller_fare is not None:
                 extra_controller_fare = computed_controller_fare
+            else:
+                raise ValueError("Configure controller pricing before booking this squad")
 
         slot_units_required = (
             int(normalized_squad_details.get("player_count", 1))

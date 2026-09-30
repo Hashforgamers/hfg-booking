@@ -73,7 +73,7 @@ class ConsolePricingOffer(db.Model):
 
         # Single-day offer
         if self.start_date == self.end_date:
-            return self.start_time <= current_time <= self.end_time
+            return self.start_time <= current_time < self.end_time
 
         # Multi-day offer
         if current_date == self.start_date:
@@ -81,7 +81,7 @@ class ConsolePricingOffer(db.Model):
             return current_time >= self.start_time
         elif current_date == self.end_date:
             # Last day: must be before end_time
-            return current_time <= self.end_time
+            return current_time < self.end_time
         else:
             # Middle days: always active all day
             return True
