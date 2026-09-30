@@ -1,6 +1,6 @@
 # Mobile checkout: cafe context required
 
-Checked against local source on 25 September 2026. Production request bodies and
+Updated against local source on 30 September 2026. Production request bodies and
 cafe policy data have not been inspected.
 
 ## Why the payment screen fails
@@ -79,10 +79,9 @@ for a checkout where no booking has been created yet.
 
 - 400 `cafe_context_required`: fix the request context; repeated payment retry is
   not a recovery. Preserve the selected cafe across navigation and SDK callbacks.
-- 403 `cafe_wallet_required`: a saved cafe policy prohibits legacy gateway gaming
-  checkout. Route to the cafe-wallet/PC QR flow. Adding vendor_id does not override
-  this policy. The presence of a saved cafe policy triggers this rule, even when
-  its `self_service` flag is false; in that case ask the cafe desk for assistance.
+- 403 `payment_method_disabled`: this cafe has disabled the requested method. Reload
+  `/api/vendor/{vendor_id}/paymentMethods` on the dashboard API origin and show only
+  enabled methods. A saved cafe-wallet policy does not disable other methods.
 - Other gateway/auth errors: handle according to the endpoint response; do not
   label every failure as missing cafe context.
 
@@ -93,9 +92,9 @@ amount, currency or a screen title.
 
 ## Validation completed
 
-Existing local regression `test_legacy_payment_policy_cannot_collect_for_wallet_cafe`
-passes: missing context → 400, a cafe with a saved wallet policy → 403, a cafe
-without a policy → allowed through to the test route. No live payment was created.
+The payment-policy regression covers missing context (400), a saved wallet cafe
+with gateway enabled (allowed), the same cafe after gateway is disabled (403),
+and a different cafe with gateway enabled (allowed). No live payment was created.
 
-The mobile frontend source was not found in this workspace. To patch the actual
-caller, provide its project location or the failing URL and sanitized JSON body.
+For the six-method contract, pass purchase and rollout requirements, see
+[six-method-payments.md](six-method-payments.md).

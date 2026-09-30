@@ -16,6 +16,7 @@ from models.bookingExtraService import BookingExtraService
 from models.extraServiceMenuImage import ExtraServiceMenuImage
 from models.passModels import CafePass
 from models.extraServiceMenu import ExtraServiceMenu
+from decimal import Decimal, InvalidOperation
 from sqlalchemy import or_
 from utils.realtime import emit_booking_event
 from flask import current_app, g, has_app_context
@@ -310,19 +311,19 @@ class BookingService:
         elif squad_details:
             stored_squad_details = {"raw": squad_details}
 
-        if is_pay_at_cafe:
-            booked_date_value = None
-            if isinstance(book_date, datetime):
-                booked_date_value = book_date.date().isoformat()
-            elif isinstance(book_date, date):
-                booked_date_value = book_date.isoformat()
-            elif isinstance(book_date, str) and book_date.strip():
-                booked_date_value = book_date.strip()
+        # Persist the reserved date for every payment method. Confirmation must not change it.
+        booked_date_value = None
+        if isinstance(book_date, datetime):
+            booked_date_value = book_date.date().isoformat()
+        elif isinstance(book_date, date):
+            booked_date_value = book_date.isoformat()
+        elif isinstance(book_date, str) and book_date.strip():
+            booked_date_value = book_date.strip()
 
-            if booked_date_value:
-                if stored_squad_details is None:
-                    stored_squad_details = {}
-                stored_squad_details["booked_date"] = booked_date_value
+        if booked_date_value:
+            if stored_squad_details is None:
+                stored_squad_details = {}
+            stored_squad_details["booked_date"] = booked_date_value
 
         try:
             booking = Booking(
@@ -688,25 +689,20 @@ class BookingService:
 
     @staticmethod
     def debit_wallet(user_id, booking_id, amount):
-        wallet = db.session.query(HashWallet).filter_by(user_id=user_id).first()
-
-        if not wallet:
-            wallet = HashWallet(user_id=user_id, balance=0)
-            db.session.add(wallet)
-            db.session.flush()
-
-        if wallet.balance < amount:
-            raise ValueError("Insufficient wallet balance")
-
+        # Hash Wallet stores whole rupees. Never truncate a fractional debit.
+        try:
+            value = Decimal(str(amount))
+            if not value.is_finite() or value <= 0 or value != value.to_integral_value():
+                raise ValueError('Hash Wallet requires a positive whole-rupee amount')
+        except InvalidOperation:
+            raise ValueError('Invalid wallet amount')
+        amount = int(value)
+        wallet = db.session.query(HashWallet).filter_by(user_id=user_id).populate_existing().with_for_update().first()
+        if not wallet or wallet.balance < amount:
+            raise ValueError('Insufficient wallet balance')
         wallet.balance -= amount
-
-        wallet_txn = HashWalletTransaction(
-            user_id=user_id,
-            amount=-amount,
-            type='booking',
-            reference_id=booking_id
-        )
-        db.session.add(wallet_txn)
+        db.session.add(HashWalletTransaction(user_id=user_id, amount=-amount,
+            type='booking', reference_id=str(booking_id)))
 
     @staticmethod
     def get_user_pass(user_id, vendor_id, book_date):

@@ -2,6 +2,7 @@
 from flask import request, jsonify
 from sqlalchemy import text
 from db.extensions import db
+from services.payment_methods import canonical_method, require_method
 
 
 def enforce_cafe_payment_policy():
@@ -17,6 +18,9 @@ def enforce_cafe_payment_policy():
     body = request.get_json(silent=True) or {}
     if not isinstance(body, dict):
         return jsonify(message='Invalid request body'), 400
+    # Buying a pass is distinct from spending it at a cafe. Purchase verifies catalog price and owner.
+    if endpoint in {'create_order', 'capture_payment'} and body.get('cafe_pass_id'):
+        return None
     vendor_ids = set()
     args = request.view_args or {}
     requested_vendor = args.get('vendor_id') or body.get('vendor_id')
@@ -39,12 +43,23 @@ def enforce_cafe_payment_policy():
                 vendor_ids.add(row[0])
     if endpoint in {'create_order', 'generate_payment_link', 'capture_payment'} and not vendor_ids:
         return jsonify(message='Supply vendor_id, game_id or booking_id for payment policy validation.', code='cafe_context_required'), 400
+    requested_method = canonical_method(body.get('payment_mode') or body.get('paymentType') or body.get('payment_method'))
+    if endpoint in {'create_order', 'generate_payment_link', 'capture_payment'}:
+        requested_method = 'payment_gateway'
+    if endpoint == 'confirm_booking':
+        # Confirmation derives the pass scope from the owned pass, never a client label.
+        requested_method = None
+    if body.get('is_pay_at_cafe') is True:
+        requested_method = 'pay_at_cafe'
     for vid in vendor_ids:
+        if requested_method:
+            try:
+                require_method(vid, requested_method)
+            except ValueError as error:
+                return jsonify(message=str(error), code='payment_method_disabled'), 403
         row = db.session.execute(text('SELECT settings FROM cafe_payment_policies WHERE vendor_id=:vid'), {'vid':vid}).first()
-        if row:
+        if row and endpoint in food:
             settings = row[0]
-            if endpoint in gaming:
-                return jsonify(message='This cafe uses cafe wallet checkout. Scan the QR on your PC.', code='cafe_wallet_required'), 403
             if not settings.get('food_ordering') or settings.get('food_collection') == 'vendor':
                 return jsonify(message='Food has a separate store checkout at this cafe.', code='separate_food_checkout'), 403
     return None

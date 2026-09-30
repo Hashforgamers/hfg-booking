@@ -82,7 +82,7 @@ from decimal import Decimal
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 from services.security import auth_required_self
-from services.vendor_access import require_vendor_permission
+from services.vendor_access import require_vendor_permission, internal_booking_headers
 
 from utils.realtime import build_booking_event_payload
 from utils.realtime import emit_booking_event
@@ -1322,9 +1322,11 @@ def _credit_wallet_for_cancellation(user_id: int, booking_id: int, amount: float
     if credit_units <= 0:
         return 0
 
+    User.query.filter_by(id=int(user_id)).with_for_update().first()
     wallet = (
         db.session.query(HashWallet)
         .filter(HashWallet.user_id == int(user_id))
+        .populate_existing()
         .with_for_update()
         .first()
     )
@@ -1423,7 +1425,7 @@ def resolve_settlement_status(payment_use_case: str) -> str:
         return "pending"
     if payment_use_case == "monthly_credit":
         return "pending"
-    if payment_use_case in {"cash", "upi", "card", "payment_gateway", "hash_wallet", "pass", "free"}:
+    if payment_use_case in {"cash", "upi", "card", "payment_gateway", "hash_wallet", "pass", "hash_global_pass", "cafe_specific_pass", "free"}:
         return "completed"
     return "pending"
 
@@ -2802,7 +2804,7 @@ def _trigger_pay_at_cafe_action_async(booking_id: int, vendor_id: int, action: s
     def _runner():
         with app.app_context():
             try:
-                requests.post(target_url, json=payload, timeout=10)
+                requests.post(target_url, json=payload, headers=internal_booking_headers(vendor_id, booking_id, action_norm), timeout=10)
             except Exception as exc:
                 current_app.logger.warning(
                     "pay_at_cafe auto action trigger failed booking_id=%s vendor_id=%s action=%s err=%s",
@@ -2818,11 +2820,35 @@ def _trigger_pay_at_cafe_action_async(booking_id: int, vendor_id: int, action: s
 @booking_blueprint.route('/create_order', methods=['POST'])
 @auth_required_self(decrypt_user=True)
 def create_order():
+    if getattr(g, 'token_expired', False):
+        return jsonify(message='Token expired'), 401
     data = request.get_json(silent=True) or {}
 
-    amount = data.get('amount')  # in paisa
+    if not isinstance(data, dict):
+        return jsonify(error='A JSON object is required'), 400
+    pass_id = data.get('cafe_pass_id')
+    if pass_id is not None:
+        from models.passModels import CafePass
+        catalog = db.session.get(CafePass, pass_id)
+        if not catalog or not catalog.is_active:
+            return jsonify(error='Pass not available'), 404
+        if catalog.vendor_id is not None:
+            from services.payment_methods import require_method
+            try:
+                require_method(catalog.vendor_id, 'cafe_specific_pass')
+                require_method(catalog.vendor_id, 'payment_gateway')
+            except ValueError as error:
+                return jsonify(error=str(error)), 403
+        price = Decimal(str(catalog.price))
+        if not price.is_finite() or price <= 0 or price * 100 != (price * 100).to_integral_value():
+            return jsonify(error='Invalid pass price'), 400
+        amount = int(price * 100)
+    else:
+        amount = data.get('amount')  # in paise
     currency = data.get('currency', 'INR')
     try:
+        if isinstance(amount, bool) or Decimal(str(amount)) != Decimal(str(amount)).to_integral_value():
+            raise ValueError('Invalid amount')
         amount = int(amount)
     except (TypeError, ValueError):
         return jsonify({"error": "amount must be a positive integer in paise"}), 400
@@ -2849,6 +2875,10 @@ def create_order():
             "user_id": str(int(g.auth_user_id)),
         },
     }
+
+    if pass_id is not None:
+        payload['notes']['cafe_pass_id'] = str(pass_id)
+        payload['notes']['purpose'] = 'pass_purchase'
 
     response = requests.post("https://api.razorpay.com/v1/orders", headers=headers, json=payload, timeout=10)
 
@@ -2927,6 +2957,9 @@ def create_booking():
     log.info("bookings.post.start cid=%s user_id=%s", cid, user_id)
 
     data = request.json or {}
+    if not isinstance(data, dict) or type(data.get('is_pay_at_cafe', False)) is not bool:
+        return jsonify(message='is_pay_at_cafe must be boolean in a JSON object'), 400
+
     slot_ids = data.get("slot_id")  # list expected
     game_id = data.get("game_id")
     book_date = data.get("book_date")
@@ -3247,7 +3280,10 @@ def generate_payment_link():
         return jsonify({"message": "Missing required fields!"}), 400
 
     try:
-        amount_paise = int(float(amount_rupees) * 100)
+        amount_decimal = Decimal(str(amount_rupees))
+        if not amount_decimal.is_finite() or amount_decimal <= 0 or amount_decimal * 100 != (amount_decimal * 100).to_integral_value():
+            raise ValueError('Amount must be positive with at most two decimal places')
+        amount_paise = int(amount_decimal * 100)
     except Exception:
         return jsonify({"message": "Invalid amount format."}), 400
 
@@ -3603,9 +3639,13 @@ def confirm_booking():
 @booking_blueprint.route('/confirm/bookings', methods=['POST'])
 @auth_required_self(decrypt_user=True)
 def confirm_booking():
+    if getattr(g, 'token_expired', False):
+        return jsonify(message='Token expired'), 401
     try:
         data = request.get_json(force=True)
 
+        if not isinstance(data, dict):
+            return jsonify(message='A JSON object is required'), 400
         booking_ids = data.get('booking_id')
         payment_id = data.get('payment_id')
         razorpay_order_id = data.get('razorpay_order_id') or data.get('order_id')
@@ -3616,7 +3656,7 @@ def confirm_booking():
         
         # NEW: Hour-based pass parameters
         use_hour_pass = bool(data.get('use_hour_pass', False))
-        hour_pass_uid = data.get('hour_pass_uid')  # Optional: specific pass
+        hour_pass_uid = data.get('hour_pass_uid') or data.get('pass_uid')  # Optional: specific pass
         
         # Keep existing date-based pass logic
         use_pass = bool(data.get('use_pass', False))
@@ -3626,18 +3666,26 @@ def confirm_booking():
 
         current_app.logger.info(f"Confirm payload: {data}")
 
-        normalized_payment_mode = str(payment_mode or "").strip().lower()
-        if normalized_payment_mode in {"hash_wallet", "wallet_credit"}:
-            payment_mode = "wallet"
-            normalized_payment_mode = "wallet"
-        elif normalized_payment_mode in {"hour_pass", "pass_hour"}:
-            use_hour_pass = True
-            payment_mode = "hour_pass"
-            normalized_payment_mode = "hour_pass"
-        elif normalized_payment_mode in {"pass", "date_pass", "cafe_pass", "global_pass"}:
-            use_pass = True
-            payment_mode = "date_pass"
-            normalized_payment_mode = "date_pass"
+        for flag in ('use_pass', 'use_hour_pass'):
+            if flag in data and type(data[flag]) is not bool:
+                return jsonify(message=f'{flag} must be boolean'), 400
+        normalized_payment_mode = str(payment_mode or '').strip().lower()
+        aliases = {'hash_wallet': 'wallet', 'wallet_credit': 'wallet', 'gateway': 'payment_gateway',
+                   'pass_hour': 'hour_pass', 'pass': 'date_pass', 'cafe_pass': 'date_pass',
+                   'global_pass': 'date_pass', 'hash_global_pass': 'date_pass', 'cafe_specific_pass': 'date_pass'}
+        payment_mode = aliases.get(normalized_payment_mode, normalized_payment_mode)
+        if payment_mode not in {'wallet', 'payment_gateway', 'date_pass', 'hour_pass'}:
+            return jsonify(message='Unsupported confirmation method. Pay in cafe must use the acceptance flow; cafe wallet uses QR checkout.'), 400
+        if use_hour_pass and use_pass:
+            return jsonify(message='Select one pass type'), 400
+        if use_hour_pass:
+            payment_mode = 'hour_pass'
+        elif use_pass:
+            payment_mode = 'date_pass'
+        use_hour_pass = payment_mode == 'hour_pass'
+        use_pass = payment_mode == 'date_pass'
+        if (use_pass or use_hour_pass) and extra_services_list:
+            return jsonify(message='Passes cover gaming only. Order food separately.'), 400
 
         def _payment_label(mode_value: str) -> str:
             if mode_value == "wallet":
@@ -3672,11 +3720,12 @@ def confirm_booking():
             booking_ids = [booking_ids]
         elif not isinstance(booking_ids, list):
             return jsonify({'message': 'booking_id must be a list or integer'}), 400
+        if any(isinstance(v, bool) or not str(v).isdigit() or int(v) <= 0 for v in booking_ids):
+            return jsonify(message='booking_id must contain positive integer IDs'), 400
         try:
             booking_ids = [int(v) for v in booking_ids]
         except (TypeError, ValueError):
             return jsonify({'message': 'booking_id contains invalid values'}), 400
-        booking_ids = list(dict.fromkeys(booking_ids))
         if len(booking_ids) > 20:
             return jsonify({'message': 'Cannot confirm more than 20 bookings per request'}), 400
 
@@ -3684,7 +3733,7 @@ def confirm_booking():
         RAZORPAY_KEY_ID = current_app.config.get("RAZORPAY_KEY_ID")
         RAZORPAY_KEY_SECRET = current_app.config.get("RAZORPAY_KEY_SECRET")
         razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
-        razorpay_payment_verified = True
+        razorpay_payment_verified = False
         razorpay_payment = None
         gateway_payment_ledger = None
 
@@ -3698,6 +3747,8 @@ def confirm_booking():
                     if razorpay_order_id and str(payment.get("order_id") or "") != str(razorpay_order_id):
                         return jsonify({"message": "Payment does not belong to the supplied order"}), 400
                     order = razorpay_client.order.fetch(payment.get("order_id"))
+                    if (order.get('notes') or {}).get('purpose') == 'pass_purchase':
+                        return jsonify(message='Use this payment to complete its pass purchase'), 400
                     owner_note = (order.get("notes") or {}).get("user_id") or (payment.get("notes") or {}).get("user_id")
                     if str(owner_note or "") != str(int(g.auth_user_id)):
                         return jsonify({"message": "Payment order does not belong to this user"}), 403
@@ -3746,14 +3797,28 @@ def confirm_booking():
                 joinedload(Booking.squad_members),
             )
             .filter(Booking.id.in_(booking_ids))
+            .order_by(Booking.id)
             # Joined optional relations cannot be locked by PostgreSQL.
             .with_for_update(of=Booking)
             .all()
         )
+        if len(set(booking_ids)) != len(booking_ids) or len(booking_objects) != len(booking_ids):
+            return jsonify(message='Every booking ID must exist and occur only once'), 400
+        if any(booking.status != 'pending_verified' for booking in booking_objects):
+            return jsonify(message='Only unpaid pending bookings can be confirmed here'), 409
         if not booking_objects:
             return jsonify({'message': 'No pending bookings found for confirmation'}), 404
         if any(int(booking.user_id or 0) != int(g.auth_user_id) for booking in booking_objects):
             return jsonify({'message': 'You can only confirm your own bookings'}), 403
+        for booking in booking_objects:
+            held_details = booking.squad_details if isinstance(booking.squad_details, dict) else {}
+            held_date = _coerce_date_value(held_details.get('booked_date'))
+            if held_date is None:
+                return jsonify(message='This hold predates date validation. Create a new booking hold.'), 409
+            if held_date != book_date:
+                return jsonify(message='book_date must match the reserved booking date'), 400
+        if any(not booking.game or not booking.slot for booking in booking_objects) or len({booking.game.vendor_id for booking in booking_objects}) != 1:
+            return jsonify(message='Confirm valid bookings for one cafe at a time'), 400
         booking_map = {b.id: b for b in booking_objects}
         first_booking = booking_objects[0] if booking_objects else None
         first_game = first_booking.game if first_booking else None
@@ -3775,7 +3840,7 @@ def confirm_booking():
             except ValueError as squad_error:
                 return jsonify({"message": str(squad_error)}), 400
             for booking in booking_objects:
-                booking.squad_details = persisted_squad_details if persisted_squad_details.get("enabled") else None
+                booking.squad_details = dict(persisted_squad_details, booked_date=book_date.isoformat())
 
         squad_enabled = bool(persisted_squad_details.get("enabled"))
         squad_console_group = str(persisted_squad_details.get("console_group") or "").strip().lower()
@@ -3865,7 +3930,7 @@ def confirm_booking():
         for extra in extra_services_list:
             menu_obj = menu_map.get(extra.get('item_id'))
             quantity = int(extra.get('quantity', 1) or 1)
-            if not menu_obj or quantity <= 0:
+            if not menu_obj or not menu_obj.category or menu_obj.category.vendor_id != first_game.vendor_id or quantity <= 0:
                 return jsonify({
                     "message": f"Invalid extra service item '{extra.get('item_id')}' in request"
                 }), 400
@@ -3939,12 +4004,9 @@ def confirm_booking():
             uses_multi_slot_units = bool(
                 squad_enabled and _requires_multi_console_units(available_game.game_name or "", vendor_id=available_game.vendor_id)
             )
-            slot_unit_price = float(
-                effective_price_by_game.get(
-                    available_game.id,
-                    float(available_game.single_slot_price or 0.0),
-                )
-            )
+            slot_unit_price = float(get_effective_price_for_schedule(
+                vendor.id, available_game, book_date, slot_obj) or 0.0)
+
 
             captain_phone = user.contact_info.phone if user and user.contact_info else ""
             if squad_enabled and not booking.squad_members:
@@ -3975,7 +4037,8 @@ def confirm_booking():
                     user_hour_pass = PassService.get_valid_user_pass(
                         user_id=user.id,
                         vendor_id=vendor.id,
-                        pass_uid=hour_pass_uid
+                        pass_uid=hour_pass_uid,
+                        check_date=book_date
                     )
                     
                     if not user_hour_pass:
@@ -4036,7 +4099,10 @@ def confirm_booking():
                         pass_mode='date_based'
                     ).first()
                 active_pass = active_pass_cache[pass_cache_key]
-                if not active_pass or active_pass.valid_to < book_date:
+                if (not active_pass or not active_pass.cafe_pass or not active_pass.cafe_pass.is_active
+                    or active_pass.cafe_pass.vendor_id not in (None, vendor.id)
+                    or (active_pass.valid_from and active_pass.valid_from > book_date)
+                    or (active_pass.valid_to and active_pass.valid_to < book_date)):
                     return jsonify({"message": "Invalid or expired date-based pass"}), 400
                 pass_used_id = active_pass.id
                 pass_type_name = active_pass.cafe_pass.pass_type.name if active_pass.cafe_pass.pass_type else None
@@ -4071,6 +4137,15 @@ def confirm_booking():
                     voucher_discount = int(amount_payable * voucher.discount_percentage / 100)
                     discount_amount += voucher_discount
                     amount_payable -= voucher_discount
+
+            from services.payment_methods import require_method
+            if use_hour_pass:
+                accepted = 'hash_global_pass' if user_hour_pass.cafe_pass.vendor_id is None else 'cafe_specific_pass'
+            elif use_pass:
+                accepted = 'hash_global_pass' if active_pass.cafe_pass.vendor_id is None else 'cafe_specific_pass'
+            else:
+                accepted = 'hash_wallet' if payment_mode == 'wallet' else 'payment_gateway'
+            require_method(vendor.id, accepted)
 
             # Payment processing
             normalized_payment_mode = str(payment_mode or "").strip().lower()
@@ -4112,7 +4187,7 @@ def confirm_booking():
             booking.access_code_id = access_code_entry.id
 
             app_fee_amount = resolve_app_fee_amount(amount_payable, data, source_channel="app")
-            payment_use_case = normalize_payment_use_case(payment_mode_used, "app")
+            payment_use_case = accepted
             settlement_status = resolve_settlement_status(payment_use_case)
 
             # Create transaction
@@ -4431,6 +4506,10 @@ def confirm_booking():
         
         return jsonify(response), 200
 
+    except ValueError as e:
+        db.session.rollback()
+        return jsonify(error=str(e)), 400
+
     except Exception as e:
         db.session.rollback()
         current_app.logger.exception("Error confirming booking")
@@ -4532,6 +4611,7 @@ def cancel_booking(booking_id):
         return jsonify({"message": "Booking not found"}), 404
 
 @booking_blueprint.route('/bookings/direct', methods=['POST'])
+@require_vendor_permission("booking.manage")
 def direct_booking():
     current_app.logger.info("Direct Booking Triggered")
     data = request.json
@@ -4543,6 +4623,14 @@ def direct_booking():
     console_type = data.get("console_type")
     system_number = data.get("system_number")
     payment_method = data.get("payment_method")
+    if str(payment_method or '').lower() not in {'cash', 'card', 'upi', 'pay_at_cafe'}:
+        return jsonify(message='Use the verified checkout for wallet, pass or gateway payments'), 400
+    from services.payment_methods import require_method
+    try:
+        require_method(g.vendor_id, 'pay_at_cafe')
+    except ValueError as error:
+        return jsonify(message=str(error)), 403
+
     payment_status = data.get("payment_status")
     total_amount = data.get("total_amount")
     additional_request = data.get("additional_request")
@@ -4753,162 +4841,23 @@ def direct_booking():
         return jsonify({"message": "Failed to process direct booking", "error": str(e)}), 500
 
 @booking_blueprint.route('/bookings/reject', methods=['POST'])
+@require_vendor_permission("booking.manage")
 def reject_booking():
-    """Reject a direct booking and handle slot release & repayment."""
+    """Use the same locked refund and slot-release path as cancellation."""
+    body = request.get_json(silent=True) or {}
     try:
-        data = request.json
-        booking_id = data.get("booking_id")
-        rejection_reason = data.get("rejection_reason", "No reason provided")
-        repayment_type = data.get("repayment_type")  # refund, credit, reschedule
-        user_email = data.get("user_email")
-
-        if not booking_id or not repayment_type:
-            return jsonify({"message": "booking_id and repayment_type are required"}), 400
-
-        # Fetch booking with transaction details
-        booking = db.session.query(Booking).options(joinedload(Booking.transaction)).filter_by(id=booking_id).first()
-
-        if not booking:
-            return jsonify({"message": "Booking not found"}), 404
-
-        if not booking.transaction or booking.transaction.booking_type != "direct":
-            return jsonify({"message": "Only direct bookings can be rejected"}), 400
-
-        # Fetch slot details
-        slot = db.session.query(Slot).filter_by(id=booking.slot_id).first()
-
-        if not slot:
-            return jsonify({"message": "Slot not found"}), 404
-
-        # Release slot by updating availability
-        db.session.execute(
-            text(f"""
-                UPDATE VENDOR_{booking.transaction.vendor_id}_SLOT
-                SET available_slot = available_slot + 1, is_available = TRUE
-                WHERE slot_id = :slot_id AND date = :booked_date
-            """),
-            {"slot_id": booking.slot_id, "booked_date": booking.transaction.booked_date}
-        )
-
-        # Update booking status
-        booking.status = "rejected"
-
-        # Create a new refund/credit/reschedule transaction
-        new_transaction = Transaction(
-            booking_id=booking.id,
-            vendor_id=booking.transaction.vendor_id,
-            user_id=booking.user_id,
-            booked_date=datetime.utcnow().date(),
-            booking_time=datetime.utcnow().time(),
-            user_name=f"{booking.transaction.user_name} {repayment_type.upper()}-{booking.transaction.id}",
-            original_amount=-booking.transaction.amount,
-            discounted_amount=0,
-            amount=-booking.transaction.amount,  # Negative amount for refund
-            mode_of_payment=booking.transaction.mode_of_payment,
-            booking_type=repayment_type,  # refund, credit, reschedule
-            settlement_status="processed" if repayment_type == "refund" else "pending",
-            app_fee_amount=0.0
-        )
-
-        db.session.add(new_transaction)
-        db.session.commit()
-
-        BookingService.update_dashboard_booking_status(booking.transaction.id, booking.transaction.vendor_id, "rejected")
-
-        vendor_contact = ContactInfo.query.filter_by(parent_id=booking.transaction.vendor_id, parent_type="vendor").first()
-        vendor = Vendor.query.filter_by(id=booking.transaction.vendor_id).first()
-
-        current_app.logger.info(
-            f"gamer Email {user_email}; gamer name :{booking.transaction.user_name}; cafe_name: {vendor_contact.email if vendor_contact else 'N/A'} ; rejection {rejection_reason}"
-        )
-
-        # Send rejection email
-        reject_booking_mail(
-            gamer_name=booking.transaction.user_name,
-            gamer_email=user_email,
-            cafe_name=vendor.cafe_name if vendor else "N/A",
-            reason=rejection_reason
-        )
-
-        return jsonify({
-            "message": f"Booking {booking_id} rejected successfully",
-            "status": booking.status,
-            "repayment_type": repayment_type
-        }), 200
-
-    except Exception as e:
+        result = cancel_bookings_with_refund([body.get('booking_id')],
+            repayment_type=body.get('repayment_type'), reason=body.get('rejection_reason'),
+            actor_scope='dashboard', apply_cancellation_fee=False)
+        return jsonify(result), 200
+    except ValueError as error:
         db.session.rollback()
-        return jsonify({"message": "Failed to reject booking", "error": str(e)}), 500
+        return jsonify(message=str(error)), 400
+    except Exception:
+        db.session.rollback()
+        current_app.logger.exception('Failed to reject booking')
+        return jsonify(message='Unable to reject booking'), 500
 
-#@booking_blueprint.route('/bookings/<booking_id>', methods=['GET'])
-#def get_booking_details(booking_id):
- #   try:
-  #      # ✅ Fetch Booking
-   #     booking = db.session.query(Booking).filter(Booking.id == booking_id).first()
-   #     if not booking:
-   #         return jsonify({"message": "Booking not found"}), 404
-#
- #       if booking.status != "confirmed":
- #           return jsonify({"message": "Booking is not confirmed yet"}), 400
-#
- #       # ✅ Fetch Slot
-  #      slot = db.session.query(Slot).filter(Slot.id == booking.slot_id).first()
-   #     if not slot:
-    #        return jsonify({"message": "Slot not found"}), 404
-#
- #       # ✅ Fetch Latest Transaction
-  #      transaction = db.session.query(Transaction).filter(
-   #         Transaction.booking_id == booking.id
-    #    ).order_by(Transaction.id.desc()).first()
-
-     #   if not transaction:
-      #      return jsonify({"message": "Transaction not found"}), 404
-
-        # ✅ Fetch User
-       # user = db.session.query(User).filter(User.id == booking.user_id).first()
-        #if not user:
-         #   return jsonify({"message": "User not found"}), 404
-
-        # ✅ Get Console ID (Fix for multiple rows issue)
-        #console_entry = db.session.query(available_game_console.c.console_id).filter(
-        #    available_game_console.c.available_game_id == slot.gaming_type_id
-        #).first()  # Returns a tuple (console_id,)
-
-       # console_id = console_entry[0] if console_entry else None
-
-        # ✅ Fetch Console Details (only if console_id exists)
-        #console = db.session.query(Console).filter(Console.id == console_id).first() if console_id else None
-
-        # ✅ Fetch Contact Info (Fix incorrect filter syntax)
-        #contact_info = db.session.query(ContactInfo).filter(
-         #   and_(ContactInfo.parent_id == user.id, ContactInfo.parent_type == 'user')
-        #).first()  # Get latest contact info if multiple exist
-
-        # ✅ Format Response
-        #booking_details = {
-         #   "success": True,
-          #  "booking": {
-           #     "booking_id": f"BK-{booking.id}",  
-            #    "date": transaction.booked_date.strftime("%Y-%m-%d"),
-             #   "time_slot": {
-              #      "start_time": slot.start_time.strftime("%H:%M"),
-               #     "end_time": slot.end_time.strftime("%H:%M")
-                #},
-                #"system": console.model_number if console else "Unknown System",
-              #  "game_id": booking.game_id,
-               # "customer": {
-                #    "name": user.name,
-                 #   "email": contact_info.email if contact_info else "",
-                 #   "phone": contact_info.phone if contact_info else ""
-                #},
-                #"amount_paid": transaction.amount
-            #}
-        #}
-
-        #return jsonify(booking_details), 200
-
-   # except Exception as e:
-    #    return jsonify({"message": f"Error fetching booking details: {str(e)}"}), 500
 
 @booking_blueprint.route('/vendor/<int:vendor_id>/upcoming/<int:booking_id>/slot', methods=['GET', 'PUT'])
 @require_vendor_permission("booking.manage")
@@ -5089,6 +5038,7 @@ def get_vendor_bookings(vendor_id):
         return jsonify({"error": str(e)}), 500
 
 @booking_blueprint.route('/newBooking/vendor/<int:vendor_id>', methods=['POST'])
+@require_vendor_permission("booking.manage")
 def new_booking(vendor_id):
     """
     Creates a new booking for the given vendor with optional extra services/meals
@@ -5106,6 +5056,15 @@ def new_booking(vendor_id):
         booked_date = data.get("bookedDate")
         slot_ids, invalid_slot_ids = _normalize_slot_ids(data.get("slotId"))
         payment_type = str(data.get("paymentType") or "").strip()
+        desk_mode = payment_type.lower().replace(' ', '_')
+        if desk_mode not in {'cash', 'card', 'upi', 'pay_at_cafe', 'pay_in_cafe', 'pass', 'monthly_credit'}:
+            return jsonify(message='Unsupported desk payment method. Use verified app checkout for wallets or gateway.'), 400
+        from services.payment_methods import require_method
+        if desk_mode in {'cash', 'card', 'upi', 'pay_at_cafe', 'pay_in_cafe'}:
+            require_method(vendor_id, 'pay_at_cafe')
+        elif desk_mode in {'wallet', 'hash_wallet'}:
+            require_method(vendor_id, 'hash_wallet')
+
         console_id = data.get("consoleId")
         is_rapid_booking = data.get("isRapidBooking")
         booking_type = data.get("bookingType") or "direct"
@@ -5735,6 +5694,24 @@ def new_booking(vendor_id):
                 max(total_base_before_discount - total_discount, 0.0), 2
             )
 
+        desk_pass = None
+        if desk_mode == 'pass':
+            if total_meals_cost or extra_controller_fare or squad_player_multiplier > 1:
+                raise ValueError('Pass checkout supports one player and gaming only; collect extras separately')
+            from services.pass_service import PassService
+            from controllers.pass_controller import _consume_pass_verification_token
+            desk_pass = PassService.get_valid_user_pass(user_id=user.id, vendor_id=vendor_id,
+                pass_uid=data.get('pass_uid'), check_date=booked_date_obj)
+            if not desk_pass:
+                raise ValueError('A valid pass belonging to this customer is required')
+            ok, error = _consume_pass_verification_token(data.get('pass_verification_token'), vendor_id, user.id, desk_pass.pass_uid)
+            if not ok:
+                raise ValueError(error)
+            for booking in bookings:
+                PassService.redeem_pass_hours(desk_pass.id, vendor_id,
+                    PassService.calculate_slot_hours(booking.slot_id, desk_pass.cafe_pass),
+                    'dashboard_booking', booking_id=booking.id)
+
         actor = resolve_transaction_actor(request, default_source="dashboard")
         payment_use_case = normalize_payment_use_case(payment_type, actor["source_channel"])
         settlement_status = resolve_settlement_status(payment_use_case)
@@ -5775,6 +5752,13 @@ def new_booking(vendor_id):
             original_amount = base_slot_price + slot_meal_cost
             discounted_amount = waive_off_per_slot + slot_discount
             final_amount = max(original_amount - discounted_amount, 0.0)
+            if desk_pass:
+                discounted_amount = original_amount
+                final_amount = 0.0
+                payment_use_case = 'hash_global_pass' if desk_pass.cafe_pass.vendor_id is None else 'cafe_specific_pass'
+            elif desk_mode in {'wallet', 'hash_wallet'} and final_amount > 0:
+                BookingService.debit_wallet(user.id, booking.id, final_amount)
+
             gst = calculate_gst_breakdown(vendor_id, final_amount)
             app_fee_amount = resolve_app_fee_amount(
                 final_amount,
@@ -6268,6 +6252,9 @@ def new_booking(vendor_id):
             socketio.dispatch()
         return jsonify(response), 200
 
+    except ValueError as e:
+        db.session.rollback()
+        return jsonify(success=False, message=str(e)), 400
     except Exception as e:
         db.session.rollback()
         current_app.logger.error(f"❌ Failed to process booking: {str(e)}")
@@ -6312,6 +6299,8 @@ def cancel_bookings_with_refund(
         Booking.query
         .options(joinedload(Booking.slot), joinedload(Booking.game))
         .filter(Booking.id.in_(parsed_ids))
+        .populate_existing()
+        .with_for_update(of=Booking)
         .all()
     )
     if not booking_rows:
@@ -6416,13 +6405,15 @@ def cancel_bookings_with_refund(
         )
 
         chosen_repayment = (str(repayment_type or "").strip().lower() or None)
+        if chosen_repayment not in {None, "refund", "credit", "none", "no_refund", "no-refund"}:
+            raise ValueError("Unsupported repayment type")
         if chosen_repayment in {"no_refund", "no-refund"}:
             chosen_repayment = "none"
         if not chosen_repayment:
             chosen_repayment = _default_repayment_type(payment_use_case) if paid_amount > 0 else "none"
         if paid_amount <= 0:
             chosen_repayment = "none"
-        if is_pay_at_cafe and settlement_status in {"pending", "unpaid", "due"} and repayment_type is None:
+        if is_pay_at_cafe and settlement_status in {"pending", "unpaid", "due"}:
             chosen_repayment = "none"
 
         cancellation_fee = (
@@ -6439,7 +6430,8 @@ def cancel_bookings_with_refund(
         refund_amount = round(max(refundable_amount - cancellation_fee, 0.0), 2)
         if chosen_repayment == "credit" and refund_amount > 0:
             # Wallet schema is integer-based; normalize refund to wallet units.
-            refund_amount = float(int(round(refund_amount)))
+            if Decimal(str(refund_amount)) != Decimal(str(refund_amount)).to_integral_value():
+                raise ValueError("Hash Wallet supports whole rupees; use original-payment refund for fractional amounts")
         wallet_credit_amount = 0.0
 
         if tx and refund_amount > 0 and chosen_repayment != "none":
@@ -6457,7 +6449,7 @@ def cancel_bookings_with_refund(
                 mode_of_payment=tx.mode_of_payment,
                 payment_use_case=tx.payment_use_case,
                 booking_type=chosen_repayment,
-                settlement_status="processed" if chosen_repayment in {"refund", "credit"} else "pending",
+                settlement_status="processed" if chosen_repayment == "credit" else "pending",
                 source_channel=actor_source,
                 initiated_by_staff_id=actor["staff_id"],
                 initiated_by_staff_name=actor["staff_name"],
@@ -6534,6 +6526,7 @@ def cancel_bookings_with_refund(
             "booking_id": booking_id,
             "repayment_type": chosen_repayment,
             "refund_amount": round(refund_amount, 2),
+            "refund_status": "pending" if chosen_repayment == "refund" and refund_amount > 0 else "processed" if wallet_credit_amount > 0 else "not_required",
             "cancellation_fee": round(cancellation_fee, 2),
             "wallet_credit_amount": round(wallet_credit_amount, 2),
             "payment_use_case": payment_use_case or None,
@@ -6612,6 +6605,7 @@ def cancel_bookings_with_refund(
 
 
 @booking_blueprint.route('/bookings/cancel', methods=['POST'])
+@require_vendor_permission("booking.manage")
 def cancel_bookings_route():
     try:
         data = request.get_json(silent=True) or {}
@@ -7359,6 +7353,7 @@ def get_vendor_booking_stats(vendor_id):
         }), 500
 
 @booking_blueprint.route('/extraBooking', methods=['POST'])
+@require_vendor_permission("booking.manage")
 def extra_booking():
     """
     Records extra booking (time extended) played by the user in a gaming cafe, with waive-off functionality.
@@ -7379,6 +7374,12 @@ def extra_booking():
         amount = float(data["amount"])
         game_id = int(data["gameId"])
         mode_of_payment = str(data["modeOfPayment"]).strip().lower()
+        if mode_of_payment not in {'cash', 'card', 'upi', 'pay_at_cafe', 'monthly_credit', 'pending', 'unpaid'}:
+            return jsonify(message='Unsupported desk payment method'), 400
+        from services.payment_methods import require_method
+        if mode_of_payment in {'cash', 'card', 'upi', 'pay_at_cafe'}:
+            require_method(g.vendor_id, 'pay_at_cafe')
+
         vendor_id = int(data["vendorId"])
         waive_off_amount = float(data.get("waiveOffAmount", 0.0))
         reference_id = data.get("reference_id")
@@ -8721,7 +8722,7 @@ def pay_at_cafe_email_action():
         action_payload["rejection_reason"] = "Rejected using secure email action link"
 
     try:
-        upstream = requests.post(action_url, json=action_payload, timeout=12)
+        upstream = requests.post(action_url, json=action_payload, headers=internal_booking_headers(vendor_id, booking_id, action), timeout=12)
     except Exception as exc:
         current_app.logger.exception(
             "pay_at_cafe.email_action upstream call failed booking_id=%s vendor_id=%s action=%s error=%s",
@@ -8786,6 +8787,7 @@ def pay_at_cafe_email_action():
     return page, 400, {"Content-Type": "text/html; charset=utf-8"}
 
 @booking_blueprint.route('/pay-at-cafe/accept', methods=['POST'])
+@require_vendor_permission("booking.manage")
 def accept_pay_at_cafe_booking():
     """Accept a pay-at-cafe booking and change status to confirmed"""
     try:
@@ -9089,6 +9091,7 @@ def accept_pay_at_cafe_booking():
         }), 500
 
 @booking_blueprint.route('/pay-at-cafe/reject', methods=['POST'])
+@require_vendor_permission("booking.manage")
 def reject_pay_at_cafe_booking():
     """Reject a pay-at-cafe booking and change status to cancelled"""
     try:
@@ -9633,6 +9636,7 @@ def booking_payment_summary(booking_id):
 
 
 @booking_blueprint.route('/booking/<int:booking_id>/settle-pending', methods=['POST'])
+@require_vendor_permission("booking.manage")
 def settle_pending_booking_transactions(booking_id):
     """
     Settle pending end-of-session charges for a booking.
@@ -9644,6 +9648,12 @@ def settle_pending_booking_transactions(booking_id):
         waive_off_amount = float(body.get("waive_off_amount") or 0.0)
         if not mode:
             return jsonify({"success": False, "message": "mode_of_payment is required"}), 400
+        if mode not in {'cash', 'card', 'upi', 'pay_at_cafe', 'monthly_credit'}:
+            return jsonify(success=False, message='Use cash, cafe UPI/card or monthly credit for desk settlement'), 400
+        from services.payment_methods import require_method
+        if mode != 'monthly_credit':
+            require_method(g.vendor_id, 'pay_at_cafe')
+
 
         booking = Booking.query.filter_by(id=booking_id).first()
         if not booking:
