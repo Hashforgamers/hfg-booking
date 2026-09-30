@@ -42,7 +42,7 @@ class PassService:
             end_dt = datetime.combine(date.today(), slot.end_time)
             
             # Handle overnight slots
-            if end_dt < start_dt:
+            if end_dt <= start_dt:
                 end_dt += timedelta(days=1)
             
             duration_seconds = (end_dt - start_dt).total_seconds()
@@ -88,6 +88,13 @@ class PassService:
             if not user_pass:
                 return None
             
+            if user_id is not None and int(user_pass.user_id) != int(user_id):
+                return None
+            if user_pass.valid_from and user_pass.valid_from > check_date:
+                return None
+            cafe_pass = CafePass.query.get(user_pass.cafe_pass_id)
+            if not cafe_pass or not cafe_pass.is_active:
+                return None
             # Check expiry
             if user_pass.valid_to and user_pass.valid_to < check_date:
                 return None
@@ -116,6 +123,8 @@ class PassService:
             UserPass.is_active == True,
             UserPass.pass_mode == 'hour_based',
             UserPass.remaining_hours > 0,
+            CafePass.is_active == True,
+            or_(UserPass.valid_from.is_(None), UserPass.valid_from <= check_date),
             or_(
                 UserPass.valid_to.is_(None),  # No expiry
                 UserPass.valid_to >= check_date
@@ -164,14 +173,37 @@ class PassService:
             ValueError: If insufficient hours or invalid pass
         """
         try:
+            hours_to_deduct = Decimal(str(hours_to_deduct))
+            if not hours_to_deduct.is_finite() or hours_to_deduct <= 0 or hours_to_deduct.as_tuple().exponent < -2:
+                raise ValueError('Hours must be positive with at most two decimal places')
             # Lock the user_pass row for update
             user_pass = db.session.query(UserPass).filter(
                 UserPass.id == user_pass_id
-            ).with_for_update().first()
+            ).populate_existing().with_for_update().first()
             
             if not user_pass:
                 raise ValueError(f"Pass {user_pass_id} not found")
             
+            cafe_pass = db.session.get(CafePass, user_pass.cafe_pass_id)
+            if not cafe_pass or not cafe_pass.is_active or cafe_pass.vendor_id not in (None, vendor_id):
+                raise ValueError('Pass is not valid at this cafe')
+            from services.payment_methods import require_method
+            require_method(vendor_id, 'hash_global_pass' if cafe_pass.vendor_id is None else 'cafe_specific_pass')
+            if user_pass.valid_from and user_pass.valid_from > datetime.now(IST).date():
+                raise ValueError('Pass validity has not started')
+            if booking_id is not None:
+                from models.booking import Booking
+                from models.availableGame import AvailableGame
+                booking = db.session.get(Booking, booking_id)
+                game = db.session.get(AvailableGame, booking.game_id) if booking else None
+                if not booking or booking.user_id != user_pass.user_id or not game or game.vendor_id != vendor_id:
+                    raise ValueError('Booking does not belong to this pass owner and cafe')
+                previous = PassRedemptionLog.query.filter_by(booking_id=booking_id, is_cancelled=False).first()
+                if previous:
+                    if previous.user_pass_id == user_pass_id and previous.hours_deducted == hours_to_deduct:
+                        return previous
+                    raise ValueError('Booking already has a pass redemption')
+
             if not user_pass.is_active:
                 raise ValueError(f"Pass {user_pass.pass_uid} is inactive")
             
@@ -243,17 +275,18 @@ class PassService:
             if not redemption:
                 raise ValueError(f"Redemption {redemption_id} not found")
             
-            if redemption.is_cancelled:
-                raise ValueError(f"Redemption {redemption_id} already cancelled")
-            
             # Lock user_pass for update
             user_pass = db.session.query(UserPass).filter(
                 UserPass.id == redemption.user_pass_id
-            ).with_for_update().first()
+            ).populate_existing().with_for_update().first()
             
             if not user_pass:
                 raise ValueError(f"Pass not found")
             
+            redemption = PassRedemptionLog.query.filter_by(id=redemption_id).populate_existing().with_for_update().one()
+            if redemption.is_cancelled:
+                return True
+
             # Restore hours
             user_pass.remaining_hours += redemption.hours_deducted
             
@@ -357,7 +390,10 @@ class PassService:
         """
         query = db.session.query(UserPass).join(CafePass).filter(
             UserPass.user_id == user_id,
-            UserPass.is_active == True
+            UserPass.is_active == True,
+            CafePass.is_active == True,
+            or_(UserPass.valid_from.is_(None), UserPass.valid_from <= datetime.now(IST).date()),
+            or_(UserPass.valid_to.is_(None), UserPass.valid_to >= datetime.now(IST).date())
         )
         
         # Filter hour-based passes by remaining hours

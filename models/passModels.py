@@ -60,6 +60,8 @@ class CafePass(db.Model):
     
     def validate(self):
         """Validate pass configuration"""
+        if self.pass_mode not in ('hour_based', 'date_based'):
+            raise ValueError("Invalid pass_mode")
         if self.pass_mode == 'hour_based':
             if not self.total_hours or self.total_hours <= 0:
                 raise ValueError("Hour-based pass must have total_hours > 0")
@@ -150,7 +152,7 @@ class UserPass(db.Model):
             'valid_to': self.valid_to.isoformat() if self.valid_to else None,
             'pass_uid': self.pass_uid,
             'total_hours': float(self.total_hours) if self.total_hours else None,
-            'remaining_hours': float(self.remaining_hours) if self.remaining_hours else None,
+            'remaining_hours': float(self.remaining_hours) if self.remaining_hours is not None else None,
         }
 
 

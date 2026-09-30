@@ -2,6 +2,7 @@ import html
 # controllers/pass_controller.py
 from flask import Blueprint, request, jsonify, current_app, g
 from services.pass_service import PassService
+from services.vendor_access import require_vendor_permission
 from services.security import auth_required_self
 from services.mail_service import send_email
 from db.extensions import db
@@ -34,8 +35,9 @@ _AVAILABLE_PASSES_TTL_SECONDS = int(os.getenv("AVAILABLE_PASSES_CACHE_TTL_SEC", 
 _AVAILABLE_PASSES_CACHE_MAX_ITEMS = 1000
 _AVAILABLE_PASSES_CACHE_LOCK = Lock()
 
-_PASS_OTP_CACHE = {}
-_PASS_OTP_VERIFIED_CACHE = {}
+from services.pass_otp_store import PassOtpStore, cleanup as cleanup_pass_otp
+_PASS_OTP_CACHE = PassOtpStore("otp")
+_PASS_OTP_VERIFIED_CACHE = PassOtpStore("verified")
 _PASS_OTP_CACHE_LOCK = Lock()
 _PASS_OTP_TTL_SECONDS = int(os.getenv("PASS_BOOKING_OTP_TTL_SECONDS", "300"))
 _PASS_OTP_VERIFY_TTL_SECONDS = int(os.getenv("PASS_BOOKING_VERIFY_TTL_SECONDS", "900"))
@@ -94,26 +96,12 @@ def _hash_otp(raw_otp: str) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _cleanup_pass_otp_cache(now_ts: float):
-    expired_otp_ids = [sid for sid, item in _PASS_OTP_CACHE.items() if float(item.get("expires_at", 0)) <= now_ts]
-    for sid in expired_otp_ids:
-        _PASS_OTP_CACHE.pop(sid, None)
-    expired_verified_ids = [tid for tid, item in _PASS_OTP_VERIFIED_CACHE.items() if float(item.get("expires_at", 0)) <= now_ts]
-    for tid in expired_verified_ids:
-        _PASS_OTP_VERIFIED_CACHE.pop(tid, None)
+def _cleanup_pass_otp_cache(now_ts):
+    cleanup_pass_otp(now_ts)
 
 
-def _find_live_otp_session(vendor_id: int, user_id: int, pass_uid: str, now_ts: float):
-    for session_id, session in _PASS_OTP_CACHE.items():
-        if float(session.get("expires_at", 0)) <= now_ts:
-            continue
-        if (
-            int(session.get("vendor_id", -1)) == int(vendor_id)
-            and int(session.get("user_id", -1)) == int(user_id)
-            and str(session.get("pass_uid", "")).strip().upper() == str(pass_uid or "").strip().upper()
-        ):
-            return session_id, session
-    return None, None
+def _find_live_otp_session(vendor_id, user_id, pass_uid, now_ts):
+    return _PASS_OTP_CACHE.live_for(vendor_id, user_id, pass_uid, now_ts)
 
 
 def _send_pass_otp_push(user_id: int, vendor_name: str, pass_uid: str, otp_code: str):
@@ -162,6 +150,7 @@ def _consume_pass_verification_token(token: str, vendor_id: int, user_id: int, p
 
 
 @pass_blueprint.route('/pass/validate', methods=['POST'])
+@require_vendor_permission("booking.manage", "passes.manage")
 def validate_pass():
     """
     Validate pass UID and return pass details.
@@ -248,6 +237,7 @@ def validate_pass():
 
 
 @pass_blueprint.route('/pass/dashboard/valid-options', methods=['GET'])
+@require_vendor_permission("booking.manage", "passes.manage")
 def get_dashboard_user_valid_passes():
     """
     Dashboard helper:
@@ -257,6 +247,21 @@ def get_dashboard_user_valid_passes():
         vendor_id = request.args.get('vendor_id', type=int)
         user_id = request.args.get('user_id', type=int)
         hours_needed = request.args.get('hours_needed', type=float)
+        slot_ids = [int(value) for value in request.args.get('slot_ids', '').split(',') if value]
+        if len(slot_ids) > 20 or len(set(slot_ids)) != len(slot_ids) or any(value <= 0 for value in slot_ids):
+            return jsonify(message='Supply up to 20 distinct slot IDs'), 400
+        if hours_needed is not None and (not Decimal(str(hours_needed)).is_finite() or hours_needed < 0):
+            return jsonify(message='Invalid hours_needed'), 400
+        if slot_ids:
+            from models.slot import Slot
+            from models.availableGame import AvailableGame
+            valid_count = Slot.query.join(AvailableGame, Slot.gaming_type_id == AvailableGame.id).filter(
+                Slot.id.in_(slot_ids), AvailableGame.vendor_id == vendor_id).count()
+            if valid_count != len(slot_ids):
+                return jsonify(message='Slots must belong to this cafe'), 400
+        from services.payment_methods import accepted_methods
+        enabled = accepted_methods(vendor_id)
+
 
         if not vendor_id or not user_id:
             return jsonify({
@@ -298,11 +303,15 @@ def get_dashboard_user_valid_passes():
             if not can_use_here:
                 continue
 
+            method = 'hash_global_pass' if is_global else 'cafe_specific_pass'
+            if method not in enabled:
+                continue
+            required_hours = float(sum((PassService.calculate_slot_hours(sid, cafe_pass) for sid in slot_ids), Decimal('0'))) if slot_ids else hours_needed
             can_cover_hours = True
             shortfall = 0.0
-            if hours_needed is not None and hours_needed > 0:
-                can_cover_hours = remaining_hours >= float(hours_needed)
-                shortfall = max(float(hours_needed) - remaining_hours, 0.0)
+            if required_hours is not None and required_hours > 0:
+                can_cover_hours = remaining_hours >= float(required_hours)
+                shortfall = max(float(required_hours) - remaining_hours, 0.0)
 
             valid_passes.append({
                 "id": int(user_pass.id),
@@ -316,6 +325,7 @@ def get_dashboard_user_valid_passes():
                 "is_global": bool(is_global),
                 "vendor_id": cafe_pass.vendor_id,
                 "hours_per_slot": float(cafe_pass.hours_per_slot) if cafe_pass.hours_per_slot else None,
+                "required_hours": required_hours,
                 "can_cover_hours": bool(can_cover_hours),
                 "hours_shortfall": round(shortfall, 2),
             })
@@ -340,6 +350,8 @@ def get_dashboard_user_valid_passes():
             "passes": valid_passes,
             "count": len(valid_passes),
         }), 200
+    except (ValueError, TypeError) as error:
+        return jsonify(message=str(error)), 400
     except Exception as e:
         current_app.logger.error("Dashboard valid-pass fetch failed: %s", e)
         return jsonify({
@@ -350,6 +362,7 @@ def get_dashboard_user_valid_passes():
 
 
 @pass_blueprint.route('/pass/dashboard/otp/send', methods=['POST'])
+@require_vendor_permission("booking.manage", "passes.manage")
 def send_dashboard_pass_otp():
     """
     Send one-time OTP (mail + optional push) before pass redemption from dashboard.
@@ -382,6 +395,7 @@ def send_dashboard_pass_otp():
         if not user or not user.contact_info or not user.contact_info.email:
             return jsonify({"success": False, "message": "User email not found for OTP delivery"}), 400
 
+        User.query.filter_by(id=user_id).with_for_update().first()
         now_ts = time.time()
         with _PASS_OTP_CACHE_LOCK:
             _cleanup_pass_otp_cache(now_ts)
@@ -401,6 +415,7 @@ def send_dashboard_pass_otp():
             otp_code = f"{secrets.randbelow(1_000_000):06d}"
             otp_session_id = str(uuid.uuid4())
             _PASS_OTP_CACHE[otp_session_id] = {
+                "request_id": otp_session_id,
                 "vendor_id": int(vendor_id),
                 "user_id": int(user_id),
                 "pass_uid": pass_uid,
@@ -410,6 +425,7 @@ def send_dashboard_pass_otp():
                 "attempts_remaining": _PASS_OTP_MAX_ATTEMPTS,
             }
 
+        db.session.commit()
         vendor = Vendor.query.filter_by(id=int(vendor_id)).first()
         vendor_name = vendor.cafe_name if vendor else f"Vendor #{vendor_id}"
         subject = "Verify your pass redemption | Hash For Gamers"
@@ -459,6 +475,7 @@ def send_dashboard_pass_otp():
 
 
 @pass_blueprint.route('/pass/dashboard/otp/verify', methods=['POST'])
+@require_vendor_permission("booking.manage", "passes.manage")
 def verify_dashboard_pass_otp():
     """
     Verify OTP and return short-lived pass_verification_token for redemption.
@@ -478,6 +495,8 @@ def verify_dashboard_pass_otp():
             if not session:
                 return jsonify({"success": False, "message": "OTP session expired or invalid"}), 400
 
+            if int(session.get("vendor_id", 0)) != g.vendor_id:
+                return jsonify(error="OTP belongs to another cafe"), 403
             stored_hash = str(session.get("otp_hash") or "")
             input_hash = _hash_otp(raw_otp)
             if not hmac.compare_digest(stored_hash, input_hash):
@@ -485,8 +504,10 @@ def verify_dashboard_pass_otp():
                 session["attempts_remaining"] = attempts_remaining
                 if attempts_remaining <= 0:
                     _PASS_OTP_CACHE.pop(otp_session_id, None)
+                    db.session.commit()
                     return jsonify({"success": False, "message": "OTP attempts exceeded. Request a new OTP"}), 400
 
+                db.session.commit()
                 return jsonify({
                     "success": False,
                     "message": "Invalid OTP",
@@ -502,6 +523,7 @@ def verify_dashboard_pass_otp():
             }
             _PASS_OTP_CACHE.pop(otp_session_id, None)
 
+        db.session.commit()
         return jsonify({
             "success": True,
             "message": "OTP verified successfully",
@@ -518,6 +540,7 @@ def verify_dashboard_pass_otp():
 
 
 @pass_blueprint.route('/pass/redeem/dashboard', methods=['POST'])
+@require_vendor_permission("booking.manage", "passes.manage")
 def redeem_pass_dashboard():
     """
     Redeem pass from dashboard (vendor scans pass).
@@ -617,76 +640,8 @@ def redeem_pass_dashboard():
 @pass_blueprint.route('/pass/redeem/app', methods=['POST'])
 @auth_required_self(decrypt_user=True)
 def redeem_pass_app():
-    """
-    Redeem pass during app booking flow.
-    Called during booking confirmation.
-    """
-    try:
-        user_id = g.auth_user_id
-        data = request.get_json()
-        
-        vendor_id = data.get('vendor_id')
-        slot_id = data.get('slot_id')
-        pass_uid = data.get('pass_uid')  # Optional: specific pass
-        booking_id = data.get('booking_id')
-        
-        if not all([vendor_id, slot_id, booking_id]):
-            return jsonify({'error': 'vendor_id, slot_id, and booking_id required'}), 400
-        
-        # Get pass (specific or best available)
-        user_pass = PassService.get_valid_user_pass(
-            user_id=user_id,
-            vendor_id=vendor_id,
-            pass_uid=pass_uid
-        )
-        
-        if not user_pass:
-            return jsonify({'error': 'No valid pass found'}), 404
-        
-        # Get cafe_pass for calculation
-        cafe_pass = CafePass.query.get(user_pass.cafe_pass_id)
-        if not cafe_pass:
-            return jsonify({'error': 'Pass configuration not found'}), 404
-        
-        # Calculate hours based on slot and pass config
-        hours_to_deduct = PassService.calculate_slot_hours(
-            slot_id=slot_id,
-            cafe_pass=cafe_pass
-        )
-        
-        # Get slot times
-        from models.slot import Slot
-        slot = Slot.query.get(slot_id)
-        
-        # Redeem
-        redemption = PassService.redeem_pass_hours(
-            user_pass_id=user_pass.id,
-            vendor_id=vendor_id,
-            hours_to_deduct=hours_to_deduct,
-            redemption_method='app_booking',
-            booking_id=booking_id,
-            session_start=slot.start_time if slot else None,
-            session_end=slot.end_time if slot else None,
-            redeemed_by_staff_id=None
-        )
-        
-        db.session.commit()
-        
-        return jsonify({
-            'success': True,
-            'message': 'Pass redeemed for booking',
-            'redemption': redemption.to_dict(),
-            'hours_deducted': float(hours_to_deduct),
-            'remaining_hours': float(user_pass.remaining_hours),
-            'pass_uid': user_pass.pass_uid
-        }), 200
-        
-    except ValueError as e:
-        return jsonify({'error': str(e)}), 400
-    except Exception as e:
-        db.session.rollback()
-        current_app.logger.error(f"App redemption error: {str(e)}")
-        return jsonify({'error': 'Redemption failed'}), 500
+    # Confirmation performs the booking and debit in one transaction.
+    return jsonify(error='Redeem your pass through booking confirmation using payment_mode=hour_pass and pass_uid.'), 409
 
 
 @pass_blueprint.route('/pass/user/active', methods=['GET'])
@@ -711,11 +666,14 @@ def get_user_active_passes():
 
 
 @pass_blueprint.route('/pass/<int:user_pass_id>/history', methods=['GET'])
+@auth_required_self(decrypt_user=True)
 def get_pass_history(user_pass_id):
     """
     Get redemption history for a pass.
     """
     try:
+        if not UserPass.query.filter_by(id=user_pass_id, user_id=g.auth_user_id).first():
+            return jsonify(error="Pass not found"), 404
         logs = PassRedemptionLog.query.filter_by(
             user_pass_id=user_pass_id
         ).order_by(PassRedemptionLog.redeemed_at.desc()).all()
@@ -730,178 +688,37 @@ def get_pass_history(user_pass_id):
 
 
 @pass_blueprint.route('/pass/redemption/<int:redemption_id>/cancel', methods=['POST'])
+@auth_required_self(decrypt_user=True)
 def cancel_redemption(redemption_id):
-    """
-    Cancel a redemption and restore hours.
-    """
-    try:
-        data = request.get_json()
-        reason = data.get('reason')
-        
-        success = PassService.cancel_redemption(redemption_id, reason)
-        
-        if success:
-            return jsonify({
-                'success': True,
-                'message': 'Redemption cancelled and hours restored'
-            }), 200
-        else:
-            return jsonify({'error': 'Cancellation failed'}), 500
-            
-    except ValueError as e:
-        return jsonify({'error': str(e)}), 400
-    except Exception as e:
-        current_app.logger.error(f"Cancel redemption error: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+    return jsonify(error='Use booking cancellation to restore eligible pass hours. Direct restoration is not supported.'), 409
 
 
 @pass_blueprint.route('/pass/create-hour-pass', methods=['POST'])
-@auth_required_self(decrypt_user=True)
-def create_hour_pass():
-    """
-    Create hour-based pass after purchase (called after payment confirmation).
-    """
-    try:
-        user_id = g.auth_user_id
-        data = request.get_json()
-        
-        cafe_pass_id = data.get('cafe_pass_id')
-        payment_details = data.get('payment_details')
-        
-        if not cafe_pass_id:
-            return jsonify({'error': 'cafe_pass_id required'}), 400
-        
-        user_pass = PassService.create_hour_based_pass(
-            user_id=user_id,
-            cafe_pass_id=cafe_pass_id,
-            payment_details=payment_details
-        )
-        
-        return jsonify({
-            'success': True,
-            'message': 'Hour-based pass created',
-            'pass': user_pass.to_dict()
-        }), 201
-        
-    except ValueError as e:
-        return jsonify({'error': str(e)}), 400
-    except Exception as e:
-        db.session.rollback()
-        current_app.logger.error(f"Create hour pass error: {str(e)}")
-        return jsonify({'error': str(e)}), 500
-
-
 @pass_blueprint.route('/user/passes/purchase', methods=['POST'])
+@auth_required_self(decrypt_user=True)
 def purchase_pass():
-    """
-    User purchases a pass after Razorpay payment.
-    Creates UserPass record with unique pass_uid.
-    """
+    from services.pass_purchase_service import purchase, PurchaseError
+    from sqlalchemy.exc import IntegrityError
     try:
-        data = request.get_json()
-        
-        user_id = data.get('user_id')
-        cafe_pass_id = data.get('cafe_pass_id')
-        payment_id = data.get('payment_id', f'test_pay_{int(datetime.now(IST).timestamp())}')
-        payment_mode = data.get('payment_mode', 'payment_gateway')
-        
-        if not all([user_id, cafe_pass_id]):
-            return jsonify({'error': 'user_id and cafe_pass_id required'}), 400
-        
-        # Get cafe pass
-        cafe_pass = CafePass.query.get(cafe_pass_id)
-        if not cafe_pass or not cafe_pass.is_active:
-            return jsonify({'error': 'Pass not available'}), 404
-        
-        # ✅ TESTING MODE - Skip Razorpay verification
-        if payment_mode == 'payment_gateway':
-            current_app.logger.info(f"[TEST MODE] Skipping Razorpay verification for payment_id: {payment_id}")
-            # In production, uncomment the verification code below:
-            """
-            if not payment_id:
-                return jsonify({'error': 'payment_id required'}), 400
-            
-            try:
-                RAZORPAY_KEY_ID = current_app.config.get("RAZORPAY_KEY_ID")
-                RAZORPAY_KEY_SECRET = current_app.config.get("RAZORPAY_KEY_SECRET")
-                razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
-                
-                payment = razorpay_client.payment.fetch(payment_id)
-                if payment['status'] != 'captured':
-                    return jsonify({'error': 'Payment not successful'}), 400
-                    
-            except Exception as e:
-                current_app.logger.error(f"Razorpay verification failed: {str(e)}")
-                return jsonify({'error': f'Payment verification failed: {str(e)}'}), 400
-            """
-        
-        # Deduct from wallet if wallet payment
-        elif payment_mode == 'wallet':
-            from models.user import User
-            user = User.query.get(user_id)
-            if not user:
-                return jsonify({'error': 'User not found'}), 404
-            if user.wallet_balance < cafe_pass.price:
-                return jsonify({'error': 'Insufficient wallet balance'}), 400
-            user.wallet_balance -= cafe_pass.price
-        
-        # Create UserPass based on pass_mode
-        if cafe_pass.pass_mode == 'hour_based':
-            # Use PassService for hour-based
-            user_pass = PassService.create_hour_based_pass(
-                user_id=user_id,
-                cafe_pass_id=cafe_pass_id,
-                payment_details={'payment_id': payment_id, 'mode': payment_mode}
-            )
-        else:
-            # Create date-based pass
-            valid_from = datetime.now(IST).date()
-            valid_to = valid_from + timedelta(days=cafe_pass.days_valid)
-            
-            user_pass = UserPass(
-                user_id=user_id,
-                cafe_pass_id=cafe_pass_id,
-                pass_mode='date_based',
-                valid_from=valid_from,
-                valid_to=valid_to,
-                is_active=True,
-                purchased_at=datetime.now(IST)
-            )
-            db.session.add(user_pass)
-            db.session.flush()
-        
-        # Create transaction record
-        transaction = Transaction(
-            user_id=user_id,
-            vendor_id=cafe_pass.vendor_id,
-            user_name=user_pass.user.name if hasattr(user_pass, 'user') and user_pass.user else None,
-            original_amount=cafe_pass.price,
-            discounted_amount=0,
-            amount=cafe_pass.price,
-            mode_of_payment=payment_mode,
-            booking_date=datetime.now(IST).date(),
-            booking_time=datetime.now(IST).time(),
-            reference_id=payment_id,
-        )
-        db.session.add(transaction)
+        if getattr(g, 'token_expired', False):
+            return jsonify(error='Sign in again'), 401
+        owned, transaction_id, replay = purchase(g.auth_user_id, request.get_json(silent=True))
         db.session.commit()
-        
-        current_app.logger.info(
-            f"Pass purchased: user_id={user_id} pass_id={user_pass.id} "
-            f"amount={cafe_pass.price} payment={payment_mode}"
-        )
-        
-        return jsonify({
-            'success': True,
-            'message': 'Pass purchased successfully',
-            'user_pass': user_pass.to_dict(),
-            'transaction_id': transaction.id
-        }), 201
-        
-    except Exception as e:
+        return jsonify(success=True, user_pass=owned.to_dict(), transaction_id=transaction_id,
+                       idempotent=replay), 200 if replay else 201
+    except PurchaseError as error:
         db.session.rollback()
-        current_app.logger.error(f"Pass purchase failed: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify(error=str(error)), error.status
+    except ValueError as error:
+        db.session.rollback()
+        return jsonify(error=str(error)), 400
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify(error='Payment or request already used. Retry with the same request key.'), 409
+    except Exception:
+        db.session.rollback()
+        current_app.logger.exception('Pass purchase failed')
+        return jsonify(error='Pass purchase failed'), 500
 
 
 @pass_blueprint.route('/vendor/<int:vendor_id>/passes/available', methods=['GET'])
