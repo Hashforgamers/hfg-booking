@@ -65,6 +65,9 @@ def session_amount(base, slots, offers, start, minutes):
     day = start.date() - timedelta(days=1)
     while day <= end.date():
         for slot in slots:
+            scheduled_day = getattr(slot, 'date', None)
+            if scheduled_day is not None and scheduled_day != day:
+                continue
             left,right = slot_window(day,slot.start_time,slot.end_time)
             if left < end and start < right:
                 windows.append((left,right,slot))
