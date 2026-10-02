@@ -1,5 +1,6 @@
 """Atomic schedule changes for upcoming bookings; financial records stay intact."""
 from datetime import datetime, timedelta
+import json
 from sqlalchemy import text
 
 
@@ -35,7 +36,8 @@ def move_slot(session, vendor_id, booking_id, target_slot_id, target_date, now):
     # Slot units follow the original reservation, including multi-PC squads.
     from controllers.booking_controller import _requires_multi_console_units
     squad = row['squad_details'] or {}
-    units = max(1, int(squad.get('player_count', 1))) if squad.get('enabled') and _requires_multi_console_units(row['game_name'], vendor_id) else 1
+    from services.slot_capacity import booking_units
+    units = booking_units(squad) if 'slot_units' in squad else (max(1, int(squad.get('player_count', 1))) if squad.get('enabled') and _requires_multi_console_units(row['game_name'], vendor_id) else 1)
     table = f'VENDOR_{vendor_id}_SLOT'
     session.execute(text(f"""SELECT slot_id FROM {table}
         WHERE vendor_id=:vendor AND ((slot_id=:old_slot AND date=:old_date)
@@ -44,7 +46,7 @@ def move_slot(session, vendor_id, booking_id, target_slot_id, target_date, now):
          'new_slot': target_slot_id, 'new_date': target_date})
     reserved = session.execute(text(f'''UPDATE {table} SET available_slot=available_slot-:units,
         is_available=(available_slot-:units > 0) WHERE slot_id=:slot AND date=:date
-        AND vendor_id=:vendor AND available_slot>=:units RETURNING slot_id'''),
+        AND vendor_id=:vendor AND is_available=true AND available_slot>=:units RETURNING slot_id'''),
         {'units': units, 'slot': target_slot_id, 'date': target_date, 'vendor': vendor_id}).first()
     if not reserved:
         raise ValueError('That slot is no longer available. Choose another slot.')
@@ -53,7 +55,9 @@ def move_slot(session, vendor_id, booking_id, target_slot_id, target_date, now):
         {'units': units, 'slot': row['slot_id'], 'date': row['booked_date'], 'vendor': vendor_id}).first()
     if not released:
         raise ValueError('Original slot availability is missing; the booking was not changed.')
-    session.execute(text('UPDATE bookings SET slot_id=:slot, updated_at=NOW() WHERE id=:id'), {'slot': target_slot_id, 'id': booking_id})
+    details = dict(squad, booked_date=target_date.isoformat(), slot_units=units)
+    session.execute(text('UPDATE bookings SET slot_id=:slot, squad_details=CAST(:details AS json), updated_at=NOW() WHERE id=:id'),
+        {'slot':target_slot_id, 'id':booking_id, 'details':json.dumps(details)})
     session.execute(text('UPDATE transactions SET booked_date=:date WHERE booking_id=:id'), {'date': target_date, 'id': booking_id})
     session.execute(text(f'''UPDATE VENDOR_{vendor_id}_DASHBOARD SET date=:date, start_time=:start,
         end_time=:end WHERE book_id=:id AND book_status='upcoming' '''),

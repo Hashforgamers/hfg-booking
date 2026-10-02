@@ -20,8 +20,8 @@
     "semantic_hash": ""
   },
   "controllers/booking_controller.py": {
-    "mtime": 1790796756.2972198,
-    "ast_hash": "4d41e8a2bf9d85f017ac3da113f67bb0",
+    "mtime": 1790942894.6316762,
+    "ast_hash": "5ca91fa0af3252c62db2a6109bb2a22b",
     "semantic_hash": ""
   },
   "controllers/game_controller.py": {
@@ -230,8 +230,8 @@
     "semantic_hash": "eb811607ca75f69c32af92d3f710876a"
   },
   "services/booking_service.py": {
-    "mtime": 1790755119.4687185,
-    "ast_hash": "8d721594c35602589ba92782e11d5a6e",
+    "mtime": 1790942894.6278727,
+    "ast_hash": "3edcc251774bacd50b72b18743ff9231",
     "semantic_hash": ""
   },
   "services/config_load.py": {
@@ -465,8 +465,8 @@
     "semantic_hash": ""
   },
   "services/upcoming_slots.py": {
-    "mtime": 1790622587.6938539,
-    "ast_hash": "91219a70886dabd3fcd5f159fc369a6a",
+    "mtime": 1790942592.5654416,
+    "ast_hash": "5d5882e4a4f544a2cbf7844931198e9c",
     "semantic_hash": ""
   },
   "tests/test_upcoming_slots.py": {
@@ -517,6 +517,11 @@
   "docs/six-method-payments.md": {
     "mtime": 1790755235.9614594,
     "ast_hash": "6dfd023c403042f25836bac9fe197eff",
+    "semantic_hash": ""
+  },
+  "services/slot_capacity.py": {
+    "mtime": 1790941397.0732005,
+    "ast_hash": "9e1a13582525d928620a73c5e6d6563d",
     "semantic_hash": ""
   }
 }

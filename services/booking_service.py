@@ -170,6 +170,7 @@ class BookingService:
         squad_details: Optional[dict] = None,
         slot_units: int = 1,
         emit_events: bool = True,
+        commit: bool = True,
     ):
         """
         Create a booking with specified mode.
@@ -201,9 +202,9 @@ class BookingService:
                     SELECT ag.vendor_id, ag.single_slot_price, ag.game_name
                     FROM available_games ag
                     JOIN slots s ON s.gaming_type_id = ag.id
-                    WHERE s.id = :slot_id
+                    WHERE s.id = :slot_id AND ag.id = :game_id
                 """),
-                {"slot_id": slot_id}
+                {"slot_id": slot_id, "game_id": game_id}
             ).fetchone()
             log.info("create_booking.meta_loaded cid=%s has_ag_row=%s", cid, bool(ag_row))
         except Exception as e:
@@ -280,26 +281,21 @@ class BookingService:
 
         # STEP 3: Atomic decrement on vendor slot row
         try:
-            update_res = db.session.execute(
-                text(f"""
-                    UPDATE VENDOR_{vendor_id}_SLOT
-                    SET available_slot = available_slot - :slot_units,
-                        is_available = CASE WHEN available_slot - :slot_units = 0 THEN FALSE ELSE is_available END
-                    WHERE slot_id = :slot_id AND date = :book_date AND available_slot >= :slot_units
-                    RETURNING available_slot
-                """),
-                {"slot_id": slot_id, "book_date": book_date, "slot_units": slot_units}
-            ).fetchone()
+            from services.slot_capacity import reserve_slot
+            remaining = reserve_slot(db.session, vendor_id, slot_id, book_date, slot_units)
+            update_res = (remaining,)
             log.info("create_booking.vendor_slot_decrement cid=%s success=%s new_available_slot=%s",
                      cid, bool(update_res), (update_res[0] if update_res else None))
         except Exception as e:
             log.exception("create_booking.vendor_slot_decrement_failed cid=%s vendor_id=%s slot_id=%s error=%s",
                           cid, vendor_id, slot_id, e)
-            db.session.rollback()
+            if commit:
+                db.session.rollback()
             raise
 
         if not update_res:
-            db.session.rollback()
+            if commit:
+                db.session.rollback()
             log.warning("create_booking.concurrent_conflict cid=%s vendor_id=%s slot_id=%s date=%s",
                         cid, vendor_id, slot_id, date_value)
             raise ValueError("Concurrent booking conflict. Please retry.")
@@ -310,6 +306,9 @@ class BookingService:
             stored_squad_details = dict(squad_details)
         elif squad_details:
             stored_squad_details = {"raw": squad_details}
+
+        stored_squad_details = stored_squad_details or {}
+        stored_squad_details['slot_units'] = slot_units
 
         # Persist the reserved date for every payment method. Confirmation must not change it.
         booked_date_value = None
@@ -343,14 +342,15 @@ class BookingService:
                 cid, bid, booking_mode, booking.status
             )
         except Exception as e:
-            db.session.rollback()
+            if commit:
+                db.session.rollback()
             log.exception("create_booking.booking_persist_failed cid=%s vendor_id=%s slot_id=%s error=%s",
                           cid, vendor_id, slot_id, e)
             raise
 
         # Dashboard creation sends only the final confirmed event after saving.
-        if not emit_events:
-            db.session.commit()
+        if not commit:
+            # Desk caller commits capacity, transaction and assignment together.
             return booking
 
         # STEP 5: Resolve username (non-fatal)
@@ -371,9 +371,13 @@ class BookingService:
             db.session.commit()
             log.info("create_booking.db_committed cid=%s bid=%s mode=%s", cid, bid, booking_mode)
         except Exception as e:
-            db.session.rollback()
+            if commit:
+                db.session.rollback()
             log.exception("create_booking.db_commit_failed cid=%s bid=%s error=%s", cid, bid, e)
             raise
+
+        if not emit_events:
+            return booking
 
         # STEP 7: Emit event (non-fatal) with booking_mode
         try:
@@ -455,12 +459,9 @@ class BookingService:
 
                 if booking and booking.status == "pending_verified":
                     squad_details = booking.squad_details if isinstance(booking.squad_details, dict) else {}
-                    slot_units = (
-                        max(1, int(squad_details.get("player_count") or squad_details.get("playerCount") or 1))
-                        if str(squad_details.get("console_group") or "").strip().lower() == "pc"
-                        and bool(squad_details.get("enabled") or int(squad_details.get("player_count") or squad_details.get("playerCount") or 1) > 1)
-                        else 1
-                    )
+                    from services.slot_capacity import booking_units
+                    slot_units = booking_units(squad_details)
+                    release_date = squad_details.get('booked_date') or book_date
                     # ✅ Get vendor_id from available_games
                     available_game = db.session.execute(
                         text("SELECT vendor_id FROM available_games WHERE id = (SELECT gaming_type_id FROM slots WHERE id = :slot_id)"),
@@ -480,7 +481,7 @@ class BookingService:
                         WHERE slot_id = :slot_id
                         AND date = :book_date;
                     """)
-                    updated = db.session.execute(update_query, {"slot_id": slot_id, "book_date": book_date, "slot_units": slot_units})
+                    updated = db.session.execute(update_query, {"slot_id": slot_id, "book_date": release_date, "slot_units": slot_units})
                     if updated.rowcount != 1:
                         raise ValueError("Expected one vendor slot row for release")
                     booking.status = 'verification_failed'
@@ -564,7 +565,7 @@ class BookingService:
         """), promo_rows)
 
     @staticmethod
-    def insert_into_vendor_dashboard_table(trans_id, console_id, status=None):
+    def insert_into_vendor_dashboard_table(trans_id, console_id, status=None, commit=True):
         """Inserts booking and transaction details into the vendor dashboard table."""
 
         # Fetch required objects
@@ -607,11 +608,14 @@ class BookingService:
             "book_status": book_status
         })
 
-        db.session.commit()
+        if commit:
+            db.session.commit()
+        else:
+            db.session.flush()
         current_app.logger.info(f"Inserted transaction {trans_id} into {table_name}")
 
     @staticmethod
-    def insert_into_vendor_promo_table(trans_id, console_id):
+    def insert_into_vendor_promo_table(trans_id, console_id, commit=True):
         """Inserts promo details into the vendor-specific promo table."""
 
         # Fetch transaction, booking
@@ -652,7 +656,10 @@ class BookingService:
             "actual_price": actual_price
         })
 
-        db.session.commit()
+        if commit:
+            db.session.commit()
+        else:
+            db.session.flush()
         current_app.logger.info(f"Inserted promo detail for transaction {trans_id} into {table_name}")
 
     @staticmethod
