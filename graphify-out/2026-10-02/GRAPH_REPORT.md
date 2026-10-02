@@ -1,47 +1,47 @@
-# Graph Report - hfg-booking  (2026-09-28)
+# Graph Report - hfg-booking  (2026-10-02)
 
 ## Corpus Check
-- 92 files · ~58,557 words
+- 101 files · ~62,150 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 699 nodes · 1609 edges · 54 communities (46 shown, 8 thin omitted)
-- Extraction: 98% EXTRACTED · 2% INFERRED · 0% AMBIGUOUS · INFERRED: 28 edges (avg confidence: 0.53)
+- 757 nodes · 1808 edges · 63 communities (55 shown, 8 thin omitted)
+- Extraction: 96% EXTRACTED · 4% INFERRED · 0% AMBIGUOUS · INFERRED: 71 edges (avg confidence: 0.65)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `844f263c`
+- Built from commit: `436b4217`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
 ## Community Hubs (Navigation)
-- cancel_bookings_with_refund
+- ValueError
 - booking_controller.py
 - game_controller.py
-- realtime.py
+- kiosk_book_next_slot
 - extensions.py
 - HFG Booking Service
 - mail_service.py
 - slot_controller.py
 - route
 - Flask
-- date
+- _coerce_date_value
 - gaming_type_controller.py
 - BookingBatchWritesTests
 - pass_controller.py
-- extra_booking
+- date
 - DeferredBookingRealtime
 - ReleaseTests
-- get_user_details
 - new_booking
+- confirm_booking
 - PassService
-- kiosk_book_next_slot
+- test_payment_integrity.py
 - pay_at_cafe_email_action
-- route
+- Slot
 - App Booking Cancellation API
 - ConsolePricingOffer
 - test_slot_cache.py
-- .redeem_pass_hours
+- Booking
 - accept_pay_at_cafe_booking
 - trigger_once
 - main_loop
@@ -52,123 +52,130 @@
 - 20260817_booking_gateway_payment_reconciliation.sql
 - extra_service_menus
 - transactions
-- release_slot_controller
+- API Endpoints
 - UpcomingSlotTests
-- auth_required_self
-- UserPass
+- search_booked_customers
+- Transaction
+- Cafe payment methods: app handoff and rollout
+- Mobile checkout: cafe context required
+- Game Controller
+- _ensure_menu_stock_available
+- Voucher
+- Client changes
+- Slot Controller
 
 ## God Nodes (most connected - your core abstractions)
-1. `new_booking()` - 51 edges
-2. `confirm_booking()` - 35 edges
-3. `BookingService` - 31 edges
-4. `accept_pay_at_cafe_booking()` - 21 edges
-5. `Transaction` - 20 edges
-6. `auth_required_self()` - 19 edges
-7. `extra_booking()` - 18 edges
-8. `Slot` - 18 edges
-9. `kiosk_book_next_slot()` - 17 edges
-10. `add_meals_to_booking()` - 16 edges
+1. `new_booking()` - 59 edges
+2. `confirm_booking()` - 36 edges
+3. `BookingService` - 33 edges
+4. `accept_pay_at_cafe_booking()` - 22 edges
+5. `Transaction` - 21 edges
+6. `auth_required_self()` - 21 edges
+7. `require_vendor_permission()` - 21 edges
+8. `extra_booking()` - 20 edges
+9. `Slot` - 19 edges
+10. `Booking` - 18 edges
 
 ## Surprising Connections (you probably didn't know these)
-- `BookingService` --uses--> `CafePass`  [INFERRED]
-  services/booking_service.py → models/passModels.py
-- `BookingService` --uses--> `UserPass`  [INFERRED]
-  services/booking_service.py → models/passModels.py
-- `PassService` --uses--> `UserPass`  [INFERRED]
-  services/pass_service.py → models/passModels.py
-- `BookingService` --uses--> `Slot`  [INFERRED]
-  services/booking_service.py → models/slot.py
-- `PassService` --uses--> `Slot`  [INFERRED]
-  services/pass_service.py → models/slot.py
+- `BookingService` --uses--> `AvailableGame`  [INFERRED]
+  services/booking_service.py → models/availableGame.py
+- `BookingService` --uses--> `Booking`  [INFERRED]
+  services/booking_service.py → models/booking.py
+- `PassService` --uses--> `Booking`  [INFERRED]
+  services/pass_service.py → models/booking.py
+- `env()` --calls--> `Booking`  [INFERRED]
+  tests/test_payment_integrity.py → models/booking.py
+- `BookingService` --uses--> `BookingExtraService`  [INFERRED]
+  services/booking_service.py → models/bookingExtraService.py
 
 ## Import Cycles
 - None detected.
 
-## Communities (54 total, 8 thin omitted)
+## Communities (63 total, 8 thin omitted)
 
-### Community 0 - "cancel_bookings_with_refund"
-Cohesion: 0.17
-Nodes (16): _append_cancellation_note(), _booking_slot_start_datetime_ist(), cancel_booking(), cancel_bookings_app_route(), cancel_bookings_route(), cancel_bookings_with_refund(), _credit_wallet_for_cancellation(), _default_repayment_type() (+8 more)
+### Community 0 - "ValueError"
+Cohesion: 0.09
+Nodes (31): _append_cancellation_note(), _booking_slot_start_datetime_ist(), cancel_booking(), cancel_bookings_app_route(), cancel_bookings_route(), cancel_bookings_with_refund(), _default_repayment_type(), generate_payment_link() (+23 more)
 
 ### Community 1 - "booking_controller.py"
-Cohesion: 0.12
-Nodes (17): calculate_slot_minutes(), credit_unused_slots_to_wallet(), _ensure_vendor_pay_at_cafe_settings_table(), get_pay_at_cafe_settings(), _get_vendor_pay_at_cafe_settings(), Credit unused booked slots to user's time wallet. Body: { "user_id": 1,…, _save_vendor_pay_at_cafe_settings(), update_pay_at_cafe_settings() (+9 more)
+Cohesion: 0.08
+Nodes (29): calculate_slot_minutes(), credit_unused_slots_to_wallet(), _ensure_vendor_booking_field_preferences_table(), _ensure_vendor_pay_at_cafe_settings_table(), get_pay_at_cafe_settings(), _get_vendor_pay_at_cafe_settings(), _load_vendor_booking_field_config(), _log_pricing_event() (+21 more)
 
 ### Community 2 - "game_controller.py"
 Cohesion: 0.13
 Nodes (30): cancel_booking(), create_booking(), create_or_update_console_type_override(), deactivate_console_type_override(), _games_cache_get(), _games_cache_set(), get_all_console_by_vendor_id(), get_all_games() (+22 more)
 
-### Community 3 - "realtime.py"
-Cohesion: 0.20
-Nodes (18): BlockLike, direct_booking(), TimeLike, _as_date_str(), _as_mapping(), build_booking_event_payload(), _canonical_payload(), _coalesce() (+10 more)
+### Community 3 - "kiosk_book_next_slot"
+Cohesion: 0.13
+Nodes (29): BlockLike, _coerce_int_value(), direct_booking(), _ist_now_naive(), kiosk_book_next_slot(), kiosk_check_next_slot(), datetime, Books the immediate next slot for kiosk continuation. - Charges are recorded as… (+21 more)
 
 ### Community 4 - "extensions.py"
-Cohesion: 0.05
-Nodes (28): Reject a direct booking and handle slot release & repayment., redeem_voucher(), reject_booking(), configure_socketio(), Configures SocketIO with the Flask app., AccessBookingCode, AvailableGame, Booking (+20 more)
+Cohesion: 0.09
+Nodes (13): _credit_wallet_for_cancellation(), configure_socketio(), Configures SocketIO with the Flask app., ExtraServiceMenu, ExtraServiceMenuImage, HashCoinTransaction, HashWallet, HashWalletTransaction (+5 more)
 
 ### Community 5 - "HFG Booking Service"
-Cohesion: 0.05
-Nodes (40): Client changes, Different errors need different UI handling, Mobile checkout: cafe context required, POST /api/capture_payment, POST /api/create_order, POST /api/generate_payment_link (if used), Validation completed, Why the payment screen fails (+32 more)
+Cohesion: 0.17
+Nodes (12): Booking (`models/booking.py`), BookingService (`services/booking_service.py`), Core Services, HFG Booking Service, Key Features, Models, Overview, Setup (+4 more)
 
 ### Community 6 - "mail_service.py"
 Cohesion: 0.20
 Nodes (15): HTMLParser, build_hfg_email_html(), email_text(), _EmailText, _extract_body(), Generate a useful plain-text alternative, retaining links and table values., booking_mail(), extra_booking_time_mail() (+7 more)
 
 ### Community 7 - "slot_controller.py"
-Cohesion: 0.08
-Nodes (27): _ensure_slots_for_date(), _expected_blocks_for_date(), _force_slot_refresh(), _generate_blocks(), get_next_six_slot_for_game(), get_slots(), get_slots_batch(), get_slots_on_game_id() (+19 more)
+Cohesion: 0.13
+Nodes (23): _ensure_slots_for_date(), _expected_blocks_for_date(), _force_slot_refresh(), _generate_blocks(), get_next_six_slot_for_game(), get_slots(), get_slots_batch(), get_slots_on_game_id() (+15 more)
 
 ### Community 8 - "route"
-Cohesion: 0.10
-Nodes (23): capture_payment(), create_order(), create_render_one_off_job(), generate_payment_link(), get_all_booking(), get_booking_details(), get_console_status(), get_time_wallet() (+15 more)
+Cohesion: 0.11
+Nodes (18): capture_payment(), create_render_one_off_job(), get_all_booking(), get_booking_details(), get_console_status(), get_time_wallet(), get_vendor_booking_stats(), get_vendor_bookings() (+10 more)
 
 ### Community 9 - "Flask"
-Cohesion: 0.10
-Nodes (22): Config, create_app(), _is_insecure_secret(), _validate_production_config(), cafe_checkout_token(), digest(), issue_token(), Short-lived gamer checkout identity, using existing Hash auth or email OTP. (+14 more)
+Cohesion: 0.14
+Nodes (16): Config, create_app(), _is_insecure_secret(), _validate_production_config(), create_order(), Register WebSocket events with the given SocketIO instance. Provides vendor-…, register_socketio_events(), Flask (+8 more)
 
-### Community 10 - "date"
-Cohesion: 0.16
-Nodes (17): _coerce_date_value(), _ensure_pay_at_cafe_action_logs_table(), _fetch_pay_at_cafe_queue_id_sets(), get_pay_at_cafe_queue_list(), get_pay_at_cafe_queue_summary(), get_pending_pay_at_cafe_bookings(), get_slot_bookings(), get_user_bookings() (+9 more)
+### Community 10 - "_coerce_date_value"
+Cohesion: 0.17
+Nodes (14): _coerce_date_value(), _ensure_pay_at_cafe_action_logs_table(), _fetch_pay_at_cafe_queue_id_sets(), get_pay_at_cafe_queue_list(), get_pay_at_cafe_queue_summary(), get_pending_pay_at_cafe_bookings(), get_slot_bookings(), get_user_bookings() (+6 more)
 
 ### Community 11 - "gaming_type_controller.py"
 Cohesion: 0.23
 Nodes (8): create_gaming_type(), delete_gaming_type(), get_gaming_types(), route, GamingTypeService, Create a new gaming type. :param data: Dictionary containing 'name', Delete an existing gaming type. :param gaming_type_id: ID of the gaming type to…, Fetch all available gaming types.
 
 ### Community 13 - "pass_controller.py"
-Cohesion: 0.22
-Nodes (15): _cleanup_pass_otp_cache(), _consume_pass_verification_token(), _find_live_otp_session(), get_available_passes_for_purchase(), _hash_otp(), _mask_email(), _otp_secret(), _passes_cache_get() (+7 more)
+Cohesion: 0.06
+Nodes (52): cafe_checkout_token(), digest(), issue_token(), Short-lived gamer checkout identity, using existing Hash auth or email OTP., request_login(), verify_login(), cancel_redemption(), _cleanup_pass_otp_cache() (+44 more)
 
-### Community 14 - "extra_booking"
-Cohesion: 0.15
-Nodes (19): add_meals_to_booking(), booking_payment_summary(), calculate_gst_breakdown(), compute_booking_financial_summary(), extra_booking(), normalize_payment_use_case(), Settle monthly credit outstanding at month-end. Body: { "user_id": 1, "amount":…, Records extra booking (time extended) played by the user in a gaming cafe, with… (+11 more)
+### Community 14 - "date"
+Cohesion: 0.13
+Nodes (23): add_meals_to_booking(), booking_payment_summary(), calculate_gst_breakdown(), compute_booking_financial_summary(), compute_credit_due_date(), extra_booking(), _is_slot_live_now_ist(), normalize_payment_use_case() (+15 more)
 
 ### Community 15 - "DeferredBookingRealtime"
 Cohesion: 0.18
 Nodes (6): patch, DeferredBookingRealtime, Keep best-effort realtime delivery outside committed booking responses., BookingMailTests, Test the production background mail helper without booting network services., BookingRealtimeTests
 
-### Community 17 - "get_user_details"
-Cohesion: 0.10
-Nodes (17): _build_squad_member_bindings(), _collect_vendor_user_ids(), _ensure_vendor_booking_field_preferences_table(), get_user_details(), _load_vendor_booking_field_config(), _normalize_vendor_booking_field_config(), _resolve_or_create_squad_member_user(), _save_vendor_booking_field_config() (+9 more)
+### Community 17 - "new_booking"
+Cohesion: 0.11
+Nodes (19): _build_squad_member_bindings(), _collect_vendor_user_ids(), _ensure_vendor_slot_rows_for_date(), get_user_details(), new_booking(), _normalize_slot_ids(), _precheck_slot_booking_eligibility(), Self-heal missing VENDOR_<id>_SLOT rows for selected date/slots so direct… (+11 more)
 
-### Community 18 - "new_booking"
-Cohesion: 0.08
-Nodes (51): booking_pricing_estimate(), booking_pricing_preview(), _build_vendor_platform_rules(), calculate_extra_controller_fare(), _compute_pay_at_cafe_pricing(), confirm_booking(), _consume_menu_stock(), create_booking() (+43 more)
+### Community 18 - "confirm_booking"
+Cohesion: 0.15
+Nodes (33): booking_pricing_estimate(), booking_pricing_preview(), _build_vendor_platform_rules(), calculate_extra_controller_fare(), _compute_pay_at_cafe_pricing(), confirm_booking(), create_booking(), _default_squad_policy_for_max_players() (+25 more)
 
 ### Community 19 - "PassService"
-Cohesion: 0.17
-Nodes (7): Decimal, CafePass, PassRedemptionLog, PassType, Validate pass configuration, PassService, Calculate hours for a slot based on pass configuration. Args: slot_id: Slot ID…
+Cohesion: 0.11
+Nodes (15): Decimal, fixture, AvailableGame, CafePass, PassRedemptionLog, PassType, Vendor, PassService (+7 more)
 
-### Community 20 - "kiosk_book_next_slot"
-Cohesion: 0.17
-Nodes (17): _coerce_int_value(), compute_credit_due_date(), _ensure_vendor_slot_rows_for_date(), _ist_now_naive(), kiosk_book_next_slot(), kiosk_check_next_slot(), _precheck_slot_booking_eligibility(), datetime (+9 more)
+### Community 20 - "test_payment_integrity.py"
+Cohesion: 0.20
+Nodes (13): parametrize, body(), Payment invariants against real ORM code in isolated PostgreSQL schemas.…, test_disabled_cafe_pass_purchase_does_not_debit(), test_failed_booking_rolls_back_pass_and_verification_consumption(), test_gateway_owner_pass_binding_and_cross_checkout_replay(), test_gateway_requires_exact_captured_inr_payment(), test_gateway_success_and_replay() (+5 more)
 
 ### Community 21 - "pay_at_cafe_email_action"
 Cohesion: 0.24
-Nodes (10): _build_pay_at_cafe_email_action_url(), _decode_pay_at_cafe_email_action_token(), _pay_at_cafe_action_serializer(), pay_at_cafe_email_action(), One-click email action endpoint for vendor to accept/reject pay-at-cafe…, _render_pay_at_cafe_email_action_page(), _resolve_booking_public_base_url(), _resolve_dashboard_public_url() (+2 more)
+Nodes (11): _build_pay_at_cafe_email_action_url(), _decode_pay_at_cafe_email_action_token(), _pay_at_cafe_action_serializer(), pay_at_cafe_email_action(), One-click email action endpoint for vendor to accept/reject pay-at-cafe…, _render_pay_at_cafe_email_action_page(), _resolve_booking_public_base_url(), _resolve_dashboard_public_url() (+3 more)
 
-### Community 22 - "route"
-Cohesion: 0.17
-Nodes (12): cancel_redemption(), get_dashboard_user_valid_passes(), get_pass_history(), get_user_active_passes(), route, Validate pass UID and return pass details. Used by dashboard before redemption., Dashboard helper: Return valid hour-based passes for a selected user at a…, Get all active passes for authenticated user. (+4 more)
+### Community 22 - "Slot"
+Cohesion: 0.19
+Nodes (4): Return a dictionary representation of the Slot object., Return a dictionary representation of the Slot object., Slot, SlotService
 
 ### Community 23 - "App Booking Cancellation API"
 Cohesion: 0.20
@@ -182,13 +189,13 @@ Nodes (5): ConsolePricingOffer, Time-based promotional pricing for console types
 Cohesion: 0.47
 Nodes (3): load(), Exercise actual slot readers with a warm cache and mocked database boundary., SlotCacheTests
 
-### Community 26 - ".redeem_pass_hours"
-Cohesion: 0.20
-Nodes (9): Redeem pass from dashboard (vendor scans pass). Staff ID removed - vendor scans…, Redeem pass during app booking flow. Called during booking confirmation., redeem_pass_app(), redeem_pass_dashboard(), date, Deduct hours from pass and create redemption log. Args: user_pass_id: UserPass…, Cancel a redemption and restore hours to pass. Args: redemption_id:…, Get valid hour-based pass for user. Priority: 1. If pass_uid provided, validate… (+1 more)
+### Community 26 - "Booking"
+Cohesion: 0.25
+Nodes (4): AccessBookingCode, Booking, Updated to include private booking fields, BookingSquadMember
 
 ### Community 28 - "accept_pay_at_cafe_booking"
-Cohesion: 0.15
-Nodes (15): accept_pay_at_cafe_booking(), _invalidate_pay_at_cafe_vendor_cache(), _json_text_equals(), _log_pay_at_cafe_action(), _parse_json_details(), Dialect-safe JSON text comparison (SQLAlchemy 2.0 removed .astext)., Resolve pay-at-cafe squad bookings by batch_id with a safe fallback that avoids…, Accept a pay-at-cafe booking and change status to confirmed (+7 more)
+Cohesion: 0.10
+Nodes (20): accept_pay_at_cafe_booking(), _invalidate_pay_at_cafe_vendor_cache(), _json_text_equals(), _log_pay_at_cafe_action(), now_utc(), _parse_json_details(), Dialect-safe JSON text comparison (SQLAlchemy 2.0 removed .astext)., Resolve pay-at-cafe squad bookings by batch_id with a safe fallback that avoids… (+12 more)
 
 ### Community 29 - "trigger_once"
 Cohesion: 0.53
@@ -202,24 +209,52 @@ Nodes (4): main_loop(), Find unverified bookings older than 2 minutes from trans
 Cohesion: 0.67
 Nodes (3): console_catalog, vendors, vendor_console_overrides
 
-### Community 49 - "release_slot_controller"
-Cohesion: 0.29
-Nodes (6): now_utc(), Releases bookings stuck in 'pending_verified' that are older than 2 minutes.…, release_slot(), release_slot_controller(), to_utc(), Release an unverified booking once, atomically with its capacity.
+### Community 49 - "API Endpoints"
+Cohesion: 0.22
+Nodes (9): API Endpoints, Booking Controller, DELETE /gaming-types/<int:gaming_type_id>, Gaming Type Controller, GET /bookings/<booking_id>, GET /gaming-types, POST /bookings, POST /create_order (+1 more)
 
 ### Community 51 - "UpcomingSlotTests"
-Cohesion: 0.27
-Nodes (3): move_slot(), Atomic schedule changes for upcoming bookings; financial records stay intact., UpcomingSlotTests
+Cohesion: 0.24
+Nodes (4): manage_upcoming_slot(), move_slot(), Atomic schedule changes for upcoming bookings; financial records stay intact., UpcomingSlotTests
 
-### Community 52 - "auth_required_self"
-Cohesion: 0.20
-Nodes (9): create_hour_pass(), Create hour-based pass after purchase (called after payment confirmation)., auth_required(), auth_required_self(), decode_user(), encode_user(), Encode a user ID using RSA public key PEM string. Returns a base64-encoded…, Decode the encrypted user ID using RSA private key PEM string. (+1 more)
+### Community 52 - "search_booked_customers"
+Cohesion: 0.33
+Nodes (3): Bounded customer lookup across a cafe's complete booking history., search_booked_customers(), CustomerSearchTests
 
-### Community 53 - "UserPass"
-Cohesion: 0.28
-Nodes (5): purchase_pass(), User purchases a pass after Razorpay payment. Creates UserPass record with…, Generate unique pass UID for hour-based passes, UserPass, Create hour-based user pass after purchase. Args: user_id: User ID…
+### Community 53 - "Transaction"
+Cohesion: 0.16
+Nodes (11): BookingGatewayPayment, One consumed Razorpay payment for one booking-confirmation batch., Generate unique pass UID for hour-based passes, UserPass, PassPurchase, Transaction, User, purchase() (+3 more)
+
+### Community 54 - "Cafe payment methods: app handoff and rollout"
+Cohesion: 0.25
+Nodes (8): Acceptance rule, Booking payment, Cafe payment methods: app handoff and rollout, Cafe wallet and the unified QR, Dashboard flow and refunds, Deploy in this order, Discover enabled methods, Pass purchase
+
+### Community 55 - "Mobile checkout: cafe context required"
+Cohesion: 0.29
+Nodes (4): Different errors need different UI handling, Mobile checkout: cafe context required, Validation completed, Why the payment screen fails
+
+### Community 56 - "Game Controller"
+Cohesion: 0.29
+Nodes (7): DELETE /bookings/<int:booking_id>, Game Controller, GET /bookings/user/<int:user_id>, GET /games, GET /games/vendor/<int:vendor_id>, GET /getAllConsole/vendor/<int:vendor_id>, POST /bookings
+
+### Community 57 - "_ensure_menu_stock_available"
+Cohesion: 0.33
+Nodes (6): _consume_menu_stock(), _ensure_menu_stock_available(), _menu_stock_qty(), _menu_stock_unit(), Returns (is_available, error_message_or_none). stock_quantity=None means…, Decrement stock in-memory; caller transaction controls commit/rollback.
+
+### Community 58 - "Voucher"
+Cohesion: 0.47
+Nodes (3): redeem_voucher(), Voucher, create_referral_voucher()
+
+### Community 59 - "Client changes"
+Cohesion: 0.50
+Nodes (4): Client changes, POST /api/capture_payment, POST /api/create_order, POST /api/generate_payment_link (if used)
+
+### Community 60 - "Slot Controller"
+Cohesion: 0.50
+Nodes (4): GET /getSlotList/vendor/<int:vendor_id>/game/<int:game_id>, GET /getSlots/vendor/<int:vendorId>/game/<int:gameId>/<string:date>, GET /slots, Slot Controller
 
 ## Knowledge Gaps
-- **39 isolated node(s):** `HashCoinTransaction`, `booking_gateway_payments`, `graphify`, `Overview`, `Key Features` (+34 more)
+- **46 isolated node(s):** `HashCoinTransaction`, `booking_gateway_payments`, `graphify`, `Overview`, `Key Features` (+41 more)
   These have ≤1 connection - possible missing edges or undocumented components.
 - **8 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
@@ -227,16 +262,16 @@ Nodes (5): purchase_pass(), User purchases a pass after Razorpay payment. Create
 _Questions this graph is uniquely positioned to answer:_
 
 - **Why does `DeferredBookingRealtime` connect `DeferredBookingRealtime` to `booking_controller.py`, `new_booking`?**
-  _High betweenness centrality (0.042) - this node is a cross-community bridge._
-- **Why does `Slot` connect `slot_controller.py` to `booking_controller.py`, `PassService`, `extensions.py`, `pass_controller.py`?**
-  _High betweenness centrality (0.037) - this node is a cross-community bridge._
-- **Why does `BookingService` connect `extensions.py` to `cancel_bookings_with_refund`, `booking_controller.py`, `game_controller.py`, `slot_controller.py`, `date`, `release_slot_controller`, `new_booking`, `PassService`, `UserPass`, `accept_pay_at_cafe_booking`?**
-  _High betweenness centrality (0.037) - this node is a cross-community bridge._
-- **Are the 13 inferred relationships involving `BookingService` (e.g. with `AvailableGame` and `Booking`) actually correct?**
-  _`BookingService` has 13 INFERRED edges - model-reasoned connections that need verification._
+  _High betweenness centrality (0.039) - this node is a cross-community bridge._
+- **Why does `Slot` connect `Slot` to `booking_controller.py`, `extensions.py`, `slot_controller.py`, `pass_controller.py`, `PassService`, `Booking`?**
+  _High betweenness centrality (0.035) - this node is a cross-community bridge._
+- **Why does `BookingService` connect `extensions.py` to `ValueError`, `booking_controller.py`, `game_controller.py`, `_coerce_date_value`, `date`, `PassService`, `Transaction`, `Slot`, `Booking`, `accept_pay_at_cafe_booking`?**
+  _High betweenness centrality (0.034) - this node is a cross-community bridge._
+- **Are the 14 inferred relationships involving `BookingService` (e.g. with `AvailableGame` and `Booking`) actually correct?**
+  _`BookingService` has 14 INFERRED edges - model-reasoned connections that need verification._
+- **Are the 26 inferred relationships involving `ValueError` (e.g. with `calculate_extra_controller_fare()` and `cancel_bookings_with_refund()`) actually correct?**
+  _`ValueError` has 26 INFERRED edges - model-reasoned connections that need verification._
 - **What connects `HashCoinTransaction`, `booking_gateway_payments`, `graphify` to the rest of the system?**
-  _39 weakly-connected nodes found - possible documentation gaps or missing edges._
-- **Should `booking_controller.py` be split into smaller, more focused modules?**
-  _Cohesion score 0.11965811965811966 - nodes in this community are weakly interconnected._
-- **Should `game_controller.py` be split into smaller, more focused modules?**
-  _Cohesion score 0.13205128205128205 - nodes in this community are weakly interconnected._
+  _46 weakly-connected nodes found - possible documentation gaps or missing edges._
+- **Should `ValueError` be split into smaller, more focused modules?**
+  _Cohesion score 0.08571428571428572 - nodes in this community are weakly interconnected._

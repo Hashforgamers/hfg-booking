@@ -10,8 +10,8 @@
     "semantic_hash": "351d675c2d2d596c22fe08382267a888"
   },
   "app/__init__.py": {
-    "mtime": 1790023546.12412,
-    "ast_hash": "3b80b536bf679d354c7f5cb46dee7c27",
+    "mtime": 1790707597.0545142,
+    "ast_hash": "da04e0f4a8fb0cd549db583cebcb48c8",
     "semantic_hash": ""
   },
   "app/config.py": {
@@ -20,8 +20,8 @@
     "semantic_hash": ""
   },
   "controllers/booking_controller.py": {
-    "mtime": 1790598032.7199094,
-    "ast_hash": "15e88dbdcc67165b83d78401b571b308",
+    "mtime": 1790796756.2972198,
+    "ast_hash": "4d41e8a2bf9d85f017ac3da113f67bb0",
     "semantic_hash": ""
   },
   "controllers/game_controller.py": {
@@ -35,8 +35,8 @@
     "semantic_hash": "5d93d7bc08bbcbc224cec47d85c9910b"
   },
   "controllers/pass_controller.py": {
-    "mtime": 1789754793.9455197,
-    "ast_hash": "fff2ea6a1a63f82fd5ce9064ad1fbb85",
+    "mtime": 1790755186.6763656,
+    "ast_hash": "cbe2c138f750a19db93bbf5205616fe0",
     "semantic_hash": ""
   },
   "controllers/slot_controller.py": {
@@ -105,9 +105,9 @@
     "semantic_hash": "0b7b4628945a16efe64c6e01b130cdb8"
   },
   "models/consolePricingOffer.py": {
-    "mtime": 1772306934.2595036,
-    "ast_hash": "d9ef4d6033abe5b52de5ea943f134989",
-    "semantic_hash": "d9ef4d6033abe5b52de5ea943f134989"
+    "mtime": 1790777508.2614157,
+    "ast_hash": "f5ff870dd7bc9ab056a3ddfc7e43f9a7",
+    "semantic_hash": ""
   },
   "models/contactInfo.py": {
     "mtime": 1756653476.7008483,
@@ -165,9 +165,9 @@
     "semantic_hash": "1835b05811c6117318d90ce02daa1d78"
   },
   "models/passModels.py": {
-    "mtime": 1768634234.4151745,
-    "ast_hash": "72e04138e1c50ac26c2c1b0705bacb45",
-    "semantic_hash": "72e04138e1c50ac26c2c1b0705bacb45"
+    "mtime": 1790752813.4881203,
+    "ast_hash": "d72a671865c32cbbe9698d5e752b2c7b",
+    "semantic_hash": ""
   },
   "models/paymentTransactionMapping.py": {
     "mtime": 1756653476.7040484,
@@ -230,8 +230,8 @@
     "semantic_hash": "eb811607ca75f69c32af92d3f710876a"
   },
   "services/booking_service.py": {
-    "mtime": 1790596959.410356,
-    "ast_hash": "cf02d5914688e778630b7f45bd9b174b",
+    "mtime": 1790755119.4687185,
+    "ast_hash": "8d721594c35602589ba92782e11d5a6e",
     "semantic_hash": ""
   },
   "services/config_load.py": {
@@ -260,9 +260,9 @@
     "semantic_hash": ""
   },
   "services/pass_service.py": {
-    "mtime": 1768634234.4160779,
-    "ast_hash": "98d4e188b103015285f76a653db72126",
-    "semantic_hash": "98d4e188b103015285f76a653db72126"
+    "mtime": 1790707743.903131,
+    "ast_hash": "6fb56b15a81398408f9500a9debacb35",
+    "semantic_hash": ""
   },
   "services/redis_service.py": {
     "mtime": 1738101310.6383827,
@@ -360,8 +360,8 @@
     "semantic_hash": ""
   },
   "services/vendor_access.py": {
-    "mtime": 1788969254.0351467,
-    "ast_hash": "523ecdceaa6bb213cc38e90279618a92",
+    "mtime": 1790753255.8973937,
+    "ast_hash": "ec7ca3966f7a86977f060a0519ab8a17",
     "semantic_hash": ""
   },
   "sql/20260817_booking_gateway_payment_reconciliation.sql": {
@@ -415,8 +415,8 @@
     "semantic_hash": ""
   },
   "services/cafe_payment_policy.py": {
-    "mtime": 1790067473.4302273,
-    "ast_hash": "a6311db417f4ab2abec4a2f518e21429",
+    "mtime": 1790752813.4814672,
+    "ast_hash": "dc992b8c0e45112fdac3eb13392a761c",
     "semantic_hash": ""
   },
   "sql/20260922_cafe_login.sql": {
@@ -435,8 +435,8 @@
     "semantic_hash": ""
   },
   "docs/mobile-payment-cafe-context.md": {
-    "mtime": 1790278492.4553869,
-    "ast_hash": "1771983ee88790d64cebf87fe28e7516",
+    "mtime": 1790754975.0393114,
+    "ast_hash": "12d7a6ed07be6130fcf89177692469cc",
     "semantic_hash": ""
   },
   "services/customer_search.py": {
@@ -472,6 +472,51 @@
   "tests/test_upcoming_slots.py": {
     "mtime": 1790622587.6942048,
     "ast_hash": "894dff7ee44beff44485f6b9a91dd297",
+    "semantic_hash": ""
+  },
+  "models/passPurchase.py": {
+    "mtime": 1790707596.9935052,
+    "ast_hash": "20fda85f249b35395e39aa3d1dff96f4",
+    "semantic_hash": ""
+  },
+  "services/pass_otp_store.py": {
+    "mtime": 1790754886.110367,
+    "ast_hash": "4fd5287a2d49bc364800f9b4c7df6cea",
+    "semantic_hash": ""
+  },
+  "services/pass_purchase_service.py": {
+    "mtime": 1790754729.861454,
+    "ast_hash": "e8fe68b3055baba9f2976b7a90f92ae8",
+    "semantic_hash": ""
+  },
+  "services/payment_methods.py": {
+    "mtime": 1790707698.3716614,
+    "ast_hash": "e761231c5a084c2da4bd9f39a4e8563f",
+    "semantic_hash": ""
+  },
+  "services/pricing_math.py": {
+    "mtime": 1790939241.0991507,
+    "ast_hash": "b7db94ebc21a313e76f6c6a4f30f4a8f",
+    "semantic_hash": ""
+  },
+  "sql/20260929_pass_purchases.sql": {
+    "mtime": 1790707596.9960754,
+    "ast_hash": "7fd7b9b26897ebeb41abe933a6e3d9ad",
+    "semantic_hash": ""
+  },
+  "sql/20260930_pass_otp_states.sql": {
+    "mtime": 1790752973.1538725,
+    "ast_hash": "bcb200160b8018b4be40a37a615ef975",
+    "semantic_hash": ""
+  },
+  "tests/test_payment_integrity.py": {
+    "mtime": 1790754822.302952,
+    "ast_hash": "4dec6abd7c6408defc4df8c6db72920b",
+    "semantic_hash": ""
+  },
+  "docs/six-method-payments.md": {
+    "mtime": 1790755235.9614594,
+    "ast_hash": "6dfd023c403042f25836bac9fe197eff",
     "semantic_hash": ""
   }
 }
