@@ -7274,9 +7274,6 @@ def extra_booking():
         mode_of_payment = str(data["modeOfPayment"]).strip().lower()
         if mode_of_payment not in {'cash', 'card', 'upi', 'pay_at_cafe', 'monthly_credit', 'pending', 'unpaid'}:
             return jsonify(message='Unsupported desk payment method'), 400
-        from services.payment_methods import require_method
-        if mode_of_payment in {'cash', 'card', 'upi', 'pay_at_cafe'}:
-            require_method(g.vendor_id, 'pay_at_cafe')
 
         vendor_id = int(data["vendorId"])
         if vendor_id != int(g.vendor_id):
@@ -9543,7 +9540,7 @@ def booking_payment_summary(booking_id):
             return jsonify({"success": False, "message": "Booking not found"}), 404
 
         summary = compute_booking_financial_summary(booking_id)
-        return jsonify({
+        response = jsonify({
             "success": True,
             "payment_status": {
                 "label": "Extra Payment Required" if summary["amount_due"] > 0 else "Settled",
@@ -9557,7 +9554,9 @@ def booking_payment_summary(booking_id):
                 if isinstance(booking.squad_details, dict)
                 else []
             ),
-        }), 200
+        })
+        response.headers["Cache-Control"] = "private, no-store, max-age=0"
+        return response, 200
     except Exception as e:
         current_app.logger.error(f"Failed to build booking payment summary for {booking_id}: {str(e)}")
         return jsonify({"success": False, "error": str(e)}), 500
@@ -9578,9 +9577,7 @@ def settle_pending_booking_transactions(booking_id):
             return jsonify({"success": False, "message": "mode_of_payment is required"}), 400
         if mode not in {'cash', 'card', 'upi', 'pay_at_cafe', 'monthly_credit'}:
             return jsonify(success=False, message='Use cash, cafe UPI/card or monthly credit for desk settlement'), 400
-        from services.payment_methods import require_method
-        if mode != 'monthly_credit':
-            require_method(g.vendor_id, 'pay_at_cafe')
+        # Collecting accrued charges is independent of new-booking payment options.
 
 
         booking = Booking.query.filter_by(id=booking_id).first()

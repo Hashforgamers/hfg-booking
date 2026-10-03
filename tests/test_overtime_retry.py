@@ -31,3 +31,34 @@ def test_explicit_booking_retry_uses_original_day_and_does_not_write(monkeypatch
     assert status==200 and response.json['success']
     db.session.add.assert_not_called()
     db.session.execute.assert_not_called()
+
+
+def test_accrued_settlement_does_not_require_pay_at_cafe(monkeypatch):
+    source=Path('controllers/booking_controller.py')
+    node=next(n for n in ast.parse(source.read_text()).body if isinstance(n,ast.FunctionDef) and n.name=='settle_pending_booking_transactions')
+    node.decorator_list=[]
+    module=ModuleType('services.payment_methods');module.require_method=MagicMock(side_effect=ValueError('pay_at_cafe is disabled'))
+    monkeypatch.setitem(sys.modules,'services.payment_methods',module)
+    Booking=MagicMock();Booking.query.filter_by.return_value.first.return_value=None
+    scope=dict(request=request,jsonify=jsonify,Booking=Booking,db=MagicMock(),current_app=MagicMock(),g=SimpleNamespace(vendor_id=41))
+    exec(compile(ast.Module(body=[node],type_ignores=[]),str(source),'exec'),scope)
+    app=Flask(__name__)
+    for mode in ('cash','card','upi','monthly_credit'):
+        with app.test_request_context(json={'mode_of_payment':mode}):
+            response,status=scope['settle_pending_booking_transactions'](999)
+        assert status==404 and response.json['message']=='Booking not found'
+    module.require_method.assert_not_called()
+
+
+def test_payment_summary_is_not_cacheable():
+    source=Path('controllers/booking_controller.py')
+    node=next(n for n in ast.parse(source.read_text()).body if isinstance(n,ast.FunctionDef) and n.name=='booking_payment_summary')
+    node.decorator_list=[]
+    Booking=MagicMock();Booking.query.filter_by.return_value.first.return_value=SimpleNamespace(squad_details={})
+    scope=dict(Booking=Booking,jsonify=jsonify,current_app=MagicMock(),compute_booking_financial_summary=lambda _:dict(amount_due=20,amount_paid=10,total_charged=30))
+    exec(compile(ast.Module(body=[node],type_ignores=[]),str(source),'exec'),scope)
+    app=Flask(__name__)
+    with app.test_request_context():
+        response,status=scope['booking_payment_summary'](1084)
+    assert status==200 and response.json['payment_status']['amount_due']==20
+    assert 'no-store' in response.headers['Cache-Control']
