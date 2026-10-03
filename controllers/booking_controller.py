@@ -7265,7 +7265,7 @@ def extra_booking():
 
         console_number = data["consoleNumber"]
         console_type = data["consoleType"]
-        booked_date = datetime.strptime(data["date"], "%Y-%m-%d").date()
+        booked_date = None if data.get("booking_id") is not None else datetime.strptime(data["date"], "%Y-%m-%d").date()
         slot_id = int(data["slotId"])
         user_id = int(data["userId"])
         username = data["username"]
@@ -7310,14 +7310,28 @@ def extra_booking():
             return jsonify(message='Slot does not belong to this cafe and console type'), 400
         # Extra charges reuse the booking for this date, rather than a booking
         # with the same daily template from an unrelated visit.
-        primary_id = db.session.execute(text("""SELECT b.id FROM bookings b
-            WHERE b.slot_id=:slot AND b.game_id=:game AND b.user_id=:user
-              AND b.status IN ('confirmed','checked_in','completed','extra','pending_verified','pending_acceptance')
-              AND COALESCE(NULLIF(b.squad_details->>'booked_date','')::date,
-                  (SELECT MIN(t.booked_date) FROM transactions t WHERE t.booking_id=b.id))=:day
-            ORDER BY b.id DESC LIMIT 1 FOR UPDATE OF b"""),
-            {'slot':slot_id,'game':game_id,'user':user_id,'day':booked_date}).scalar()
-        primary_booking = Booking.query.filter_by(id=primary_id).populate_existing().first() if primary_id else None
+        requested_booking_id = data.get('booking_id')
+        if requested_booking_id is not None:
+            primary_booking = Booking.query.filter_by(id=int(requested_booking_id)).populate_existing().with_for_update().first()
+            if not primary_booking or (primary_booking.user_id,primary_booking.game_id,primary_booking.slot_id) != (user_id,game_id,slot_id):
+                return jsonify(message='Session booking does not match this charge'),400
+            original_day = db.session.query(func.min(Transaction.booked_date)).filter_by(booking_id=primary_booking.id,vendor_id=vendor_id).scalar()
+            if not original_day:
+                return jsonify(message='Session booking date could not be verified'),409
+            booked_date = original_day
+        else:
+            primary_id = db.session.execute(text("""SELECT b.id FROM bookings b
+                WHERE b.slot_id=:slot AND b.game_id=:game AND b.user_id=:user
+                  AND b.status IN ('confirmed','checked_in','completed','extra','pending_verified','pending_acceptance')
+                  AND COALESCE(NULLIF(b.squad_details->>'booked_date','')::date,
+                      (SELECT MIN(t.booked_date) FROM transactions t WHERE t.booking_id=b.id))=:day
+                ORDER BY b.id DESC LIMIT 1 FOR UPDATE OF b"""),
+                {'slot':slot_id,'game':game_id,'user':user_id,'day':booked_date}).scalar()
+            primary_booking = Booking.query.filter_by(id=primary_id).populate_existing().first() if primary_id else None
+        if primary_booking and reference_id:
+            existing = Transaction.query.filter_by(booking_id=primary_booking.id,vendor_id=vendor_id,reference_id=reference_id,booking_type='extra').first()
+            if existing:
+                return jsonify(success=True,message='Overtime charge already recorded'),200
         created_booking = primary_booking is None
         if created_booking:
             from services.slot_capacity import reserve_slot
