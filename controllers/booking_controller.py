@@ -1327,9 +1327,11 @@ def _release_slot_for_booking(booking, vendor_id: int, booked_date):
         )
         slot_units = max(slot_units, 1)
         from services.slot_capacity import release_slot, booking_units
-        if 'slot_units' in squad_details:
+        if 'slot_units' in squad_details or 'remaining_slot_units' in squad_details:
             slot_units = booking_units(squad_details)
         release_slot(db.session,vendor_id,booking.slot_id,booked_date,slot_units)
+        if 'remaining_slot_units' in squad_details:
+            updated=dict(squad_details);updated['remaining_slot_units']=0;booking.squad_details=updated
         return True
     except Exception as e:
         current_app.logger.warning("Slot release failed booking_id=%s vendor=%s error=%s", booking.id if booking else None, vendor_id, e)
@@ -7329,6 +7331,17 @@ def extra_booking():
             existing = Transaction.query.filter_by(booking_id=primary_booking.id,vendor_id=vendor_id,reference_id=reference_id,booking_type='extra').first()
             if existing:
                 return jsonify(success=True,message='Overtime charge already recorded'),200
+        # New kiosk runtime has one metered extension invoice. Legacy client
+        # amounts must not create a second overtime charge for that session.
+        if primary_booking and db.session.execute(text("SELECT to_regclass('kiosk_runtime_sessions')")).scalar():
+            managed = db.session.execute(text("""SELECT r.id FROM kiosk_runtime_sessions r JOIN consoles c ON c.id=r.console_id
+                WHERE r.vendor_id=:vendor AND source_kind='booking'
+                  AND (source_id=:booking OR booking_ids::jsonb @> to_jsonb(CAST(:bid AS integer)))
+                  AND (CAST(r.console_id AS text)=:console OR CAST(c.console_number AS text)=:console)
+                LIMIT 1"""), {'vendor':vendor_id,'booking':str(primary_booking.id),'bid':primary_booking.id,'console':str(console_number)}).scalar()
+            if managed:
+                return jsonify(success=False,code='managed_extension_settlement',runtime_id=managed,
+                    message='Use the server session extension settlement; this time is already metered.'),409
         created_booking = primary_booking is None
         if created_booking:
             from services.slot_capacity import reserve_slot
