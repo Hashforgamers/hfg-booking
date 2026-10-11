@@ -14,6 +14,30 @@ from services.security import auth_required_self
 cafe_checkout_blueprint = Blueprint('cafe_checkout', __name__)
 
 
+@cafe_checkout_blueprint.get('/vendor/<int:vendor_id>/payment-methods')
+def gamer_payment_methods(vendor_id):
+    """Public acceptance metadata only; payment mutations still require auth."""
+    from services.payment_methods import payment_options
+    try:
+        exists = db.session.execute(text('SELECT id FROM vendors WHERE id=:id'),
+                                    {'id': vendor_id}).scalar()
+        if exists is None:
+            response = jsonify(success=False, error='cafe_not_found')
+            response.status_code = 404
+        else:
+            options = payment_options(vendor_id)
+            response = jsonify(success=True, vendor_id=vendor_id,
+                payment_methods=options,
+                enabled_payment_methods=[item['method_name'] for item in options if item['is_enabled']])
+    except Exception:
+        db.session.rollback()
+        current_app.logger.exception('Payment method discovery failed vendor_id=%s', vendor_id)
+        response = jsonify(success=False, error='payment_methods_unavailable')
+        response.status_code = 503
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
 def issue_token(user_id):
     now = datetime.now(timezone.utc)
     token = jwt.encode({'sub': str(user_id), 'scope': 'cafe_gamer',

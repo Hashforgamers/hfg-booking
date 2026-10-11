@@ -11,6 +11,19 @@ ALIASES = {
     'pay_at_cafe': {'pay at cafe', 'pay in cafe', 'cash'},
 }
 
+DISPLAY_NAMES = {
+    'hash_wallet': 'Hash Wallet', 'cafe_wallet': 'Cafe Wallet',
+    'hash_global_pass': 'Hash Game Pass', 'cafe_specific_pass': 'Cafe Game Pass',
+    'payment_gateway': 'UPI / Card', 'pay_at_cafe': 'Pay at Cafe',
+}
+
+
+def payment_options(vendor_id):
+    """Read dashboard acceptance without caching or changing the catalog."""
+    enabled = accepted_methods(vendor_id)
+    return [{'method_name': key, 'display_name': label, 'is_enabled': key in enabled}
+            for key, label in DISPLAY_NAMES.items()]
+
 def canonical_method(value):
     clean = str(value or '').lower().strip().replace('_', ' ').replace('-', ' ')
     return next((key for key, names in ALIASES.items() if clean == key.replace('_', ' ') or clean in names), None)
