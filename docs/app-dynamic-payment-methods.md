@@ -1,3 +1,7 @@
+# Updated 13 October 2026
+
+Cafe Wallet scheduled confirmation is now implemented locally: use payment_mode: cafe_wallet on /api/bookings/confirm after deploying the updated booking backend. The QR-only limitation in the original handoff below is superseded. See artifacts/unified-session-integration-20261013.md in the Hash workspace for the full contract.
+
 # Hash app team integration prompt
 
 Implement dynamic cafe payment choices in HFG-frontend. The backend change is additive; existing payment payloads remain unchanged. Deploy hfg-booking first. Do not use staff or kiosk credentials in the app.

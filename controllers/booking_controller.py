@@ -3630,8 +3630,8 @@ def confirm_booking():
                    'pass_hour': 'hour_pass', 'pass': 'date_pass', 'cafe_pass': 'date_pass',
                    'global_pass': 'date_pass', 'hash_global_pass': 'date_pass', 'cafe_specific_pass': 'date_pass'}
         payment_mode = aliases.get(normalized_payment_mode, normalized_payment_mode)
-        if payment_mode not in {'wallet', 'payment_gateway', 'date_pass', 'hour_pass'}:
-            return jsonify(message='Unsupported confirmation method. Pay in cafe must use the acceptance flow; cafe wallet uses QR checkout.'), 400
+        if payment_mode not in {'wallet', 'cafe_wallet', 'payment_gateway', 'date_pass', 'hour_pass'}:
+            return jsonify(message='Unsupported confirmation method. Pay in cafe must use the acceptance flow.'), 400
         if use_hour_pass and use_pass:
             return jsonify(message='Select one pass type'), 400
         if use_hour_pass:
@@ -3684,6 +3684,11 @@ def confirm_booking():
             return jsonify({'message': 'booking_id contains invalid values'}), 400
         if len(booking_ids) > 20:
             return jsonify({'message': 'Cannot confirm more than 20 bookings per request'}), 400
+        if payment_mode == 'cafe_wallet':
+            # Same vendor-before-booking order as QR/extension reservations.
+            vendor_ids = db.session.query(AvailableGame.vendor_id).join(Booking,Booking.game_id==AvailableGame.id).filter(Booking.id.in_(booking_ids)).distinct().all()
+            for (vid,) in sorted(vendor_ids):
+                db.session.execute(text('SELECT pg_advisory_xact_lock(220926,:vid)'),{'vid':vid})
 
         # Setup Razorpay client
         RAZORPAY_KEY_ID = current_app.config.get("RAZORPAY_KEY_ID")
@@ -4100,7 +4105,7 @@ def confirm_booking():
             elif use_pass:
                 accepted = 'hash_global_pass' if active_pass.cafe_pass.vendor_id is None else 'cafe_specific_pass'
             else:
-                accepted = 'hash_wallet' if payment_mode == 'wallet' else 'payment_gateway'
+                accepted = 'hash_wallet' if payment_mode == 'wallet' else 'cafe_wallet' if payment_mode == 'cafe_wallet' else 'payment_gateway'
             require_method(vendor.id, accepted)
 
             # Payment processing
@@ -4108,6 +4113,10 @@ def confirm_booking():
             if normalized_payment_mode in {"wallet", "hash_wallet"} and amount_payable > 0:
                 BookingService.debit_wallet(user.id, booking.id, amount_payable)
                 payment_mode_used = "wallet"
+            elif normalized_payment_mode == 'cafe_wallet':
+                from services.cafe_booking_wallet import move
+                move(vendor.id,user.id,booking.id,amount_payable)
+                payment_mode_used = 'cafe_wallet'
             elif use_hour_pass:
                 payment_mode_used = "hour_pass"
             elif use_pass:
@@ -4351,7 +4360,10 @@ def confirm_booking():
                         controller_booking.id,
                         float(extra_controller_fare_total or 0.0)
                     )
-                controller_payment_mode = "wallet" if payment_mode == "wallet" else "payment_gateway"
+                if payment_mode == 'cafe_wallet':
+                    from services.cafe_booking_wallet import move
+                    move(controller_vendor.id,controller_user.id,controller_booking.id,extra_controller_fare_total,component='controller')
+                controller_payment_mode = payment_mode if payment_mode in ('wallet','cafe_wallet') else "payment_gateway"
                 controller_app_fee = resolve_app_fee_amount(
                     float(extra_controller_fare_total or 0.0),
                     data,
@@ -4464,6 +4476,8 @@ def confirm_booking():
 
     except ValueError as e:
         db.session.rollback()
+        if str(e)=='Insufficient cafe wallet balance':
+            return jsonify(error='insufficient_cafe_wallet',message=str(e)),402
         return jsonify(error=str(e)), 400
 
     except Exception as e:
@@ -6195,6 +6209,10 @@ def cancel_bookings_with_refund(
     actor_source = normalized_scope if normalized_scope in {"app", "dashboard"} else actor["source_channel"]
     now_utc = datetime.utcnow()
 
+    # Refunds can move cafe funds; serialize before taking booking row locks.
+    cancel_vendors = db.session.query(AvailableGame.vendor_id).join(Booking,Booking.game_id==AvailableGame.id).filter(Booking.id.in_(parsed_ids)).distinct().all()
+    for (vid,) in sorted(cancel_vendors):
+        db.session.execute(text('SELECT pg_advisory_xact_lock(220926,:vid)'),{'vid':vid})
     booking_rows = (
         Booking.query
         .options(joinedload(Booking.slot), joinedload(Booking.game))
@@ -6291,6 +6309,9 @@ def cancel_bookings_with_refund(
         settlement_status = str(getattr(tx, "settlement_status", "")).strip().lower()
         payment_mode = str(getattr(tx, "mode_of_payment", "")).strip().lower()
         paid_amount = max(_safe_float(getattr(tx, "amount", 0.0), 0.0), 0.0)
+        if payment_mode == 'cafe_wallet':
+            paid_amount = sum(max(_safe_float(t.amount,0.0),0.0) for t in booking_txs
+                if t.mode_of_payment=='cafe_wallet' and t.settlement_status=='paid')
 
         has_pass_redemption = bool(redemptions_by_booking.get(booking_id))
         is_pass_payment = (
@@ -6311,6 +6332,9 @@ def cancel_bookings_with_refund(
             chosen_repayment = "none"
         if not chosen_repayment:
             chosen_repayment = _default_repayment_type(payment_use_case) if paid_amount > 0 else "none"
+        if payment_mode == 'cafe_wallet' and chosen_repayment != 'none':
+            # Return to the original cafe balance; never silently transfer to global wallet.
+            chosen_repayment = 'refund'
         if paid_amount <= 0:
             chosen_repayment = "none"
         if is_pay_at_cafe and settlement_status in {"pending", "unpaid", "due"}:
@@ -6358,6 +6382,11 @@ def cancel_bookings_with_refund(
             )
             db.session.add(refund_tx)
             refund_total += refund_amount
+
+            if payment_mode == 'cafe_wallet':
+                from services.cafe_booking_wallet import move
+                move(tx.vendor_id,booking.user_id,booking_id,refund_amount,refund=True)
+                refund_tx.settlement_status = 'processed'
 
             if chosen_repayment == "credit":
                 wallet_credit_amount = float(
@@ -6426,7 +6455,7 @@ def cancel_bookings_with_refund(
             "booking_id": booking_id,
             "repayment_type": chosen_repayment,
             "refund_amount": round(refund_amount, 2),
-            "refund_status": "pending" if chosen_repayment == "refund" and refund_amount > 0 else "processed" if wallet_credit_amount > 0 else "not_required",
+            "refund_status": "processed" if payment_mode=='cafe_wallet' and refund_amount>0 else "pending" if chosen_repayment == "refund" and refund_amount > 0 else "processed" if wallet_credit_amount > 0 else "not_required",
             "cancellation_fee": round(cancellation_fee, 2),
             "wallet_credit_amount": round(wallet_credit_amount, 2),
             "payment_use_case": payment_use_case or None,
