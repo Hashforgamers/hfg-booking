@@ -9,7 +9,7 @@ Each cafe independently enables any combination of these canonical keys:
 | Key | App flow | Money unit |
 | --- | --- | --- |
 | `hash_wallet` | Confirm a booking with `payment_mode: "wallet"` | Global wallet stores whole INR rupees |
-| `cafe_wallet` | Cafe wallet reads; instant QR session checkout | Integer INR paise |
+| `cafe_wallet` | Confirm scheduled bookings with payment_mode: cafe_wallet; instant QR session checkout | Integer INR paise |
 | `hash_global_pass` | Confirm with the user's global date/hour pass | Hours or validity dates |
 | `cafe_specific_pass` | Confirm with a pass issued by this cafe | Hours or validity dates |
 | `payment_gateway` | Create order, complete Razorpay payment, confirm booking | Order amount in integer INR paise |
