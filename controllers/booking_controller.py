@@ -1062,6 +1062,13 @@ def _ensure_vendor_slot_rows_for_date(vendor_id, game_id, booked_date_obj, slot_
         )
     ]
 
+    from controllers.slot_controller import _expected_blocks_for_date
+    expected = _expected_blocks_for_date(int(vendor_id), booked_date_obj.strftime('%Y-%m-%d'))
+    if expected is not None:
+        matching = Slot.query.filter(Slot.id.in_(valid_slot_ids)).all()
+        valid_slot_ids = [int(slot.id) for slot in matching
+                         if (slot.start_time,slot.end_time) in expected]
+
     candidate_slot_ids = valid_slot_ids
 
     for slot_id in candidate_slot_ids:
@@ -1114,7 +1121,7 @@ def _precheck_slot_booking_eligibility(vendor_id, slot_id, booked_date_obj, requ
     if available_slot < int(required_units or 1):
         return f"Slot capacity not available (required {int(required_units or 1)}, available {available_slot})."
 
-    if not is_available and available_slot <= 0:
+    if not is_available:
         return "Slot is marked unavailable."
 
     return None
