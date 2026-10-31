@@ -20,8 +20,8 @@
     "semantic_hash": ""
   },
   "controllers/booking_controller.py": {
-    "mtime": 1791398953.7719567,
-    "ast_hash": "b203c21fb12f5a9afd456d4fb1d18cb4",
+    "mtime": 1793435856.135101,
+    "ast_hash": "742c34df73845ca139cb015ae4678a47",
     "semantic_hash": ""
   },
   "controllers/game_controller.py": {
@@ -40,8 +40,8 @@
     "semantic_hash": ""
   },
   "controllers/slot_controller.py": {
-    "mtime": 1789808296.7207046,
-    "ast_hash": "e01aa7eb943f0e9e4a01031aa85798af",
+    "mtime": 1793435856.1320815,
+    "ast_hash": "79781b5a7ecd6f98cee7c6888a82b9d3",
     "semantic_hash": ""
   },
   "db/extensions.py": {
@@ -410,8 +410,8 @@
     "semantic_hash": ""
   },
   "controllers/cafe_checkout_controller.py": {
-    "mtime": 1790050030.758762,
-    "ast_hash": "3074e354d3e4bbb540ef70e05516879d",
+    "mtime": 1791719274.9770248,
+    "ast_hash": "8e37b885d2e59c26fe6693d0f9272c4b",
     "semantic_hash": ""
   },
   "services/cafe_payment_policy.py": {
@@ -490,8 +490,8 @@
     "semantic_hash": ""
   },
   "services/payment_methods.py": {
-    "mtime": 1790707698.3716614,
-    "ast_hash": "e761231c5a084c2da4bd9f39a4e8563f",
+    "mtime": 1791719274.975707,
+    "ast_hash": "f0775b4969bf563c53f4a59499b658f4",
     "semantic_hash": ""
   },
   "services/pricing_math.py": {
@@ -515,8 +515,8 @@
     "semantic_hash": ""
   },
   "docs/six-method-payments.md": {
-    "mtime": 1790755235.9614594,
-    "ast_hash": "6dfd023c403042f25836bac9fe197eff",
+    "mtime": 1791878695.0487514,
+    "ast_hash": "2d926c7d9c4281de2ef82db6214a1c66",
     "semantic_hash": ""
   },
   "services/slot_capacity.py": {
@@ -527,6 +527,31 @@
   "tests/test_overtime_retry.py": {
     "mtime": 1791026510.1374023,
     "ast_hash": "258e227381e032152f3373de0a470266",
+    "semantic_hash": ""
+  },
+  "services/cafe_booking_wallet.py": {
+    "mtime": 1791876962.140199,
+    "ast_hash": "286842507edd07b0c7967e7a8786405f",
+    "semantic_hash": ""
+  },
+  "tests/test_cafe_booking_wallet.py": {
+    "mtime": 1791876996.9152377,
+    "ast_hash": "25cc1c443555c5214cc953f3701c31b6",
+    "semantic_hash": ""
+  },
+  "tests/test_operating_hours_availability.py": {
+    "mtime": 1793435886.5027719,
+    "ast_hash": "9c47c9b0d5eaf76a9c0764ec2b0d5572",
+    "semantic_hash": ""
+  },
+  "tests/test_payment_method_discovery.py": {
+    "mtime": 1791721427.887678,
+    "ast_hash": "ea80e55b30e9b47f4a34d7ad1e6e909e",
+    "semantic_hash": ""
+  },
+  "docs/app-dynamic-payment-methods.md": {
+    "mtime": 1791878695.0494173,
+    "ast_hash": "7a1dbaddf401896dc995a71b99b182ee",
     "semantic_hash": ""
   }
 }

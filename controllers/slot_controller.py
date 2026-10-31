@@ -14,8 +14,9 @@ import threading
 
 
 slot_blueprint = Blueprint('slots', __name__)
-SLOTS_BATCH_CACHE_TTL_SEC = 5
-SLOTS_SINGLE_CACHE_TTL_SEC = 5
+# Operating-hour edits must be visible on the next request across service instances.
+SLOTS_BATCH_CACHE_TTL_SEC = 0
+SLOTS_SINGLE_CACHE_TTL_SEC = 0
 _slots_batch_cache = {}
 _slots_batch_cache_lock = threading.Lock()
 _slots_single_cache = {}
@@ -110,6 +111,11 @@ def _expected_blocks_for_date(vendor_id, formatted_date):
 
     dt_obj = datetime.strptime(formatted_date, "%Y-%m-%d").date()
     day_key = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][dt_obj.weekday()]
+    opening = db.session.execute(text("""SELECT is_open FROM opening_days
+        WHERE vendor_id=:vendor AND lower(substr(trim(day),1,3))=:day"""),
+        {'vendor':vendor_id, 'day':day_key}).fetchall()
+    if opening and not any(bool(row[0]) for row in opening):
+        return set()
     cfg_rows = db.session.execute(
         text(
             """
@@ -122,7 +128,7 @@ def _expected_blocks_for_date(vendor_id, formatted_date):
         {"vendor_id": vendor_id, "day_key": day_key},
     ).fetchall()
     if not cfg_rows:
-        return set()
+        return None
 
     blocks = []
     for cfg in cfg_rows:
@@ -141,7 +147,7 @@ def _expected_blocks_for_date(vendor_id, formatted_date):
     with _expected_blocks_cache_lock:
         _expected_blocks_cache[cache_key] = {
             "payload": payload,
-            "expires_at": now_ts + 120,
+            "expires_at": now_ts,
         }
     return payload
 
@@ -151,41 +157,10 @@ def _ensure_slots_for_date(vendor_id, game_id, formatted_date):
     Self-heal missing slots for a specific vendor/game/date based on vendor_day_slot_config.
     Keeps data consistent when historical cleanup removed some slot templates.
     """
-    dt_obj = datetime.strptime(formatted_date, "%Y-%m-%d").date()
-    day_key = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][dt_obj.weekday()]
-
-    cfg_rows = db.session.execute(
-        text(
-            """
-            SELECT day, opening_time, closing_time, slot_duration
-            FROM vendor_day_slot_config
-            WHERE vendor_id = :vendor_id
-              AND lower(substr(day, 1, 3)) = :day_key
-            """
-        ),
-        {"vendor_id": vendor_id, "day_key": day_key},
-    ).fetchall()
-    if not cfg_rows:
+    expected = _expected_blocks_for_date(vendor_id, formatted_date)
+    if not expected:
         return
-
-    blocks = []
-    for cfg in cfg_rows:
-        try:
-            duration = int(cfg.slot_duration or 0)
-        except (TypeError, ValueError):
-            continue
-        if duration <= 0:
-            continue
-
-        open_t = _parse_time_flexible(cfg.opening_time)
-        close_t = _parse_time_flexible(cfg.closing_time)
-        if not open_t or not close_t:
-            continue
-        blocks.extend(_generate_blocks(dt_obj, open_t, close_t, duration))
-
-    blocks = list(dict.fromkeys(blocks))
-    if not blocks:
-        return
+    blocks = list(expected)
 
     available_game = AvailableGame.query.filter_by(id=game_id, vendor_id=vendor_id).first()
     total_slots = int(available_game.total_slot or 0) if available_game else 0
@@ -393,7 +368,7 @@ def get_slots_on_game_id(vendorId, gameId, date):
             slot_id = int(row[0])
             slot_start = row[3]
             slot_end = row[4]
-            if expected_blocks and (slot_start, slot_end) not in expected_blocks:
+            if expected_blocks is not None and (slot_start, slot_end) not in expected_blocks:
                 continue
             raw_available = int(row[2] or 0)
             booked_count = int(booking_counts.get((slot_id, formatted_date), 0))
@@ -401,7 +376,7 @@ def get_slots_on_game_id(vendorId, gameId, date):
             # `available_slot` in VENDOR_<id>_SLOT is the source of truth and already
             # decremented by booking flow (including PC squad slot_units). Never inflate
             # availability above this value via booking-row count heuristics.
-            resolved_available = min(raw_available, computed_available)
+            resolved_available = min(raw_available, computed_available) if bool(row[1]) else 0
             slot_is_available = resolved_available > 0
 
             candidate = {
@@ -539,15 +514,15 @@ def get_slots_batch(vendorId):
         for row in result:
             date_obj = row[1]
             date_key = date_obj.strftime("%Y%m%d")
-            expected_blocks = expected_blocks_by_date.get(date_obj.strftime("%Y-%m-%d")) or set()
-            if expected_blocks and (row[4], row[5]) not in expected_blocks:
+            expected_blocks = expected_blocks_by_date.get(date_obj.strftime("%Y-%m-%d"))
+            if expected_blocks is not None and (row[4], row[5]) not in expected_blocks:
                 continue
             raw_available = int(row[3] or 0)
             game_id = int(row[8])
             booked_count = int(booking_counts.get((int(row[0]), date_obj.strftime("%Y-%m-%d")), 0))
             computed_available = max(int(total_slots_map.get(game_id, 0)) - booked_count, 0)
             # Keep DB availability authoritative; count-based estimate is only a cap.
-            resolved_available = min(raw_available, computed_available)
+            resolved_available = min(raw_available, computed_available) if bool(row[2]) else 0
             slot_is_available = resolved_available > 0
             
             candidate = {
