@@ -205,9 +205,9 @@
     "semantic_hash": "4d06d7d5ef35743a06f1304c71cef904"
   },
   "models/vendor.py": {
-    "mtime": 1772306934.2601345,
-    "ast_hash": "0b0b8ea61719b113420b4be28288e0fe",
-    "semantic_hash": "0b0b8ea61719b113420b4be28288e0fe"
+    "mtime": 1793442393.377492,
+    "ast_hash": "20319fe063789ee2f7318c8177256596",
+    "semantic_hash": ""
   },
   "models/vendorConsoleOverride.py": {
     "mtime": 1774724903.6503153,

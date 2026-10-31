@@ -9,6 +9,12 @@ class Vendor(db.Model):
     
     id = Column(Integer, primary_key=True)
     cafe_name = Column(String(255), nullable=False)
+    display_name = Column(String(120), nullable=True)
+
+    @property
+    def public_name(self):
+        return (self.display_name or '').strip() or self.cafe_name
+
 
     available_games = relationship('AvailableGame', back_populates='vendor', cascade="all, delete-orphan")
 
@@ -21,5 +27,6 @@ class Vendor(db.Model):
 
     def to_dict_for_booking(self):
         return {
-            "cafe_name":self.cafe_name
+            "cafe_name": self.public_name,
+            "display_name": self.display_name
         }
