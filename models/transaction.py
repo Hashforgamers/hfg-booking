@@ -9,7 +9,7 @@ class Transaction(db.Model):
     id = Column(Integer, primary_key=True)
     booking_id = Column(Integer, ForeignKey('bookings.id'), nullable=True)  # made nullable
     vendor_id = Column(Integer, ForeignKey('vendors.id'), nullable=True)    # nullable for system-wide transactions
-    user_id = Column(Integer, nullable=False)
+    user_id = Column(Integer, nullable=True)
     booked_date = Column(Date, default=datetime.utcnow().date(), nullable=False)
     booking_date = Column(Date, default=datetime.utcnow().date(), nullable=False)
     booking_time = Column(Time, default=datetime.utcnow().time(), nullable=False)

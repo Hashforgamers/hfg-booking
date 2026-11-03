@@ -5985,6 +5985,7 @@ def new_booking(vendor_id):
                         booking_status=runtime_status,
                         squad_details=booking.squad_details or {},
                     )
+                    event_payload.update(settlement_status=settlement_status, payment_use_case=payment_use_case)
                     emit_booking_event(socketio, event="booking", data=event_payload, vendor_id=vendor_id)
                     socketio.emit("booking_admin", sanitize_realtime_payload(event_payload), to="dashboard_admin")
                 except Exception as emit_err:
