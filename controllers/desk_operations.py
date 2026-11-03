@@ -123,8 +123,26 @@ def import_history(vendor_id):
         statement = insert(archive).values(values).on_conflict_do_nothing(
             index_elements=["vendor_id","source_key"]).returning(archive.c.source_key)
         inserted = len(db.session.execute(statement).all())
+    # Mirror the persisted archive value so a retry cannot change a previously recorded payment.
+    from sqlalchemy import bindparam
+    posted = db.session.execute(text("""
+        INSERT INTO transactions (vendor_id,reference_id,user_name,booked_date,booking_date,booking_time,
+            amount,original_amount,discounted_amount,mode_of_payment,payment_use_case,booking_type,
+            settlement_status,source_channel,base_amount,meals_amount,controller_amount,waive_off_amount,
+            app_fee_amount,taxable_amount,gst_rate,cgst_amount,sgst_amount,igst_amount,total_with_tax,created_at,updated_at)
+        SELECT vendor_id,source_key,player,played_on,played_on + (ended < started)::integer,ended,
+            paid,paid,0,'Unspecified','historical_payment','historical_session','completed','excel_import',
+            paid,0,0,0,0,0,0,0,0,0,paid,now(),now()
+        FROM desk_booking_archive WHERE vendor_id=:vendor AND source_key IN :keys
+        ON CONFLICT (vendor_id,reference_id) WHERE source_channel='excel_import' DO UPDATE
+        SET user_name=excluded.user_name,booked_date=excluded.booked_date,booking_date=excluded.booking_date,
+            booking_time=excluded.booking_time,amount=excluded.amount,original_amount=excluded.amount,
+            base_amount=excluded.amount,total_with_tax=excluded.amount,updated_at=now()
+        WHERE (transactions.user_name,transactions.booked_date,transactions.booking_date,transactions.booking_time,transactions.amount)
+              IS DISTINCT FROM (excluded.user_name,excluded.booked_date,excluded.booking_date,excluded.booking_time,excluded.amount)
+    """).bindparams(bindparam("keys", expanding=True)), {"vendor":vendor_id, "keys":[p["key"] for p in parameters]})
     db.session.commit()
-    return jsonify(inserted=inserted, skipped=len(rows)-inserted)
+    return jsonify(inserted=inserted, skipped=len(rows)-inserted, transactions_saved=posted.rowcount)
 
 
 @desk.get("/vendor/<int:vendor_id>/desk-history")
