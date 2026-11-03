@@ -1,8 +1,25 @@
 """Enforce migrated cafe policies before legacy checkout can collect money."""
-from flask import request, jsonify
+from flask import g, request, jsonify
 from sqlalchemy import text
 from db.extensions import db
 from services.payment_methods import canonical_method, require_method
+
+
+PLATFORM_PURPOSES = ('wallet_topup', 'game_pass', 'tournament_entry')
+
+
+def platform_order_purpose(body):
+    if 'purpose' in body:
+        purpose = body['purpose']
+        return purpose if purpose in PLATFORM_PURPOSES else None
+    receipt = body.get('receipt')
+    if isinstance(receipt, str) and receipt.startswith('wallet_rcpt_'):
+        return 'wallet_topup'
+    return None
+
+
+def cafe_context_required():
+    return jsonify(message='Supply vendor_id, game_id or booking_id for payment policy validation.', code='cafe_context_required'), 400
 
 
 def enforce_cafe_payment_policy():
@@ -42,7 +59,16 @@ def enforce_cafe_payment_policy():
             if row:
                 vendor_ids.add(row[0])
     if endpoint in {'create_order', 'generate_payment_link', 'capture_payment'} and not vendor_ids:
-        return jsonify(message='Supply vendor_id, game_id or booking_id for payment policy validation.', code='cafe_context_required'), 400
+        if not any(key in body for key in ('vendor_id', 'game_id', 'booking_id', 'cafe_pass_id')):
+            if endpoint == 'create_order':
+                g.platform_order_purpose = platform_order_purpose(body)
+                if g.platform_order_purpose:
+                    return None
+            if endpoint == 'capture_payment':
+                # The authenticated handler verifies the purpose on the signed order.
+                g.require_platform_order = True
+                return None
+        return cafe_context_required()
     requested_method = canonical_method(body.get('payment_mode') or body.get('paymentType') or body.get('payment_method'))
     if endpoint in {'create_order', 'generate_payment_link', 'capture_payment'}:
         requested_method = 'payment_gateway'
