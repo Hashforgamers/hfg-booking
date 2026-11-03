@@ -1,5 +1,6 @@
 from flask import Blueprint, request, jsonify, current_app, g,  make_response
 from services.booking_service import BookingService
+from services.cafe_payment_policy import PLATFORM_PURPOSES, cafe_context_required
 from db.extensions import db
 from models.slot import Slot
 from models.booking import Booking
@@ -2842,6 +2843,8 @@ def create_order():
     if pass_id is not None:
         payload['notes']['cafe_pass_id'] = str(pass_id)
         payload['notes']['purpose'] = 'pass_purchase'
+    elif getattr(g, 'platform_order_purpose', None):
+        payload['notes']['purpose'] = g.platform_order_purpose
 
     response = requests.post("https://api.razorpay.com/v1/orders", headers=headers, json=payload, timeout=10)
 
@@ -2888,6 +2891,9 @@ def capture_payment():
         owner_note = (order.get("notes") or {}).get("user_id") or (payment.get("notes") or {}).get("user_id")
         if str(owner_note or "") != str(int(g.auth_user_id)):
             return jsonify({"message": "Payment order does not belong to this user"}), 403
+
+        if getattr(g, 'require_platform_order', False) and (order.get('notes') or {}).get('purpose') not in PLATFORM_PURPOSES:
+            return cafe_context_required()
 
         if payment['status'] == 'authorized':
             # Capture payment manually if not auto-captured during order creation
@@ -3717,6 +3723,8 @@ def confirm_booking():
                     order = razorpay_client.order.fetch(payment.get("order_id"))
                     if (order.get('notes') or {}).get('purpose') == 'pass_purchase':
                         return jsonify(message='Use this payment to complete its pass purchase'), 400
+                    if (order.get('notes') or {}).get('purpose') in PLATFORM_PURPOSES:
+                        return jsonify(message='Platform payments cannot be used for a booking'), 400
                     owner_note = (order.get("notes") or {}).get("user_id") or (payment.get("notes") or {}).get("user_id")
                     if str(owner_note or "") != str(int(g.auth_user_id)):
                         return jsonify({"message": "Payment order does not belong to this user"}), 403
