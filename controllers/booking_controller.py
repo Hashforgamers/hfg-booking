@@ -4978,6 +4978,9 @@ def new_booking(vendor_id):
         slot_ids = sorted(slot_ids)  # Shared lock order for multi-slot desk requests.
         payment_type = str(data.get("paymentType") or "").strip()
         desk_mode = payment_type.lower().replace(' ', '_')
+        collect_after_session = desk_mode in {"pay_at_cafe", "pay_in_cafe"}
+        if collect_after_session:
+            payment_type = "pay_at_cafe"
         if desk_mode not in {'cash', 'card', 'upi', 'pay_at_cafe', 'pay_in_cafe', 'pass', 'monthly_credit'}:
             return jsonify(message='Unsupported desk payment method. Use verified app checkout for wallets or gateway.'), 400
         from services.payment_methods import require_method
@@ -5726,7 +5729,7 @@ def new_booking(vendor_id):
                 amount=final_amount,
                 mode_of_payment=payment_type,
                 payment_use_case=payment_use_case,
-                booking_type=booking_type,
+                booking_type="pay_at_cafe" if collect_after_session else booking_type,
                 settlement_status=settlement_status,
                 source_channel=actor["source_channel"],
                 initiated_by_staff_id=actor["staff_id"],
@@ -6113,12 +6116,12 @@ def new_booking(vendor_id):
                 booking_date=datetime.utcnow().strftime("%Y-%m-%d"),
                 booked_for_date=booked_date_str,
                 booking_details=booking_details,
-                price_paid=total_paid,
+                price_paid=0.0 if collect_after_session else total_paid,
                 extra_meals=email_meal_details,
                 extra_controller_fare=extra_controller_fare,
                 waive_off_amount=waive_off_total,
                 app_fee_amount=float(app_fee_total or 0.0),
-                net_total=max(float(total_paid or 0.0) - float(app_fee_total or 0.0), 0.0),
+                net_total=0.0 if collect_after_session else max(float(total_paid or 0.0) - float(app_fee_total or 0.0), 0.0),
             )])
         except Exception as mail_error:
             current_app.logger.exception("booking_mail failed for vendor=%s booking_ids=%s err=%s",
@@ -6172,6 +6175,7 @@ def new_booking(vendor_id):
                 "role": actor["staff_role"]
             },
             "payment_use_case": payment_use_case,
+            "settlement_status": settlement_status,
             "selected_meals": [
                 {
                     "name": detail['menu_item'].name,
