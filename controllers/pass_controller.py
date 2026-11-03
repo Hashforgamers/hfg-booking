@@ -252,13 +252,16 @@ def get_dashboard_user_valid_passes():
             return jsonify(message='Supply up to 20 distinct slot IDs'), 400
         if hours_needed is not None and (not Decimal(str(hours_needed)).is_finite() or hours_needed < 0):
             return jsonify(message='Invalid hours_needed'), 400
+        device_names = set()
         if slot_ids:
             from models.slot import Slot
             from models.availableGame import AvailableGame
-            valid_count = Slot.query.join(AvailableGame, Slot.gaming_type_id == AvailableGame.id).filter(
-                Slot.id.in_(slot_ids), AvailableGame.vendor_id == vendor_id).count()
-            if valid_count != len(slot_ids):
+            matches = db.session.query(AvailableGame.game_name).select_from(Slot).join(
+                AvailableGame, Slot.gaming_type_id == AvailableGame.id).filter(
+                Slot.id.in_(slot_ids), AvailableGame.vendor_id == vendor_id).all()
+            if len(matches) != len(slot_ids):
                 return jsonify(message='Slots must belong to this cafe'), 400
+            device_names = {name for (name,) in matches}
         from services.payment_methods import accepted_methods
         enabled = accepted_methods(vendor_id)
 
@@ -297,6 +300,11 @@ def get_dashboard_user_valid_passes():
             cafe_pass = user_pass.cafe_pass
             if not cafe_pass or not cafe_pass.is_active:
                 continue
+
+            if cafe_pass.pc_only:
+                from services.pass_service import is_pc_device
+                if not device_names or not all(is_pc_device(vendor_id, name) for name in device_names):
+                    continue
 
             is_global = cafe_pass.vendor_id is None
             can_use_here = is_global or int(cafe_pass.vendor_id) == int(vendor_id)

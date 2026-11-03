@@ -4978,6 +4978,9 @@ def new_booking(vendor_id):
         slot_ids = sorted(slot_ids)  # Shared lock order for multi-slot desk requests.
         payment_type = str(data.get("paymentType") or "").strip()
         desk_mode = payment_type.lower().replace(' ', '_')
+        collect_after_session = desk_mode in {"pay_at_cafe", "pay_in_cafe"}
+        if collect_after_session:
+            payment_type = "pay_at_cafe"
         if desk_mode not in {'cash', 'card', 'upi', 'pay_at_cafe', 'pay_in_cafe', 'pass', 'monthly_credit'}:
             return jsonify(message='Unsupported desk payment method. Use verified app checkout for wallets or gateway.'), 400
         from services.payment_methods import require_method
@@ -5169,7 +5172,8 @@ def new_booking(vendor_id):
         if not 0 <= extra_controller_qty <= 64:
             return jsonify({"message": "extraControllerQty must be between 0 and 64"}), 400
 
-        if not is_controller_pricing_supported(available_game.game_name, vendor_id=vendor_id):
+        controllers_included = data.get("deskProfile") in ("ps55", "ps65", "gta55", "gta65")
+        if controllers_included or not is_controller_pricing_supported(available_game.game_name, vendor_id=vendor_id):
             # PC/VR and other unsupported console types should never carry controller surcharge.
             extra_controller_qty = 0
             extra_controller_fare = 0.0
@@ -5230,7 +5234,7 @@ def new_booking(vendor_id):
             normalized_squad_details["discount_percent"] = discount_pct
 
             # For PS/Xbox squad sessions, pricing is controller-driven; ensure controller qty matches players.
-            if pricing_mode == "controller_pricing":
+            if pricing_mode == "controller_pricing" and not controllers_included:
                 required_extra_controller_qty = max(0, int(normalized_squad_details["player_count"]) - 1)
                 if required_extra_controller_qty > extra_controller_qty:
                     extra_controller_qty = required_extra_controller_qty
@@ -5479,6 +5483,11 @@ def new_booking(vendor_id):
                 })
                 continue
 
+        if failed_slots and data.get("requireFullRange"):
+            db.session.rollback()
+            return jsonify(success=False, message="Availability changed. Choose a new session time.",
+                           failed_slots=failed_slots, failed_slot_details=failed_slot_details), 409
+
         # Check if any bookings were created
         if not bookings:
             return jsonify({
@@ -5584,6 +5593,15 @@ def new_booking(vendor_id):
             int(s.id): s
             for s in Slot.query.filter(Slot.id.in_([b.slot_id for b in bookings])).all()
         }
+        desk_prices = {}
+        if data.get("deskProfile"):
+            from controllers.desk_operations import desk_slot_prices
+            desk_prices = desk_slot_prices(vendor_id, available_game.id, data["deskProfile"],
+                                          int(normalized_squad_details.get("player_count", 1)),
+                                          runtime_slot_map.values())
+            expected = sum(round(amount * 100) for amount in desk_prices.values())
+            if round(float(data.get("deskSubtotal", -1)) * 100) != expected:
+                raise ValueError("The desk rate changed. Refresh and review the new price.")
         slot_pricing = {}
         total_unit_price = 0.0
         total_base_before_discount = 0.0
@@ -5597,6 +5615,9 @@ def new_booking(vendor_id):
                 (base_slot_price * squad_discount_percent / 100.0)
                 if squad_discount_applicable else 0.0
             )
+            if desk_prices:
+                unit_price = base_slot_price = desk_prices[booking.slot_id]
+                slot_discount = 0.0
             total_base_before_discount += base_slot_price
             total_discount += slot_discount
             slot_pricing[int(booking.id)] = {
@@ -5708,7 +5729,7 @@ def new_booking(vendor_id):
                 amount=final_amount,
                 mode_of_payment=payment_type,
                 payment_use_case=payment_use_case,
-                booking_type=booking_type,
+                booking_type="pay_at_cafe" if collect_after_session else booking_type,
                 settlement_status=settlement_status,
                 source_channel=actor["source_channel"],
                 initiated_by_staff_id=actor["staff_id"],
@@ -6095,12 +6116,12 @@ def new_booking(vendor_id):
                 booking_date=datetime.utcnow().strftime("%Y-%m-%d"),
                 booked_for_date=booked_date_str,
                 booking_details=booking_details,
-                price_paid=total_paid,
+                price_paid=0.0 if collect_after_session else total_paid,
                 extra_meals=email_meal_details,
                 extra_controller_fare=extra_controller_fare,
                 waive_off_amount=waive_off_total,
                 app_fee_amount=float(app_fee_total or 0.0),
-                net_total=max(float(total_paid or 0.0) - float(app_fee_total or 0.0), 0.0),
+                net_total=0.0 if collect_after_session else max(float(total_paid or 0.0) - float(app_fee_total or 0.0), 0.0),
             )])
         except Exception as mail_error:
             current_app.logger.exception("booking_mail failed for vendor=%s booking_ids=%s err=%s",
@@ -6154,6 +6175,7 @@ def new_booking(vendor_id):
                 "role": actor["staff_role"]
             },
             "payment_use_case": payment_use_case,
+            "settlement_status": settlement_status,
             "selected_meals": [
                 {
                     "name": detail['menu_item'].name,

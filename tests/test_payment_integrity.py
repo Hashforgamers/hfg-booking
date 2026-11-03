@@ -49,6 +49,7 @@ def env(monkeypatch):
         __tablename__='available_games'
         id=db.Column(db.Integer,primary_key=True)
         vendor_id=db.Column(db.Integer)
+        game_name=db.Column(db.String,default='PC')
     class Booking(db.Model):
         __tablename__='bookings'
         id=db.Column(db.Integer,primary_key=True)
@@ -257,3 +258,19 @@ def test_invalid_pass_hours_do_not_change_balance(env,amount):
         with pytest.raises(ValueError):e.ps.redeem_pass_hours(pid,1,amount,'app_booking',booking_id=1)
         e.db.session.rollback()
         assert e.db.session.get(e.p.UserPass,pid).remaining_hours==10
+
+def test_pc_membership_requires_pc_booking(env, monkeypatch):
+    e = env
+    with e.app.app_context():
+        owned = e.buy(1, body())[0]
+        owned.cafe_pass.pc_only = True
+        e.db.session.commit()
+        with pytest.raises(ValueError, match="through a PC booking"):
+            e.ps.redeem_pass_hours(owned.id, 1, 1, "dashboard_manual")
+        monkeypatch.setattr(sys.modules["services.pass_service"], "is_pc_device", lambda vendor, name: False)
+        with pytest.raises(ValueError, match="PC sessions only"):
+            e.ps.redeem_pass_hours(owned.id, 1, 1, "dashboard_booking", booking_id=1)
+        assert owned.remaining_hours == 10
+        monkeypatch.setattr(sys.modules["services.pass_service"], "is_pc_device", lambda vendor, name: name == "PC")
+        e.ps.redeem_pass_hours(owned.id, 1, 1, "dashboard_booking", booking_id=1)
+        assert owned.remaining_hours == 9
