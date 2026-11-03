@@ -14,6 +14,12 @@ import pytz
 IST = pytz.timezone("Asia/Kolkata")
 
 
+def is_pc_device(vendor_id, game_name):
+    from services.console_catalog_service import resolve_console_capabilities, legacy_console_group
+    capabilities = resolve_console_capabilities(vendor_id, game_name)
+    return legacy_console_group(capabilities["slug"], capabilities) == "pc"
+
+
 class PassService:
     
     @staticmethod
@@ -191,6 +197,8 @@ class PassService:
             require_method(vendor_id, 'hash_global_pass' if cafe_pass.vendor_id is None else 'cafe_specific_pass')
             if user_pass.valid_from and user_pass.valid_from > datetime.now(IST).date():
                 raise ValueError('Pass validity has not started')
+            if cafe_pass.pc_only and booking_id is None:
+                raise ValueError("Redeem this PC membership through a PC booking.")
             if booking_id is not None:
                 from models.booking import Booking
                 from models.availableGame import AvailableGame
@@ -198,6 +206,8 @@ class PassService:
                 game = db.session.get(AvailableGame, booking.game_id) if booking else None
                 if not booking or booking.user_id != user_pass.user_id or not game or game.vendor_id != vendor_id:
                     raise ValueError('Booking does not belong to this pass owner and cafe')
+                if cafe_pass.pc_only and not is_pc_device(vendor_id, game.game_name):
+                    raise ValueError("This membership covers PC sessions only.")
                 previous = PassRedemptionLog.query.filter_by(booking_id=booking_id, is_cancelled=False).first()
                 if previous:
                     if previous.user_pass_id == user_pass_id and previous.hours_deducted == hours_to_deduct:

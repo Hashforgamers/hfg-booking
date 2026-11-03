@@ -83,6 +83,8 @@ def create_app():
     )
 
     from models.passPurchase import PassPurchase
+    from controllers.desk_operations import desk
+    app.register_blueprint(desk, url_prefix="/api")
     app.register_blueprint(booking_blueprint, url_prefix="/api")
     app.register_blueprint(slot_blueprint, url_prefix="/api")
     app.register_blueprint(game_blueprint, url_prefix="/api")

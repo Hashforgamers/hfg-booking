@@ -43,6 +43,7 @@ class CafePass(db.Model):
     is_active = Column(Boolean, default=True, index=True)
     
     # Both pass types need validity period
+    pc_only = Column(Boolean, nullable=False, default=False, server_default="false")
     days_valid = Column(Integer, nullable=False)  # ✅ FIXED: Not nullable
     
     # Hour-based pass fields
@@ -88,6 +89,7 @@ class CafePass(db.Model):
             'description': self.description,
             'is_active': self.is_active,
             'pass_mode': self.pass_mode,
+            'pc_only': bool(self.pc_only),
             'days_valid': self.days_valid,
             'total_hours': float(self.total_hours) if self.total_hours else None,
             'hour_calculation_mode': self.hour_calculation_mode,
