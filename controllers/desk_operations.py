@@ -2,7 +2,8 @@ from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, current_app
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy import text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy import bindparam
@@ -11,6 +12,16 @@ from db.extensions import db
 from services.vendor_access import require_vendor_permission
 
 desk = Blueprint("desk_operations", __name__)
+@desk.errorhandler(SQLAlchemyError)
+def database_error(error):
+    db.session.rollback()
+    current_app.logger.exception("Desk operations database request failed")
+    code = getattr(getattr(error, "orig", None), "pgcode", None)
+    if code in ("42P01", "42703", "42P10", "23502"):
+        return jsonify(error="Booking database setup is incomplete. Apply the desk rates/history and imported transactions migrations to the booking database, then retry. No rows in this batch were saved."), 503
+    return jsonify(error="Could not save or load desk data. Please retry. No rows in this batch were saved."), 503
+
+
 RATE_COUNTS = {"pc": 3, "ps55": 4, "ps65": 4, "gta55": 1, "gta65": 1, "racing": 2}
 
 
@@ -100,6 +111,9 @@ def import_history(vendor_id):
             start, end = (datetime.strptime(row[k], "%H:%M").time() for k in ("start", "end"))
             if start == end or datetime.combine(day, end) + timedelta(days=end < start) > now:
                 raise ValueError()
+            payment_status = row.get("paymentStatus")
+            if payment_status is not None and str(payment_status).strip().lower() not in ("paid", "completed", "settled", "success", "successful"):
+                return jsonify(error=f"Row {index}: payment is not settled. Import only verified payments received."), 400
             paid = money(row["paid"])
             parameters.append(dict(v=vendor_id,key=key,player=player,device=device,day=day,start=start,end=end,paid=paid))
         except (KeyError, TypeError, AttributeError, ValueError, InvalidOperation):
