@@ -5594,6 +5594,11 @@ def new_booking(vendor_id):
             for s in Slot.query.filter(Slot.id.in_([b.slot_id for b in bookings])).all()
         }
         desk_prices = {}
+        active_desk_rates = db.session.execute(text("SELECT 1 FROM desk_rate_cards WHERE vendor_id=:vendor AND game_id=:game AND is_active=true LIMIT 1"), dict(vendor=vendor_id, game=available_game.id)).first()
+        if active_desk_rates and not data.get("deskProfile"):
+            raise ValueError("This device uses variant pricing. Open New Gaming Session and choose its session rate.")
+        if not active_desk_rates and data.get("deskProfile"):
+            raise ValueError("This device now uses slot pricing. Refresh and review the price.")
         if data.get("deskProfile"):
             from controllers.desk_operations import desk_slot_prices
             desk_prices = desk_slot_prices(vendor_id, available_game.id, data["deskProfile"],
@@ -5602,6 +5607,16 @@ def new_booking(vendor_id):
             expected = sum(round(amount * 100) for amount in desk_prices.values())
             if round(float(data.get("deskSubtotal", -1)) * 100) != expected:
                 raise ValueError("The desk rate changed. Refresh and review the new price.")
+        if data.get("deskPricingMode") is not None:
+            for booking in bookings:
+                pricing_details = dict(booking.squad_details or {})
+                pricing_details.setdefault("enabled", False)
+                pricing_details["desk_pricing"] = {
+                    "mode": "variants" if desk_prices else "slot",
+                    "profile": data.get("deskProfile"),
+                    "slot_base_amount": desk_prices.get(int(booking.slot_id)),
+                }
+                booking.squad_details = pricing_details
         slot_pricing = {}
         total_unit_price = 0.0
         total_base_before_discount = 0.0

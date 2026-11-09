@@ -1,0 +1,3 @@
+BEGIN;
+ALTER TABLE desk_rate_cards ADD COLUMN IF NOT EXISTS is_active boolean NOT NULL DEFAULT true;
+COMMIT;

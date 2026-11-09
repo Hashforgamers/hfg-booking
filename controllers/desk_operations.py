@@ -35,7 +35,7 @@ def money(value):
 @desk.get("/vendor/<int:vendor_id>/desk-rates")
 @require_vendor_permission("booking.manage", "pricing.manage")
 def desk_rates(vendor_id):
-    rows = db.session.execute(text("SELECT game_id,profile,rates FROM desk_rate_cards WHERE vendor_id=:vendor"), {"vendor": vendor_id})
+    rows = db.session.execute(text("SELECT game_id,profile,rates,is_active FROM desk_rate_cards WHERE vendor_id=:vendor"), {"vendor": vendor_id})
     return jsonify([dict(row) for row in rows.mappings()])
 
 
@@ -53,6 +53,7 @@ def save_rates(vendor_id):
             ON CONFLICT(vendor_id,game_id,profile) DO UPDATE SET rates=excluded.rates""").bindparams(bindparam("rates", type_=JSONB))
         if not db.session.execute(stmt, dict(vendor=vendor_id, game=int(data["game_id"]), profile=profile, rates=rates)).rowcount:
             raise ValueError("Choose a device at this cafe.")
+        db.session.execute(text("UPDATE desk_rate_cards SET is_active=true WHERE vendor_id=:vendor AND game_id=:game"), dict(vendor=vendor_id,game=int(data["game_id"])))
         db.session.commit()
         return jsonify(success=True)
     except (KeyError, ValueError, TypeError, InvalidOperation):
@@ -60,8 +61,30 @@ def save_rates(vendor_id):
         return jsonify(error="Check the selected device and rates."), 400
 
 
+@desk.put("/vendor/<int:vendor_id>/desk-rates/mode")
+@require_vendor_permission("pricing.manage")
+def set_rate_mode(vendor_id):
+    data = request.get_json(silent=True) or {}
+    try:
+        game = int(data["game_id"])
+        if data["mode"] not in ("slot", "variants"):
+            raise ValueError()
+        if not db.session.execute(text("SELECT id FROM available_games WHERE vendor_id=:vendor AND id=:game"), dict(vendor=vendor_id,game=game)).first():
+            raise ValueError()
+        changed = db.session.execute(text("UPDATE desk_rate_cards SET is_active=:active WHERE vendor_id=:vendor AND game_id=:game"),
+                           dict(active=data["mode"] == "variants", vendor=vendor_id, game=game))
+        if data["mode"] == "variants" and not changed.rowcount:
+            db.session.rollback()
+            return jsonify(error="Save at least one variant rate before enabling variant pricing."), 400
+        db.session.commit()
+        return jsonify(success=True)
+    except (KeyError, TypeError, ValueError):
+        db.session.rollback()
+        return jsonify(error="Choose slot or variant pricing for a device."), 400
+
+
 def desk_slot_prices(vendor, game, profile, players, slots):
-    rates = db.session.execute(text("SELECT rates FROM desk_rate_cards WHERE vendor_id=:v AND game_id=:g AND profile=:p"),
+    rates = db.session.execute(text("SELECT rates FROM desk_rate_cards WHERE vendor_id=:v AND game_id=:g AND profile=:p AND is_active=true"),
                                dict(v=vendor, g=game, p=profile)).scalar()
     if not rates or profile not in RATE_COUNTS:
         raise ValueError("Refresh the desk rate card.")
