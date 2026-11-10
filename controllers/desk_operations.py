@@ -65,6 +65,9 @@ def save_rates(vendor_id):
             return jsonify(error="This rate was changed by another staff member. Reload it before saving."), 409
         if data.get("definition") is not None:
             definition = validate_definition(data["definition"])
+            if definition.get("console_ids"):
+                from services.desk_consoles import validate_mapping
+                validate_mapping(vendor_id,game,definition)
             rates = []
         else:
             rates = [float(money(value)) for value in data["rates"]]
@@ -239,3 +242,37 @@ def list_history(vendor_id):
         FROM desk_booking_archive WHERE vendor_id=:v ORDER BY played_on DESC, source_key LIMIT 50 OFFSET :offset"""),
         dict(v=vendor_id, offset=offset))
     return jsonify([dict(row) for row in rows.mappings()])
+
+
+@desk.get("/vendor/<int:vendor_id>/desk-consoles/<int:game_id>")
+@require_vendor_permission("booking.manage", "pricing.manage")
+def desk_console_list(vendor_id, game_id):
+    from services.desk_consoles import consoles
+    return jsonify(consoles(vendor_id,game_id))
+
+
+@desk.post("/vendor/<int:vendor_id>/desk-consoles/<int:game_id>/available")
+@require_vendor_permission("booking.manage")
+def desk_console_availability(vendor_id, game_id):
+    from services.desk_consoles import available, windows
+    from types import SimpleNamespace
+    data=request.get_json(silent=True) or {}
+    try:
+        ids=data.get('slot_ids')
+        if not isinstance(ids,list) or not 1<=len(ids)<=500 or any(type(i) is not int or i<=0 for i in ids):
+            raise ValueError('Choose between 1 and 500 valid slots.')
+        card=get_desk_card(vendor_id,game_id,data['profile'])
+        rows=db.session.execute(text("SELECT id,start_time,end_time FROM slots WHERE gaming_type_id=:g AND id=ANY(:ids)"),dict(g=game_id,ids=data['slot_ids'])).mappings().all()
+        if not rows or len(rows)!=len(set(data['slot_ids'])):raise ValueError('Choose valid slots for this device.')
+        spans=windows(date.fromisoformat(data['date']),[SimpleNamespace(**row) for row in rows])
+        return jsonify(available(vendor_id,game_id,card['definition'],spans))
+    except (ValueError,KeyError,TypeError) as error:
+        return jsonify(error=str(error) if isinstance(error,ValueError) else 'Check session times and rate.'),400
+
+@desk.get("/vendor/<int:vendor_id>/desk-console-games/<int:console_id>")
+@require_vendor_permission("pricing.manage")
+def desk_console_games(vendor_id,console_id):
+    rows=db.session.execute(text('''SELECT a.available_game_id FROM available_game_console a
+        JOIN consoles c ON c.id=a.console_id JOIN available_games g ON g.id=a.available_game_id
+        WHERE c.id=:c AND c.vendor_id=:v AND g.vendor_id=:v'''),dict(c=console_id,v=vendor_id))
+    return jsonify([row[0] for row in rows])

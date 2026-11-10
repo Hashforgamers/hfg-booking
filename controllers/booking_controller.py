@@ -5600,6 +5600,7 @@ def new_booking(vendor_id):
             int(s.id): s
             for s in Slot.query.filter(Slot.id.in_([b.slot_id for b in bookings])).all()
         }
+        desk_console_ids = []
         desk_prices = {}
         active_desk_rates = db.session.execute(text("SELECT 1 FROM desk_pricing_settings WHERE vendor_id=:vendor AND game_id=:game AND mode='variants'"), dict(vendor=vendor_id, game=available_game.id)).first()
         if active_desk_rates and not data.get("deskProfile"):
@@ -5614,6 +5615,16 @@ def new_booking(vendor_id):
             expected = sum(round(amount * 100) for amount in desk_prices.values())
             if round(float(data.get("deskSubtotal", -1)) * 100) != expected:
                 raise ValueError("The desk rate changed. Refresh and review the new price.")
+        if selected_desk_card:
+            from services.desk_consoles import reserve as reserve_desk_consoles, windows as desk_windows
+            quantity = int(normalized_squad_details.get("player_count",1)) if squad_enabled and uses_multi_slot_units else 1
+            desk_console_ids = reserve_desk_consoles(vendor_id,available_game.id,selected_desk_card["definition"],
+                desk_windows(booked_date_obj,runtime_slot_map.values()),quantity,data.get("deskConsoleIds"))
+            for booking in bookings:
+                details = dict(booking.squad_details or {})
+                details["desk_console_ids"] = desk_console_ids
+                details["assigned_console_ids"] = desk_console_ids
+                booking.squad_details = details
         if data.get("deskPricingMode") is not None:
             for booking in bookings:
                 pricing_details = dict(booking.squad_details or {})
@@ -5698,7 +5709,7 @@ def new_booking(vendor_id):
                 vendor_id=vendor_id,
                 user_id=user.id,
                 is_active=True
-            ).first()
+            ).with_for_update().first()
             if not credit_account:
                 return jsonify({
                     "success": False,
@@ -5871,7 +5882,7 @@ def new_booking(vendor_id):
         for booking in bookings:
             slot_obj = slot_map.get(int(booking.slot_id))
             runtime_status = "upcoming"
-            runtime_console_id = int(console_id) if console_id is not None else -1
+            runtime_console_id = desk_console_ids[0] if desk_console_ids else (int(console_id) if console_id is not None else -1)
 
             if slot_obj and _is_slot_live_now_ist(booked_for_date_obj, slot_obj.start_time, slot_obj.end_time):
                 is_pc_squad = bool(
@@ -5885,7 +5896,13 @@ def new_booking(vendor_id):
                 required_console_count = max(required_console_count, 1)
 
                 reserved_console_ids = []
-                if is_rapid_booking and console_id is not None:
+                if desk_console_ids:
+                    for cid in desk_console_ids:
+                        reserved = _reserve_specific_console(vendor_id,available_game.id,cid)
+                        if reserved is None:
+                            raise ValueError("The reserved console is busy. Refresh before starting this session.")
+                        reserved_console_ids.append(reserved)
+                if not desk_console_ids and is_rapid_booking and console_id is not None:
                     reserved_specific = _reserve_specific_console(
                         vendor_id=vendor_id,
                         game_id=available_game.id,
@@ -5964,6 +5981,7 @@ def new_booking(vendor_id):
 
         # Persist transaction and dashboard records together. Reuse the loaded
         # objects instead of re-querying and committing each record separately.
+        db.session.flush()  # Persist console reservation metadata before assignment guards run.
         BookingService.insert_vendor_booking_rows(
             vendor_id, transactions, bookings, user, available_game, slot_map, booking_runtime
         )
@@ -7386,7 +7404,7 @@ def extra_booking():
                 vendor_id=vendor_id,
                 user_id=user_id,
                 is_active=True
-            ).first()
+            ).with_for_update().first()
             if not credit_account:
                 return jsonify({
                     "success": False,
@@ -9704,7 +9722,7 @@ def settle_pending_booking_transactions(booking_id):
                 vendor_id=booking.game.vendor_id if booking.game else None,
                 user_id=booking.user_id,
                 is_active=True
-            ).first()
+            ).with_for_update().first()
             if not credit_account:
                 return jsonify({
                     "success": False,
@@ -10800,9 +10818,15 @@ def monthly_credit_eligibility(vendor_id, user_id):
 @booking_blueprint.route('/vendor/<int:vendor_id>/monthly-credit/accounts', methods=['GET', 'PUT'])
 @require_vendor_permission("credit.manage")
 def monthly_credit_accounts(vendor_id):
+    from zoneinfo import ZoneInfo
+    from services.credit_workflow import validate_account, amount_due, SENSITIVE
+    from services.vendor_access import permits
+    from flask import g
+    sensitive = permits(g.vendor_claims,vendor_id,("staff.manage",))
     try:
         if request.method == 'GET':
             rows = MonthlyCreditAccount.query.filter_by(vendor_id=vendor_id).all()
+            ledger = MonthlyCreditLedger.query.filter(MonthlyCreditLedger.account_id.in_([r.id for r in rows])).all() if rows else []
             return jsonify({
                 "success": True,
                 "accounts": [
@@ -10812,6 +10836,7 @@ def monthly_credit_accounts(vendor_id):
                         "user_id": r.user_id,
                         "credit_limit": float(r.credit_limit or 0),
                         "outstanding_amount": float(r.outstanding_amount or 0),
+                        "amount_due": amount_due([e for e in ledger if e.account_id==r.id],r.outstanding_amount,datetime.now(ZoneInfo("Asia/Kolkata")).date()),
                         "billing_cycle_day": r.billing_cycle_day,
                         "grace_days": r.grace_days,
                         "is_active": r.is_active,
@@ -10820,27 +10845,35 @@ def monthly_credit_accounts(vendor_id):
                         "whatsapp_number": r.whatsapp_number,
                         "phone_number": r.phone_number,
                         "email": r.email,
-                        "address_line1": r.address_line1,
-                        "address_line2": r.address_line2,
-                        "city": r.city,
-                        "state": r.state,
-                        "pincode": r.pincode,
-                        "id_proof_type": r.id_proof_type,
-                        "id_proof_number": r.id_proof_number,
+                        "address_line1": r.address_line1 if sensitive else None,
+                        "address_line2": r.address_line2 if sensitive else None,
+                        "city": r.city if sensitive else None,
+                        "state": r.state if sensitive else None,
+                        "pincode": r.pincode if sensitive else None,
+                        "id_proof_type": r.id_proof_type if sensitive else None,
+                        "id_proof_number": r.id_proof_number if sensitive else None,
                     } for r in rows
                 ]
             }), 200
 
         body = request.get_json(silent=True) or {}
         user_id = int(body.get("user_id"))
-        account = MonthlyCreditAccount.query.filter_by(vendor_id=vendor_id, user_id=user_id).first()
+        if not sensitive and any(key in body for key in SENSITIVE):
+            return jsonify(success=False,message="Administrator permission is required to edit identity and address details."),403
+        if body.get("confirmed") is not True:
+            return jsonify(success=False,message="Review and confirm the credit account changes."),400
+        if not User.query.filter_by(id=user_id).first():
+            return jsonify(success=False,message="Gamer not found."),404
+        account = MonthlyCreditAccount.query.filter_by(vendor_id=vendor_id, user_id=user_id).with_for_update().first()
+        limit,day,grace = validate_account(body,float(account.outstanding_amount or 0) if account else 0)
+        old_limit = float(account.credit_limit or 0) if account else 0
         if not account:
             account = MonthlyCreditAccount(vendor_id=vendor_id, user_id=user_id)
             db.session.add(account)
 
-        account.credit_limit = float(body.get("credit_limit", account.credit_limit or 0))
-        account.billing_cycle_day = int(body.get("billing_cycle_day", account.billing_cycle_day or 1))
-        account.grace_days = int(body.get("grace_days", account.grace_days or 5))
+        account.credit_limit = limit
+        account.billing_cycle_day = day
+        account.grace_days = grace
         account.is_active = bool(body.get("is_active", True))
         account.notes = body.get("notes", account.notes)
         account.customer_name = body.get("customer_name", account.customer_name)
@@ -10855,8 +10888,16 @@ def monthly_credit_accounts(vendor_id):
         account.id_proof_type = body.get("id_proof_type", account.id_proof_type)
         account.id_proof_number = body.get("id_proof_number", account.id_proof_number)
 
+        db.session.flush()
+        actor=resolve_transaction_actor(request)
+        db.session.add(MonthlyCreditLedger(account_id=account.id,entry_type="limit_change",amount=0,
+            description=f"Credit limit ₹{old_limit:.2f} → ₹{limit:.2f}; account {'active' if account.is_active else 'paused'}",
+            booked_date=datetime.utcnow().date(),source_channel=actor["source_channel"],staff_id=actor["staff_id"],staff_name=actor["staff_name"]))
         db.session.commit()
         return jsonify({"success": True, "account_id": account.id}), 200
+    except (ValueError,TypeError,KeyError) as e:
+        db.session.rollback()
+        return jsonify(success=False,message=str(e)),400
     except Exception as e:
         db.session.rollback()
         return jsonify({"success": False, "error": str(e)}), 500
@@ -10892,13 +10933,6 @@ def monthly_credit_statement(vendor_id, user_id):
                 "whatsapp_number": account.whatsapp_number,
                 "phone_number": account.phone_number,
                 "email": account.email,
-                "address_line1": account.address_line1,
-                "address_line2": account.address_line2,
-                "city": account.city,
-                "state": account.state,
-                "pincode": account.pincode,
-                "id_proof_type": account.id_proof_type,
-                "id_proof_number": account.id_proof_number,
             },
             "entries": [
                 {
@@ -10933,15 +10967,22 @@ def settle_monthly_credit(vendor_id):
     try:
         body = request.get_json(silent=True) or {}
         user_id = int(body.get("user_id"))
-        amount = float(body.get("amount", 0))
+        from services.credit_workflow import amount as validate_amount
+        amount = validate_amount(body.get("amount",0),positive=True)
+        if body.get("confirmed") is not True:
+            return jsonify(success=False,message="Confirm the payment amount before saving."),400
         mode = str(body.get("mode_of_payment", "UPI"))
+        if mode not in ("UPI","Cash","Bank Transfer"):
+            return jsonify(success=False,message="Choose a valid payment method."),400
         if amount <= 0:
             return jsonify({"success": False, "message": "amount must be > 0"}), 400
 
-        account = MonthlyCreditAccount.query.filter_by(vendor_id=vendor_id, user_id=user_id, is_active=True).first()
+        account = MonthlyCreditAccount.query.filter_by(vendor_id=vendor_id, user_id=user_id).with_for_update().first()
         if not account:
             return jsonify({"success": False, "message": "Monthly credit account not found"}), 404
 
+        if amount > float(account.outstanding_amount or 0):
+            return jsonify(success=False,message="Payment exceeds the current outstanding balance. Refresh the account."),400
         user = User.query.filter_by(id=user_id).first()
         actor = resolve_transaction_actor(request)
 
@@ -11002,7 +11043,37 @@ def settle_monthly_credit(vendor_id):
             "transaction_id": transaction.id,
             "remaining_outstanding": float(account.outstanding_amount or 0),
         }), 200
+    except (ValueError,TypeError) as e:
+        db.session.rollback()
+        return jsonify(success=False,message=str(e)),400
     except Exception as e:
         db.session.rollback()
         current_app.logger.exception("Monthly settlement failed: %s", e)
         return jsonify({"success": False, "error": str(e)}), 500
+
+@booking_blueprint.route('/vendor/<int:vendor_id>/monthly-credit/adjust', methods=['POST'])
+@require_vendor_permission('credit.manage')
+def adjust_monthly_credit(vendor_id):
+    from services.credit_workflow import amount
+    try:
+        body=request.get_json(silent=True) or {}
+        change=amount(body.get('amount'),signed=True)
+        reason=str(body.get('reason') or '').strip()
+        if not change or not 5<=len(reason)<=200 or body.get('confirmed') is not True:
+            raise ValueError('Enter an adjustment, a reason (5–200 characters), and confirm the change.')
+        account=MonthlyCreditAccount.query.filter_by(vendor_id=vendor_id,user_id=int(body['user_id'])).with_for_update().first()
+        if not account:return jsonify(success=False,message='Credit account not found.'),404
+        balance=round(float(account.outstanding_amount or 0)+change,2)
+        if balance<0 or balance>float(account.credit_limit or 0):raise ValueError('Adjustment must keep the balance between zero and the credit limit.')
+        actor=resolve_transaction_actor(request)
+        account.outstanding_amount=balance
+        db.session.add(MonthlyCreditLedger(account_id=account.id,entry_type='adjustment',amount=change,
+            description=reason,booked_date=datetime.utcnow().date(),due_date=datetime.utcnow().date(),
+            source_channel=actor['source_channel'],staff_id=actor['staff_id'],staff_name=actor['staff_name']))
+        db.session.commit()
+        return jsonify(success=True,outstanding_amount=balance)
+    except (ValueError,TypeError,KeyError) as e:
+        db.session.rollback();return jsonify(success=False,message=str(e)),400
+    except Exception:
+        db.session.rollback();current_app.logger.exception('Credit adjustment failed')
+        return jsonify(success=False,message='Unable to record adjustment.'),500
