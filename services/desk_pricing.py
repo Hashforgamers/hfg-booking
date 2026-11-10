@@ -28,6 +28,10 @@ def validate_definition(raw):
     if not isinstance(raw.get("controllers_included", False), bool):
         raise ValueError("Choose whether controllers are included.")
     result["controllers_included"] = raw.get("controllers_included", False)
+    ids = raw.get("console_ids", [])
+    if not isinstance(ids, list) or len(ids) > 1000:
+        raise ValueError("Choose up to 1,000 physical consoles.")
+    result["console_ids"] = sorted(set(integer(cid,1,2147483647,"Console") for cid in ids))
     rules = raw.get("rules")
     if not isinstance(rules, list) or not 1 <= len(rules) <= 100:
         raise ValueError("Add between 1 and 100 price rules.")
