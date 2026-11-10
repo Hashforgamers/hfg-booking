@@ -5172,7 +5172,14 @@ def new_booking(vendor_id):
         if not 0 <= extra_controller_qty <= 64:
             return jsonify({"message": "extraControllerQty must be between 0 and 64"}), 400
 
-        controllers_included = data.get("deskProfile") in ("ps55", "ps65", "gta55", "gta65")
+        controllers_included = False
+        selected_desk_card = None
+        if data.get("deskProfile"):
+            from controllers.desk_operations import get_desk_card
+            selected_desk_card = get_desk_card(vendor_id, available_game.id, data["deskProfile"])
+            if data.get("deskRevision") is not None and data["deskRevision"] != selected_desk_card["revision"]:
+                raise ValueError("The rate changed. Refresh and review the new price.")
+            controllers_included = selected_desk_card["definition"]["controllers_included"]
         if controllers_included or not is_controller_pricing_supported(available_game.game_name, vendor_id=vendor_id):
             # PC/VR and other unsupported console types should never carry controller surcharge.
             extra_controller_qty = 0
@@ -5594,7 +5601,7 @@ def new_booking(vendor_id):
             for s in Slot.query.filter(Slot.id.in_([b.slot_id for b in bookings])).all()
         }
         desk_prices = {}
-        active_desk_rates = db.session.execute(text("SELECT 1 FROM desk_rate_cards WHERE vendor_id=:vendor AND game_id=:game AND is_active=true LIMIT 1"), dict(vendor=vendor_id, game=available_game.id)).first()
+        active_desk_rates = db.session.execute(text("SELECT 1 FROM desk_pricing_settings WHERE vendor_id=:vendor AND game_id=:game AND mode='variants'"), dict(vendor=vendor_id, game=available_game.id)).first()
         if active_desk_rates and not data.get("deskProfile"):
             raise ValueError("This device uses variant pricing. Open New Gaming Session and choose its session rate.")
         if not active_desk_rates and data.get("deskProfile"):
@@ -5603,7 +5610,7 @@ def new_booking(vendor_id):
             from controllers.desk_operations import desk_slot_prices
             desk_prices = desk_slot_prices(vendor_id, available_game.id, data["deskProfile"],
                                           int(normalized_squad_details.get("player_count", 1)),
-                                          runtime_slot_map.values())
+                                          runtime_slot_map.values(), revision=selected_desk_card["revision"])
             expected = sum(round(amount * 100) for amount in desk_prices.values())
             if round(float(data.get("deskSubtotal", -1)) * 100) != expected:
                 raise ValueError("The desk rate changed. Refresh and review the new price.")
@@ -5614,6 +5621,11 @@ def new_booking(vendor_id):
                 pricing_details["desk_pricing"] = {
                     "mode": "variants" if desk_prices else "slot",
                     "profile": data.get("deskProfile"),
+                    "revision": selected_desk_card["revision"] if selected_desk_card else None,
+                    "rate_name": selected_desk_card["definition"]["name"] if selected_desk_card else None,
+                    "model_name": selected_desk_card["definition"]["model_name"] if selected_desk_card else None,
+                    "screen_size_inches": selected_desk_card["definition"]["screen_size_inches"] if selected_desk_card else None,
+                    "game_variant": selected_desk_card["definition"]["game_variant"] if selected_desk_card else None,
                     "slot_base_amount": desk_prices.get(int(booking.slot_id)),
                 }
                 booking.squad_details = pricing_details
