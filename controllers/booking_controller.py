@@ -1575,19 +1575,6 @@ def _build_squad_member_bindings(captain_user, captain_name: str, captain_phone:
     return bindings
 
 
-def _is_slot_live_now_ist(slot_date, start_time, end_time) -> bool:
-    if not slot_date or not start_time or not end_time:
-        return False
-    now_ist = datetime.now(IST).replace(tzinfo=None)
-    if slot_date != now_ist.date():
-        return False
-    start_dt = datetime.combine(slot_date, start_time)
-    end_dt = datetime.combine(slot_date, end_time)
-    if end_dt <= start_dt:
-        end_dt += timedelta(days=1)
-    return start_dt <= now_ist <= end_dt
-
-
 def _reserve_specific_console(vendor_id: int, game_id: int, console_id: int):
     table_name = f"VENDOR_{vendor_id}_CONSOLE_AVAILABILITY"
     row = db.session.execute(
@@ -5875,16 +5862,24 @@ def new_booking(vendor_id):
                 credit_account.outstanding_amount = float(credit_account.outstanding_amount or 0) + extra_controller_fare
 
         # Resolve runtime lifecycle and console assignment.
-        # If slot is live in IST, assign console now and start as current.
+        # Start contiguous slots from this checkout on the same reserved consoles.
         booked_for_date_obj = booked_date_obj
         slot_map = runtime_slot_map
         booking_runtime = {}
-        for booking in bookings:
-            slot_obj = slot_map.get(int(booking.slot_id))
+        reserved_console_ids = []
+        previous_live_end = None
+        now_ist = datetime.now(IST).replace(tzinfo=None)
+        ordered_bookings = sorted(bookings, key=lambda booking: slot_map[int(booking.slot_id)].start_time)
+        for booking in ordered_bookings:
+            slot_obj = slot_map[int(booking.slot_id)]
             runtime_status = "upcoming"
             runtime_console_id = desk_console_ids[0] if desk_console_ids else (int(console_id) if console_id is not None else -1)
 
-            if slot_obj and _is_slot_live_now_ist(booked_for_date_obj, slot_obj.start_time, slot_obj.end_time):
+            slot_start, slot_end = _slot_window_for_date(booked_for_date_obj, slot_obj.start_time, slot_obj.end_time)
+            if slot_start != previous_live_end:
+                reserved_console_ids = []
+            is_continuation = bool(reserved_console_ids)
+            if is_continuation or slot_start <= now_ist < slot_end:
                 is_pc_squad = bool(
                     squad_enabled and _requires_multi_console_units(available_game.game_name or "", vendor_id=vendor_id)
                 )
@@ -5895,34 +5890,35 @@ def new_booking(vendor_id):
                 )
                 required_console_count = max(required_console_count, 1)
 
-                reserved_console_ids = []
-                if desk_console_ids:
-                    for cid in desk_console_ids:
-                        reserved = _reserve_specific_console(vendor_id,available_game.id,cid)
-                        if reserved is None:
-                            raise ValueError("The reserved console is busy. Refresh before starting this session.")
-                        reserved_console_ids.append(reserved)
-                if not desk_console_ids and is_rapid_booking and console_id is not None:
-                    reserved_specific = _reserve_specific_console(
-                        vendor_id=vendor_id,
-                        game_id=available_game.id,
-                        console_id=int(console_id),
-                    )
-                    if reserved_specific is not None:
-                        reserved_console_ids.append(int(reserved_specific))
-
-                remaining_needed = required_console_count - len(reserved_console_ids)
-                if remaining_needed > 0:
-                    reserved_console_ids.extend(
-                        _reserve_multiple_consoles(
+                if not is_continuation:
+                    if desk_console_ids:
+                        for cid in desk_console_ids:
+                            reserved = _reserve_specific_console(vendor_id,available_game.id,cid)
+                            if reserved is None:
+                                raise ValueError("The reserved console is busy. Refresh before starting this session.")
+                            reserved_console_ids.append(reserved)
+                    if not desk_console_ids and is_rapid_booking and console_id is not None:
+                        reserved_specific = _reserve_specific_console(
                             vendor_id=vendor_id,
                             game_id=available_game.id,
-                            quantity=remaining_needed,
+                            console_id=int(console_id),
                         )
-                    )
+                        if reserved_specific is not None:
+                            reserved_console_ids.append(int(reserved_specific))
+
+                    remaining_needed = required_console_count - len(reserved_console_ids)
+                    if remaining_needed > 0:
+                        reserved_console_ids.extend(
+                            _reserve_multiple_consoles(
+                                vendor_id=vendor_id,
+                                game_id=available_game.id,
+                                quantity=remaining_needed,
+                            )
+                        )
 
                 if len(reserved_console_ids) >= required_console_count:
                     reserved_console_ids = reserved_console_ids[:required_console_count]
+                    previous_live_end = slot_end
                     runtime_status = "current"
                     runtime_console_id = int(reserved_console_ids[0])
                     booking.status = "checked_in"
@@ -5969,6 +5965,7 @@ def new_booking(vendor_id):
                 else:
                     if reserved_console_ids:
                         _release_reserved_consoles(vendor_id=vendor_id, console_ids=reserved_console_ids)
+                        reserved_console_ids = []
                     current_app.logger.warning(
                         "Insufficient consoles for live booking_id=%s vendor_id=%s game_id=%s required=%s reserved=%s",
                         booking.id, vendor_id, available_game.id, required_console_count, len(reserved_console_ids)
