@@ -10486,42 +10486,116 @@ def kiosk_book_next_slot(vendor_id):
         return jsonify({"success": False, "message": "Server error", "error": str(e)}), 500
 
 
+def _booking_record_filters(day, starts):
+    filters = []
+    date_from = request.args.get('date_from')
+    date_to = request.args.get('date_to')
+    lower = _coerce_date_value(date_from) if date_from else None
+    upper = _coerce_date_value(date_to) if date_to else None
+    if (date_from and not lower) or (date_to and not upper) or (lower and upper and lower > upper):
+        raise ValueError('Invalid date range')
+    if lower:
+        filters.append(day >= lower)
+    if upper:
+        filters.append(day <= upper)
+
+    time_from = request.args.get('time_from')
+    time_to = request.args.get('time_to')
+    start = datetime.strptime(time_from, '%H:%M').time() if time_from else None
+    end = datetime.strptime(time_to, '%H:%M').time() if time_to else None
+    if start and end and start > end:
+        filters.append(or_(starts >= start, starts <= end))
+    else:
+        if start is not None:
+            filters.append(starts >= start)
+        if end is not None:
+            filters.append(starts <= end)
+    return filters
+
+
+def _booking_records_page(vendor_id, page, page_size):
+    from sqlalchemy import Integer, case, column, literal, null, select, table, union_all
+    from sqlalchemy.dialects.postgresql import ARRAY, aggregate_order_by
+
+    archive = table('desk_booking_archive', *(column(name) for name in (
+        'vendor_id', 'source_key', 'played_on', 'started', 'ended', 'player', 'device', 'paid',
+    )))
+    slots = (select(Booking.id, Booking.access_code_id, Booking.user_id, Booking.game_id,
+                    func.max(Transaction.booked_date).label('played_on'),
+                    Slot.start_time.label('started'), Slot.end_time.label('ended'))
+             .select_from(Booking)
+             .join(Transaction, Transaction.booking_id == Booking.id)
+             .join(Slot, Slot.id == Booking.slot_id)
+             .where(Transaction.vendor_id == vendor_id)
+             .group_by(Booking.id, Booking.access_code_id, Booking.user_id, Booking.game_id,
+                       Slot.start_time, Slot.end_time).cte('record_slots'))
+
+    # Access codes identify a checkout. A gap starts a separate session within it.
+    partition = [slots.c.access_code_id, slots.c.user_id, slots.c.game_id, slots.c.played_on]
+    order = [slots.c.started, slots.c.id]
+    previous_end = func.lag(slots.c.ended).over(partition_by=partition, order_by=order)
+    new_session = case((slots.c.access_code_id.is_not(None) & (previous_end == slots.c.started), 0), else_=1)
+    boundaries = select(slots, new_session.label('new_session')).cte('session_boundaries')
+    numbered = select(boundaries, func.sum(boundaries.c.new_session).over(
+        partition_by=[boundaries.c[col.key] for col in partition],
+        order_by=[boundaries.c[col.key] for col in order], rows=(None, 0)
+    ).label('session_number')).cte('numbered_slots')
+    session_start = func.min(numbered.c.started)
+    native = (select(literal(False).label('imported'), cast(func.min(numbered.c.id), String).label('record_key'),
+                     numbered.c.played_on, session_start.label('started'),
+                     func.array_agg(aggregate_order_by(numbered.c.id, numbered.c.started, numbered.c.id)).label('booking_ids'))
+              .group_by(numbered.c.access_code_id, numbered.c.user_id, numbered.c.game_id,
+                        numbered.c.played_on, numbered.c.session_number)
+              .having(*_booking_record_filters(numbered.c.played_on, session_start)))
+    imported = select(literal(True), archive.c.source_key, archive.c.played_on, archive.c.started,
+                      cast(null(), ARRAY(Integer))).where(
+        archive.c.vendor_id == vendor_id, *_booking_record_filters(archive.c.played_on, archive.c.started)
+    )
+    records = union_all(native, imported).subquery()
+    total = db.session.execute(select(func.count()).select_from(records)).scalar_one()
+    keys = db.session.execute(
+        select(records.c.imported, records.c.record_key, records.c.booking_ids)
+        .order_by(records.c.played_on.desc().nullslast(), records.c.started.desc().nullslast(),
+                  records.c.imported, records.c.record_key.desc())
+        .offset((page - 1) * page_size).limit(page_size)
+    ).all()
+    archive_keys = [key for is_imported, key, _ in keys if is_imported]
+    archive_records = {}
+    if archive_keys:
+        rows = db.session.execute(select(archive).where(
+            archive.c.vendor_id == vendor_id, archive.c.source_key.in_(archive_keys)
+        )).mappings()
+        archive_records = {row['source_key']: {
+            'booking_id': f"import:{row['source_key']}",
+            'booking_fid': 'Excel import',
+            'customer_name': row['player'],
+            'device': row['device'],
+            'booking_date': row['played_on'].isoformat(),
+            'slot_start_time': row['started'].strftime('%I:%M %p'),
+            'slot_end_time': row['ended'].strftime('%I:%M %p'),
+            'status': 'completed',
+            'amount_paid': float(row['paid']),
+        } for row in rows}
+    return keys, archive_records, total
+
+
 @booking_blueprint.route('/vendor/<int:vendor_id>/booking-records', methods=['GET'])
+@require_vendor_permission("booking.manage")
+def get_booking_records(vendor_id):
+    return get_slot_bookings(vendor_id, records_view=True)
+
+
 @booking_blueprint.route('/vendor/<int:vendor_id>/slot-bookings', methods=['GET'])
-def get_slot_bookings(vendor_id):
+def get_slot_bookings(vendor_id, records_view=False):
     """Read slot bookings or paginated vendor booking records."""
     try:
-        records_view = request.path.endswith('/booking-records')
         booking_date = None
         filters = [Transaction.vendor_id == vendor_id]
         page, page_size = 1, 25
         try:
             if records_view:
                 page = max(1, int(request.args.get('page', 1)))
-                for param, column, lower in [
-                    ('date_from', Transaction.booked_date, True),
-                    ('date_to', Transaction.booked_date, False),
-                ]:
-                    raw = request.args.get(param)
-                    if raw:
-                        value = _coerce_date_value(raw)
-                        if not value:
-                            raise ValueError('Invalid date filter')
-                        filters.append(column >= value if lower else column <= value)
-                if request.args.get('date_from') and request.args.get('date_to'):
-                    if _coerce_date_value(request.args['date_from']) > _coerce_date_value(request.args['date_to']):
-                        raise ValueError('Start date must be before end date')
-                time_from = request.args.get('time_from')
-                time_to = request.args.get('time_to')
-                for raw, lower in [(time_from, True), (time_to, False)]:
-                    if raw:
-                        value = datetime.strptime(raw, '%H:%M').time()
-                        filters.append(Slot.start_time >= value if lower else Slot.start_time <= value)
-                if time_from and time_to and time_from > time_to:
-                    # Overnight start-time window, e.g. 22:00–02:00.
-                    filters = filters[:-2]
-                    filters.append(or_(Slot.start_time >= datetime.strptime(time_from, '%H:%M').time(),
-                                       Slot.start_time <= datetime.strptime(time_to, '%H:%M').time()))
+                keys, archive_records, total = _booking_records_page(vendor_id, page, page_size)
             else:
                 slot_ids_param = request.args.get('slot_ids')
                 booking_date = _coerce_date_value(request.args.get('date'))
@@ -10541,10 +10615,10 @@ def get_slot_bookings(vendor_id):
                           joinedload(Booking.booking_extra_services).joinedload(BookingExtraService.extra_service_menu),
                           joinedload(Booking.squad_members))
                  .distinct())
-        total = query.count() if records_view else None
-        query = query.order_by(Booking.id.desc())
         if records_view:
-            query = query.offset((page - 1) * page_size).limit(page_size)
+            query = query.filter(Booking.id.in_([bid for imported, _, ids in keys if not imported for bid in ids]))
+        else:
+            query = query.order_by(Booking.id.desc())
         bookings_query = query.all()
 
         current_app.logger.info(f"Found {len(bookings_query)} bookings")
@@ -10621,6 +10695,29 @@ def get_slot_bookings(vendor_id):
                 'squad_details': squad_details,
             })
         
+        if records_view:
+            native_records = {row['booking_id']: row for row in bookings_data}
+            bookings_data = []
+            for imported, key, ids in keys:
+                if imported:
+                    if key in archive_records:
+                        bookings_data.append(archive_records[key])
+                    continue
+                session = [native_records[bid] for bid in ids if bid in native_records]
+                if not session:
+                    continue
+                record = dict(session[0])
+                record['slot_end_time'] = session[-1]['slot_end_time']
+                record['amount_paid'] = round(sum(row['amount_paid'] for row in session), 2)
+                statuses = {row['status'] for row in session}
+                if len(statuses) > 1:
+                    record['status'] = 'checked_in' if 'checked_in' in statuses else 'mixed'
+                meals = [meal for row in session for meal in row['meals']]
+                record['meals'] = meals
+                if meals:
+                    record['meal_selection'] = ", ".join(f"{meal['quantity']}x {meal['name']}" for meal in meals)
+                bookings_data.append(record)
+
         return jsonify({
             'success': True,
             'bookings': bookings_data,

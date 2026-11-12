@@ -18,7 +18,7 @@ def database_error(error):
     db.session.rollback()
     current_app.logger.exception("Desk operations database request failed")
     code = getattr(getattr(error, "orig", None), "pgcode", None)
-    if code in ("42P01", "42703", "42P10", "23502"):
+    if code in ("42P01", "42703", "42P10", "42883", "23502"):
         return jsonify(error="Booking database setup is incomplete. Apply the latest desk pricing and history migrations to the booking database, then retry. No rows in this batch were saved."), 503
     return jsonify(error="Could not save or load desk data. Please retry. No rows in this batch were saved."), 503
 
@@ -229,6 +229,8 @@ def import_history(vendor_id):
         WHERE (transactions.user_name,transactions.booked_date,transactions.booking_date,transactions.booking_time,transactions.amount)
               IS DISTINCT FROM (excluded.user_name,excluded.booked_date,excluded.booking_date,excluded.booking_time,excluded.amount)
     """).bindparams(bindparam("keys", expanding=True)), {"vendor":vendor_id, "keys":[p["key"] for p in parameters]})
+    db.session.execute(text("SELECT link_imported_history_gamers(:vendor, :keys)"),
+                       {"vendor": vendor_id, "keys": [p["key"] for p in parameters]})
     db.session.commit()
     return jsonify(inserted=inserted, skipped=len(rows)-inserted, transactions_saved=posted.rowcount)
 
