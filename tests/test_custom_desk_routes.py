@@ -49,7 +49,7 @@ def env(monkeypatch):
         db.session.rollback();db.session.execute(text(f'DROP SCHEMA {schema} CASCADE'));db.session.commit();db.session.remove();db.engine.dispose()
 
 def card():
-    return dict(game_id=1,profile='custom_example',definition=dict(name='Premium',model_name='Weekend group',screen_size_inches=77,game_variant='Custom game',controllers_included=True,rules=[dict(min_minutes=1,max_minutes=None,min_players=1,max_players=8,amount='99.50',unit_minutes=45,per_player=True)]))
+    return dict(game_id=1,profile='custom_example',definition=dict(name='Premium',model_name='Weekend group',screen_size_inches=77,game_variant='',controllers_included=True,rules=[dict(min_minutes=1,max_minutes=None,min_players=1,max_players=8,amount='99.50',unit_minutes=45,per_player=True)]))
 
 def test_custom_pricing_lifecycle_and_scope(env):
     e=env;url='/api/vendor/1/desk-rates'
@@ -113,3 +113,34 @@ def test_assignment_guard_blocks_wrong_console_and_other_bookings(env):
         env.db.session.execute(text("INSERT INTO vendor_1_dashboard VALUES(2,12,'current','2030-01-01','10:30','11:30')"))
     env.db.session.rollback()
     env.db.session.execute(text("UPDATE vendor_1_dashboard SET book_status='current' WHERE book_id=1"));env.db.session.commit()
+
+
+def test_special_game_rate_preserves_standard_pricing_and_enforces_scope(env):
+    e = env
+    normal = card()
+    assert e.client.put('/api/vendor/1/desk-rates',json=normal).status_code == 200
+    premium = card()
+    premium['profile'] = 'gta6'
+    premium['definition']['game_variant'] = 'GTA 6'
+    premium['definition']['rules'][0]['amount'] = '250'
+    assert e.client.put('/api/vendor/1/desk-rates',json=premium).status_code == 200
+    slots = [types.SimpleNamespace(id=1,start_time=time(10),end_time=time(11))]
+    with pytest.raises(ValueError, match='match this game'):
+        e.module.desk_slot_prices(1,1,normal['profile'],1,slots,pricing_game='GTA6')
+    with pytest.raises(ValueError, match='match this game'):
+        e.module.desk_slot_prices(1,1,'gta6',1,slots,pricing_game='')
+    assert sum(e.module.desk_slot_prices(1,1,'gta6',1,slots,pricing_game='GTA6').values()) == 333.33
+    assert sum(e.module.desk_slot_prices(1,1,normal['profile'],1,slots,pricing_game='').values()) == 132.67
+
+
+def test_special_only_card_does_not_enable_variants_for_other_games(env):
+    e = env
+    special = card()
+    special['definition']['game_variant'] = 'GTA 6'
+    assert e.client.put('/api/vendor/1/desk-rates',json=special).status_code == 200
+    assert e.client.get('/api/vendor/1/desk-rates').json[0]['pricing_mode'] == 'slot'
+    assert e.client.put('/api/vendor/1/desk-rates/mode',json={'game_id':1,'mode':'variants'}).status_code == 400
+    assert e.client.patch('/api/vendor/1/desk-rates',json={'game_id':1,'profile':special['profile'],'revision':1,'is_active':True}).status_code == 200
+    assert e.client.get('/api/vendor/1/desk-rates').json[0]['pricing_mode'] == 'slot'
+    slots = [types.SimpleNamespace(id=1,start_time=time(10),end_time=time(11))]
+    assert sum(e.module.desk_slot_prices(1,1,special['profile'],1,slots,pricing_game='GTA6').values()) == 132.67

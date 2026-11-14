@@ -1,3 +1,4 @@
+from services.legacy_pass_checkout import pass_order_auth, is_legacy_pass_request, is_legacy_pass_order, claim_legacy_payment, LEGACY_PASS_VERSION
 from flask import Blueprint, request, jsonify, current_app, g,  make_response
 from services.booking_service import BookingService
 from services.cafe_payment_policy import PLATFORM_PURPOSES, cafe_context_required
@@ -79,7 +80,7 @@ import requests
 import hmac
 import hashlib
 import razorpay
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 from services.security import auth_required_self
@@ -2769,7 +2770,7 @@ def _trigger_pay_at_cafe_action_async(booking_id: int, vendor_id: int, action: s
 
 
 @booking_blueprint.route('/create_order', methods=['POST'])
-@auth_required_self(decrypt_user=True)
+@pass_order_auth
 def create_order():
     if getattr(g, 'token_expired', False):
         return jsonify(message='Token expired'), 401
@@ -2801,12 +2802,13 @@ def create_order():
         if isinstance(amount, bool) or Decimal(str(amount)) != Decimal(str(amount)).to_integral_value():
             raise ValueError('Invalid amount')
         amount = int(amount)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, InvalidOperation, OverflowError):
         return jsonify({"error": "amount must be a positive integer in paise"}), 400
     if amount <= 0 or str(currency).upper() != "INR":
         return jsonify({"error": "only positive INR orders are supported"}), 400
     # Do not let client-controlled receipts/notes be used as booking evidence.
-    receipt = f"bk_{int(g.auth_user_id)}_{uuid.uuid4().hex[:24]}"
+    legacy_pass = is_legacy_pass_request(data)
+    receipt = f"pass_{uuid.uuid4().hex}" if legacy_pass else f"bk_{int(g.auth_user_id)}_{uuid.uuid4().hex[:24]}"
 
     RAZORPAY_KEY_ID = current_app.config.get("RAZORPAY_KEY_ID")
     RAZORPAY_KEY_SECRET = current_app.config.get("RAZORPAY_KEY_SECRET")
@@ -2823,11 +2825,14 @@ def create_order():
         "payment_capture": 1,
         "notes": {
             "source": "hfg_booking",
-            "user_id": str(int(g.auth_user_id)),
+            "user_id": str(int(g.auth_user_id)) if getattr(g, "auth_user_id", None) is not None else "",
         },
     }
 
-    if pass_id is not None:
+    if legacy_pass:
+        payload['notes']['purpose'] = 'game_pass'
+        payload['notes']['checkout_version'] = LEGACY_PASS_VERSION
+    elif pass_id is not None:
         payload['notes']['cafe_pass_id'] = str(pass_id)
         payload['notes']['purpose'] = 'pass_purchase'
     elif getattr(g, 'platform_order_purpose', None):
@@ -2875,11 +2880,29 @@ def capture_payment():
         if str(payment.get("order_id") or "") != str(order_id):
             return jsonify({"message": "Payment does not belong to the supplied order"}), 400
         order = razorpay_client.order.fetch(order_id)
+        if is_legacy_pass_order(order):
+            owner = (order.get('notes') or {}).get('user_id')
+            if owner and str(owner) != str(int(g.auth_user_id)):
+                return jsonify(message='Payment order does not belong to this user'), 403
+            if payment.get('status') == 'authorized':
+                payment = razorpay_client.payment.capture(payment_id, payment['amount'])
+            try:
+                if payment.get('id') != payment_id or payment.get('order_id') != order_id:
+                    raise ValueError('Gateway payment identifiers do not match checkout')
+                claim_legacy_payment(int(g.auth_user_id), payment, order_id)
+            except ValueError as error:
+                db.session.rollback()
+                return jsonify(message=str(error)), 409
+            return jsonify(message='Pass payment verified successfully'), 200
+
         owner_note = (order.get("notes") or {}).get("user_id") or (payment.get("notes") or {}).get("user_id")
         if str(owner_note or "") != str(int(g.auth_user_id)):
             return jsonify({"message": "Payment order does not belong to this user"}), 403
 
-        if getattr(g, 'require_platform_order', False) and (order.get('notes') or {}).get('purpose') not in PLATFORM_PURPOSES:
+        if (getattr(g, 'require_platform_order', False)
+                and (order.get('notes') or {}).get('purpose') not in PLATFORM_PURPOSES
+                and not ((order.get('notes') or {}).get('purpose') == 'pass_purchase'
+                         and (order.get('notes') or {}).get('cafe_pass_id'))):
             return cafe_context_required()
 
         if payment['status'] == 'authorized':
@@ -5592,13 +5615,17 @@ def new_booking(vendor_id):
         active_desk_rates = db.session.execute(text("SELECT 1 FROM desk_pricing_settings WHERE vendor_id=:vendor AND game_id=:game AND mode='variants'"), dict(vendor=vendor_id, game=available_game.id)).first()
         if active_desk_rates and not data.get("deskProfile"):
             raise ValueError("This device uses variant pricing. Open New Gaming Session and choose its session rate.")
-        if not active_desk_rates and data.get("deskProfile"):
+        if data.get("pricingGame") and not data.get("deskProfile"):
+            raise ValueError("Choose a rate for the selected special game.")
+        if (not active_desk_rates and data.get("deskProfile")
+                and not (selected_desk_card and selected_desk_card["definition"].get("game_variant"))):
             raise ValueError("This device now uses slot pricing. Refresh and review the price.")
         if data.get("deskProfile"):
             from controllers.desk_operations import desk_slot_prices
             desk_prices = desk_slot_prices(vendor_id, available_game.id, data["deskProfile"],
                                           int(normalized_squad_details.get("player_count", 1)),
-                                          runtime_slot_map.values(), revision=selected_desk_card["revision"])
+                                          runtime_slot_map.values(), revision=selected_desk_card["revision"],
+                                          pricing_game=data.get("pricingGame", ""))
             expected = sum(round(amount * 100) for amount in desk_prices.values())
             if round(float(data.get("deskSubtotal", -1)) * 100) != expected:
                 raise ValueError("The desk rate changed. Refresh and review the new price.")
@@ -5624,6 +5651,7 @@ def new_booking(vendor_id):
                     "model_name": selected_desk_card["definition"]["model_name"] if selected_desk_card else None,
                     "screen_size_inches": selected_desk_card["definition"]["screen_size_inches"] if selected_desk_card else None,
                     "game_variant": selected_desk_card["definition"]["game_variant"] if selected_desk_card else None,
+                    "selected_game": data.get("pricingGame", ""),
                     "slot_base_amount": desk_prices.get(int(booking.slot_id)),
                 }
                 booking.squad_details = pricing_details

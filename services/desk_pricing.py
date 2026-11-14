@@ -101,3 +101,17 @@ def legacy_definition(profile, rates):
         game_variant='GTA6' if profile.startswith('gta') else '',
         screen_size_inches=int(profile[-2:]) if profile.startswith(('ps','gta')) else None,
         controllers_included=profile.startswith(('ps','gta'))))
+
+
+def game_rate_key(value):
+    import re
+    if not isinstance(value, str) or len(value) > 120:
+        raise ValueError('Choose a game title of up to 120 characters.')
+    return re.sub(r'[^a-z0-9]+', '', value.strip().lower())
+
+
+def rates_for_game(definitions, selected_game):
+    """A title override replaces standard rates before duration/player matching."""
+    key = game_rate_key(selected_game)
+    special = [d for d in definitions if key and game_rate_key(d.get('game_variant', '')) == key]
+    return special or [d for d in definitions if not game_rate_key(d.get('game_variant', ''))]
