@@ -10,7 +10,7 @@ from sqlalchemy import bindparam
 
 from db.extensions import db
 from services.vendor_access import require_vendor_permission
-from services.desk_pricing import validate_definition, legacy_definition, quote
+from services.desk_pricing import validate_definition, legacy_definition, quote, rates_for_game
 
 desk = Blueprint("desk_operations", __name__)
 @desk.errorhandler(SQLAlchemyError)
@@ -80,7 +80,7 @@ def save_rates(vendor_id):
                 definition=excluded.definition,revision=desk_rate_cards.revision+1
             RETURNING revision""").bindparams(bindparam("rates", type_=JSONB),bindparam("definition",type_=JSONB))
         revision = db.session.execute(stmt,dict(vendor=vendor_id,game=game,profile=profile,rates=rates,definition=definition)).scalar()
-        if existing is None:
+        if existing is None and not definition.get("game_variant"):
             db.session.execute(text("""INSERT INTO desk_pricing_settings(vendor_id,game_id,mode)
                 VALUES(:v,:g,'variants') ON CONFLICT(vendor_id,game_id) DO UPDATE SET mode='variants'"""),dict(v=vendor_id,g=game))
         db.session.commit()
@@ -105,7 +105,8 @@ def maintain_rate(vendor_id):
         if not result.rowcount:
             db.session.rollback()
             return jsonify(error="Rate not found or changed. Reload before trying again."),409
-        if data.get('is_active') is True and not data.get('archived'):
+        special = db.session.execute(text("SELECT definition->>'game_variant' FROM desk_rate_cards WHERE vendor_id=:v AND game_id=:g AND profile=:p"), dict(v=vendor_id,g=int(data['game_id']),p=data['profile'])).scalar()
+        if data.get('is_active') is True and not data.get('archived') and not special:
             db.session.execute(text("""INSERT INTO desk_pricing_settings(vendor_id,game_id,mode)
                 VALUES(:v,:g,'variants') ON CONFLICT(vendor_id,game_id) DO UPDATE SET mode='variants'"""),dict(v=vendor_id,g=int(data['game_id'])))
         db.session.commit()
@@ -125,9 +126,9 @@ def set_rate_mode(vendor_id):
             raise ValueError()
         if not db.session.execute(text("SELECT id FROM available_games WHERE vendor_id=:vendor AND id=:game"), dict(vendor=vendor_id,game=game)).first():
             raise ValueError()
-        if data["mode"] == "variants" and not db.session.execute(text("SELECT 1 FROM desk_rate_cards WHERE vendor_id=:v AND game_id=:g AND archived=false AND is_active=true LIMIT 1"),dict(v=vendor_id,g=game)).first():
+        if data["mode"] == "variants" and not db.session.execute(text("SELECT 1 FROM desk_rate_cards WHERE vendor_id=:v AND game_id=:g AND archived=false AND is_active=true AND COALESCE(definition->>'game_variant','') = '' LIMIT 1"),dict(v=vendor_id,g=game)).first():
             db.session.rollback()
-            return jsonify(error="Enable or create a rate card before switching to custom pricing."),400
+            return jsonify(error="Enable or create a standard rate card before switching to custom pricing."),400
         db.session.execute(text("""INSERT INTO desk_pricing_settings(vendor_id,game_id,mode)
             VALUES(:v,:g,:mode) ON CONFLICT(vendor_id,game_id) DO UPDATE SET mode=excluded.mode"""),dict(v=vendor_id,g=game,mode=data['mode']))
         db.session.commit()
@@ -139,15 +140,22 @@ def set_rate_mode(vendor_id):
 
 def get_desk_card(vendor, game, profile):
     row = db.session.execute(text("""SELECT c.definition,c.rates,c.profile,c.revision FROM desk_rate_cards c
-        JOIN desk_pricing_settings s ON s.vendor_id=c.vendor_id AND s.game_id=c.game_id AND s.mode='variants'
-        WHERE c.vendor_id=:v AND c.game_id=:g AND c.profile=:p AND c.is_active=true AND c.archived=false"""),dict(v=vendor,g=game,p=profile)).mappings().first()
+        LEFT JOIN desk_pricing_settings s ON s.vendor_id=c.vendor_id AND s.game_id=c.game_id
+        WHERE c.vendor_id=:v AND c.game_id=:g AND c.profile=:p AND c.is_active=true AND c.archived=false
+        AND (s.mode='variants' OR COALESCE(c.definition->>'game_variant','') <> '')"""),dict(v=vendor,g=game,p=profile)).mappings().first()
     if not row:
         raise ValueError("This rate is no longer active. Refresh and choose a current rate.")
     return dict(definition=row['definition'] or legacy_definition(row['profile'],row['rates']),revision=row['revision'])
 
 
-def desk_slot_prices(vendor, game, profile, players, slots, revision=None):
+def desk_slot_prices(vendor, game, profile, players, slots, revision=None, pricing_game=None):
     card = get_desk_card(vendor,game,profile)
+    if pricing_game is not None:
+        rows = db.session.execute(text("""SELECT definition, profile, rates FROM desk_rate_cards
+            WHERE vendor_id=:v AND game_id=:g AND is_active=true AND archived=false"""), dict(v=vendor,g=game)).mappings()
+        definitions = [row['definition'] or legacy_definition(row['profile'],row['rates']) for row in rows]
+        if card['definition'] not in rates_for_game(definitions, pricing_game):
+            raise ValueError('The selected rate does not match this game. Refresh and choose its game rate.')
     if revision is not None and revision != card['revision']:
         raise ValueError("The rate changed. Refresh and review the new price.")
     minutes = {}

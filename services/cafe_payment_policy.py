@@ -1,6 +1,7 @@
 """Enforce migrated cafe policies before legacy checkout can collect money."""
 from flask import g, request, jsonify
 from sqlalchemy import text
+from services.legacy_pass_checkout import is_legacy_pass_request
 from db.extensions import db
 from services.payment_methods import canonical_method, require_method
 
@@ -12,6 +13,8 @@ def platform_order_purpose(body):
     if 'purpose' in body:
         purpose = body['purpose']
         return purpose if purpose in PLATFORM_PURPOSES else None
+    if is_legacy_pass_request(body):
+        return 'game_pass'
     receipt = body.get('receipt')
     if isinstance(receipt, str) and receipt.startswith('wallet_rcpt_'):
         return 'wallet_topup'

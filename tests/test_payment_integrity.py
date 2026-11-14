@@ -79,6 +79,7 @@ def env(monkeypatch):
     module.__dict__.update(db=db,Decimal=Decimal,InvalidOperation=InvalidOperation,HashWallet=wallet.HashWallet,HashWalletTransaction=ledger.HashWalletTransaction)
     exec(compile(ast.fix_missing_locations(ast.Module(body=[ast.ClassDef(name='BookingService',bases=[],keywords=[],body=[debit],decorator_list=[])],type_ignores=[])),str(ROOT/'services/booking_service.py'),'exec'),module.__dict__)
     monkeypatch.setitem(sys.modules,module.__name__,module)
+    legacy=load('services.legacy_pass_checkout','services/legacy_pass_checkout.py')
     purchase=load('services.pass_purchase_service','services/pass_purchase_service.py')
     fake=Mock()
     fake.payment.fetch.return_value={'order_id':'order_1','status':'captured','currency':'INR','amount':10000}
@@ -97,7 +98,7 @@ def env(monkeypatch):
         db.session.add(passes.CafePass(id=1,vendor_id=1,name='10 hours',price=100,days_valid=30,pass_mode='hour_based',total_hours=10,hour_calculation_mode='actual_duration'))
         db.session.add(wallet.HashWallet(user_id=1,balance=200))
         db.session.commit()
-    e=types.SimpleNamespace(app=app,db=db,p=passes,ps=ps.PassService,b=module.BookingService,w=wallet.HashWallet,l=ledger.HashWalletTransaction,g=gateway.BookingGatewayPayment,tx=tx.Transaction,buy=purchase.purchase,fake=fake,otp=otp,methods=methods,pg=url.startswith('postgresql'))
+    e=types.SimpleNamespace(app=app,db=db,p=passes,ps=ps.PassService,b=module.BookingService,w=wallet.HashWallet,l=ledger.HashWalletTransaction,g=gateway.BookingGatewayPayment,tx=tx.Transaction,buy=purchase.purchase,fake=fake,otp=otp,methods=methods,legacy=legacy,pg=url.startswith('postgresql'))
     yield e
     with app.app_context():
         db.session.remove()
@@ -274,3 +275,89 @@ def test_pc_membership_requires_pc_booking(env, monkeypatch):
         monkeypatch.setattr(sys.modules["services.pass_service"], "is_pc_device", lambda vendor, name: name == "PC")
         e.ps.redeem_pass_hours(owned.id, 1, 1, "dashboard_booking", booking_id=1)
         assert owned.remaining_hours == 9
+
+
+def legacy_gateway(e):
+    e.fake.payment.fetch.return_value.update(id='pay_legacy_1')
+    e.fake.order.fetch.return_value = {'notes': {'source': 'hfg_booking', 'purpose': 'game_pass',
+        'checkout_version': e.legacy.LEGACY_PASS_VERSION}}
+    return dict(cafe_pass_id='1', payment_mode='gateway', payment_id='pay_legacy_1')
+
+
+def test_flutter_signed_claim_purchase_and_retry(env):
+    e = env
+    with e.app.app_context():
+        request = legacy_gateway(e)
+        # A bare payment ID must not grant a pass, even if it was captured.
+        with pytest.raises(ValueError, match='signed pass checkout'):
+            e.buy(1, request)
+        e.db.session.rollback()
+        e.legacy.claim_legacy_payment(1, e.fake.payment.fetch.return_value, 'order_1')
+        owned, tx, replay = e.buy(1, request)
+        e.db.session.commit()
+        assert owned.pass_mode == 'hour_based' and owned.remaining_hours == 10
+        assert e.g.query.one().status == 'pass_purchase'
+        assert e.buy(1, request)[0].id == owned.id
+        e.db.session.commit()
+        assert e.tx.query.count() == 1 and e.p.UserPass.query.count() == 1
+        # Capture retries are harmless even after issuance.
+        e.legacy.claim_legacy_payment(1, e.fake.payment.fetch.return_value, 'order_1')
+        with pytest.raises(ValueError, match='claimed'):
+            e.legacy.claim_legacy_payment(2, e.fake.payment.fetch.return_value, 'order_1')
+        e.db.session.rollback()
+        with pytest.raises(ValueError, match='signed pass checkout'):
+            e.buy(2, request)
+
+
+def test_flutter_wrong_price_does_not_consume_claim(env):
+    e = env
+    with e.app.app_context():
+        request = legacy_gateway(e)
+        e.fake.payment.fetch.return_value['amount'] = 50
+        e.legacy.claim_legacy_payment(1, e.fake.payment.fetch.return_value, 'order_1')
+        with pytest.raises(ValueError, match='Captured'):
+            e.buy(1, request)
+        e.db.session.rollback()
+        assert e.g.query.one().status == 'pass_checkout'
+        assert e.p.UserPass.query.count() == 0 and e.tx.query.count() == 0
+
+
+def test_flutter_date_pass_and_disabled_method(env):
+    e = env
+    with e.app.app_context():
+        request = legacy_gateway(e)
+        catalog = e.db.session.get(e.p.CafePass, 1)
+        catalog.pass_mode = 'date_based'
+        e.db.session.commit()
+        e.legacy.claim_legacy_payment(1, e.fake.payment.fetch.return_value, 'order_1')
+        e.db.session.execute(text('DELETE FROM payment_vendor_map WHERE vendor_id=1 AND pay_method_id=2'))
+        e.db.session.commit()
+        with pytest.raises(ValueError, match='disabled'):
+            e.buy(1, request)
+        e.db.session.rollback()
+        assert e.p.UserPass.query.count() == 0
+        e.db.session.execute(text('INSERT INTO payment_vendor_map VALUES (1,2)'))
+        e.db.session.commit()
+        owned, _, _ = e.buy(1, request)
+        e.db.session.commit()
+        assert owned.pass_mode == 'date_based' and (owned.valid_to - owned.valid_from).days == 30
+
+
+def test_concurrent_flutter_purchase_only_issues_once(env):
+    e = env
+    if not e.pg:
+        pytest.skip('PostgreSQL row locks required')
+    with e.app.app_context():
+        request = legacy_gateway(e)
+        e.legacy.claim_legacy_payment(1, e.fake.payment.fetch.return_value, 'order_1')
+    def run():
+        with e.app.app_context():
+            owned, _, _ = e.buy(1, request)
+            result = owned.id
+            e.db.session.commit()
+            return result
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        ids = list(pool.map(lambda _: run(), range(2)))
+    with e.app.app_context():
+        assert ids[0] == ids[1]
+        assert e.p.UserPass.query.count() == 1 and e.tx.query.count() == 1

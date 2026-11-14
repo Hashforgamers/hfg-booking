@@ -41,3 +41,14 @@ def test_existing_presets_keep_their_original_rates():
     assert pricing.quote(pricing.legacy_definition('pc',[100,90,80]),180,1)==270
     assert pricing.quote(pricing.legacy_definition('ps65',[150,125,100,100]),60,4)==400
     assert pricing.quote(pricing.legacy_definition('racing',[100,150]),30,1)==100
+
+
+def test_special_game_scope_never_replaces_standard_games():
+    standard = definition(game_variant='')
+    gta = definition(game_variant='GTA 6')
+    assert pricing.rates_for_game([gta, standard], '') == [standard]
+    assert pricing.rates_for_game([gta, standard], 'gta6') == [gta]
+    assert pricing.rates_for_game([gta, standard], 'Other game') == [standard]
+    assert pricing.rates_for_game([gta], '') == []
+    with pytest.raises(ValueError):
+        pricing.rates_for_game([gta], ['GTA6'])

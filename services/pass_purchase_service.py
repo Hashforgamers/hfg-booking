@@ -12,6 +12,7 @@ from models.passPurchase import PassPurchase
 from models.bookingGatewayPayment import BookingGatewayPayment
 from models.transaction import Transaction
 from services.pass_service import PassService, IST
+from services.legacy_pass_checkout import is_legacy_pass_order
 
 
 class PurchaseError(ValueError):
@@ -26,6 +27,8 @@ def purchase(user_id, body):
     if body.get('user_id') is not None and str(body['user_id']) != str(user_id):
         raise PurchaseError('Cannot purchase a pass for another user', 403)
     pass_id = body.get('cafe_pass_id')
+    if isinstance(pass_id, str) and pass_id.isascii() and pass_id.isdigit():
+        pass_id = int(pass_id)
     if type(pass_id) is not int or pass_id <= 0:
         raise PurchaseError('cafe_pass_id must be a positive integer')
     mode = str(body.get('payment_mode', 'payment_gateway')).strip().lower()
@@ -67,15 +70,25 @@ def purchase(user_id, body):
         except Exception:
             raise PurchaseError('Unable to verify payment', 502)
         notes = order.get('notes') or {}
-        if str(notes.get('user_id')) != str(user_id) or str(notes.get('cafe_pass_id')) != str(pass_id):
+        legacy = is_legacy_pass_order(order)
+        claim = BookingGatewayPayment.query.filter_by(payment_id=payment_id).with_for_update().first()
+        if legacy:
+            if (not claim or claim.user_id != user_id or claim.order_id != str(payment.get('order_id'))
+                    or claim.status != 'pass_checkout'):
+                raise PurchaseError('Verify the signed pass checkout before purchasing', 403)
+        elif str(notes.get('user_id')) != str(user_id) or str(notes.get('cafe_pass_id')) != str(pass_id):
             raise PurchaseError('Payment order does not belong to this user and pass', 403)
-        if payment.get('status') != 'captured' or payment.get('currency') != 'INR' or payment.get('amount') != int(price * 100):
+        if (payment.get('status') != 'captured' or payment.get('currency') != 'INR'
+                or payment.get('amount') != int(price * 100)):
             raise PurchaseError('Captured INR payment must match the pass price')
-        # Shared with booking confirmation: payment/order cannot buy both a pass and a booking.
-        if BookingGatewayPayment.query.filter_by(payment_id=payment_id).first():
-            raise PurchaseError('Payment already used', 409)
-        db.session.add(BookingGatewayPayment(payment_id=payment_id, order_id=str(payment['order_id']),
-            user_id=user_id, amount=price, currency='INR', status='pass_purchase'))
+        # The shared unique order/payment ledger also prevents spending on a booking.
+        if legacy:
+            claim.status = 'pass_purchase'
+        else:
+            if claim:
+                raise PurchaseError('Payment already used', 409)
+            db.session.add(BookingGatewayPayment(payment_id=payment_id, order_id=str(payment['order_id']),
+                user_id=user_id, amount=price, currency='INR', status='pass_purchase'))
         db.session.flush()
     else:
         from services.booking_service import BookingService
