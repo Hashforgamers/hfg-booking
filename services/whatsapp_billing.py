@@ -9,13 +9,19 @@ SECRET_FIELDS={'ACCESS_TOKEN','APP_SECRET','VERIFY_TOKEN','PAYMENT_WEBHOOK_SECRE
 CONFIG_FIELDS=SECRET_FIELDS|{'ENABLED','PHONE_NUMBER_ID','API_VERSION','TEMPLATES','PACK_PRICE_PAISE','WABA_ID'}
 
 
+def _config_cipher():
+    key=os.getenv('WHATSAPP_CONFIG_KEY')
+    if not key:raise ValueError('Set WHATSAPP_CONFIG_KEY on the booking server before saving credentials.')
+    try:return Fernet(key.encode())
+    except (TypeError,ValueError) as error:
+        raise ValueError('WHATSAPP_CONFIG_KEY is not a valid Fernet key. Set the complete generated key on the booking server without quotes or spaces.') from error
+
+
 def read_config():
     row=db.session.execute(text('SELECT values_encrypted FROM whatsapp_config WHERE id=1')).first()
     if not row:return {}
-    key=os.getenv('WHATSAPP_CONFIG_KEY')
-    if not key:raise ValueError('Set WHATSAPP_CONFIG_KEY on the booking server to read saved WhatsApp settings.')
+    cipher=_config_cipher()
     try:
-        cipher=Fernet(key.encode())
         return json.loads(cipher.decrypt(row[0].encode()))
     except InvalidToken as error:
         raise ValueError('Saved WhatsApp settings cannot be decrypted. Restore the original WHATSAPP_CONFIG_KEY on the booking server.') from error
@@ -24,7 +30,7 @@ def read_config():
 
 
 def save_config(values):
-    if not os.getenv('WHATSAPP_CONFIG_KEY'):raise ValueError('Set WHATSAPP_CONFIG_KEY on the booking server before saving credentials.')
+    cipher=_config_cipher()
     unknown=set(values)-CONFIG_FIELDS
     if unknown:raise ValueError('Unknown configuration field')
     merged=read_config()
@@ -35,7 +41,7 @@ def save_config(values):
     if not price.isdigit() or not 100<=int(price)<=10000000:raise ValueError('Pack price must be between ₹1 and ₹100,000.')
     import re
     if merged.get('PHONE_NUMBER_ID') and not re.fullmatch(r'\d+',merged['PHONE_NUMBER_ID']):raise ValueError('Phone number ID must be numeric.')
-    if merged.get('API_VERSION') and not re.fullmatch(r'v\d+\.\d+',merged['API_VERSION']):raise ValueError('Enter a Meta API version such as v27.0.')
+    if merged.get('API_VERSION') and not re.fullmatch(r'v\d+\.0',merged['API_VERSION']):raise ValueError('Use a Meta Graph API release version ending in .0, for example v27.0.')
     if merged.get('WABA_ID') and not merged['WABA_ID'].isdigit():raise ValueError('WABA ID must be numeric.')
     if merged.get('API_VERSION') and int(merged['API_VERSION'].split('.')[0][1:])<20:raise ValueError('Choose a currently supported Meta API version, not v1.0.')
     rows=json.loads(merged.get('TEMPLATES') or '[]')
@@ -47,7 +53,7 @@ def save_config(values):
     if merged.get('ENABLED','false').lower()=='true' and (not rows or not all(merged.get(k) for k in ('ACCESS_TOKEN','APP_SECRET','VERIFY_TOKEN','PHONE_NUMBER_ID','API_VERSION'))):
         merged['ENABLED']='false'
         warning='Settings saved. Sending remains disabled until sender credentials and at least one approved template are configured.'
-    encrypted=Fernet(os.environ['WHATSAPP_CONFIG_KEY'].encode()).encrypt(json.dumps(merged).encode()).decode()
+    encrypted=cipher.encrypt(json.dumps(merged).encode()).decode()
     db.session.execute(text("INSERT INTO whatsapp_config(id,values_encrypted) VALUES(1,:v) ON CONFLICT(id) DO UPDATE SET values_encrypted=:v,updated_at=now()"),{'v':encrypted})
     db.session.commit()
     return warning
