@@ -43,10 +43,14 @@ def save_config(values):
     for row in rows:
         if not isinstance(row,dict) or not re.fullmatch(r'[a-z0-9_]+',str(row.get('name',''))) or not re.fullmatch(r'[A-Za-z_]+',str(row.get('language',''))) or not isinstance(row.get('fields'),list) or len(row['fields'])>20 or any(not isinstance(f,str) or not f.strip() or len(f)>100 for f in row['fields']):raise ValueError('Invalid template name, language or field labels.')
     if merged.get('ENABLED','false').lower() not in ('true','false'):raise ValueError('Choose enabled or disabled.')
-    if merged.get('ENABLED','false').lower()=='true' and (not rows or not all(merged.get(k) for k in ('ACCESS_TOKEN','APP_SECRET','VERIFY_TOKEN','PHONE_NUMBER_ID','API_VERSION'))):raise ValueError('Complete sender credentials and templates before enabling.')
+    warning=None
+    if merged.get('ENABLED','false').lower()=='true' and (not rows or not all(merged.get(k) for k in ('ACCESS_TOKEN','APP_SECRET','VERIFY_TOKEN','PHONE_NUMBER_ID','API_VERSION'))):
+        merged['ENABLED']='false'
+        warning='Settings saved. Sending remains disabled until sender credentials and at least one approved template are configured.'
     encrypted=Fernet(os.environ['WHATSAPP_CONFIG_KEY'].encode()).encrypt(json.dumps(merged).encode()).decode()
     db.session.execute(text("INSERT INTO whatsapp_config(id,values_encrypted) VALUES(1,:v) ON CONFLICT(id) DO UPDATE SET values_encrypted=:v,updated_at=now()"),{'v':encrypted})
     db.session.commit()
+    return warning
 
 
 def credit(vendor_id,delta,reference):
