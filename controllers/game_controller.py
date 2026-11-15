@@ -136,6 +136,7 @@ def get_games_by_vendor_id(vendor_id):
     if not games and not inventory_by_slug:
         payload = {
             "message": "No games found for this vendor",
+            "pricing_url": f"/api/games/vendor/{vendor_id}/pricing",
             "shop_open": is_shop_open_today,
             "game_count": 0
         }
@@ -177,6 +178,7 @@ def get_games_by_vendor_id(vendor_id):
             "single_slot_price": game.single_slot_price,
             "opening_days": open_days_list
         } for game in games],
+        "pricing_url": f"/api/games/vendor/{vendor_id}/pricing",
         "shop_open": is_shop_open_today,
         "game_count": len(games),
         "console_types": catalog_entries,

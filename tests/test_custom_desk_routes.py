@@ -22,6 +22,7 @@ def env(monkeypatch):
     app=Flask(__name__)
     app.config.update(SQLALCHEMY_DATABASE_URI=uri,SQLALCHEMY_ENGINE_OPTIONS={'connect_args':{'options':f'-csearch_path={schema}'}})
     db=SQLAlchemy(app)
+    monkeypatch.delitem(sys.modules, 'services.desk_consoles', raising=False)
     services=types.ModuleType('services');services.__path__=[str(ROOT/'services')];monkeypatch.setitem(sys.modules,'services',services)
     ext=types.ModuleType('db.extensions');ext.db=db;monkeypatch.setitem(sys.modules,'db.extensions',ext)
     access=types.ModuleType('services.vendor_access');access.require_vendor_permission=lambda *args:lambda f:f;monkeypatch.setitem(sys.modules,access.__name__,access)
@@ -144,3 +145,67 @@ def test_special_only_card_does_not_enable_variants_for_other_games(env):
     assert e.client.get('/api/vendor/1/desk-rates').json[0]['pricing_mode'] == 'slot'
     slots = [types.SimpleNamespace(id=1,start_time=time(10),end_time=time(11))]
     assert sum(e.module.desk_slot_prices(1,1,special['profile'],1,slots,pricing_game='GTA6').values()) == 132.67
+
+
+def test_public_customer_rates_are_scoped_and_do_not_expose_staff_data(env):
+    e = env
+    e.db.session.execute(text("ALTER TABLE available_games ADD COLUMN game_name text, ADD COLUMN single_slot_price numeric; UPDATE available_games SET game_name='PlayStation',single_slot_price=50"))
+    e.db.session.commit()
+    standard = card()
+    assert e.client.put('/api/vendor/1/desk-rates', json=standard).status_code == 200
+    premium = card()
+    premium['profile'] = 'gta6'
+    premium['definition']['game_variant'] = 'GTA 6'
+    premium['definition']['console_ids'] = [12]
+    assert e.client.put('/api/vendor/1/desk-rates', json=premium).status_code == 200
+    response = e.client.get('/api/games/vendor/1/pricing')
+    assert response.status_code == 200
+    assert response.headers['Cache-Control'] == 'no-store'
+    body = response.json
+    assert body['app_game_specific_booking_supported'] is False
+    platform = body['platforms'][0]
+    assert platform['standard']['base_slot_price'] == '50.00'
+    assert len(platform['standard']['rate_cards']) == 1
+    assert platform['game_specific'][0]['game_variant'] == 'GTA 6'
+    assert 'console_ids' not in platform['game_specific'][0]
+    assert platform['game_specific'][0]['booking_channels'] == ['dashboard']
+    assert e.client.get('/api/games/vendor/2/pricing').json['platforms'][0]['game_specific'] == []
+    assert e.client.get('/api/games/vendor/999/pricing').json['platforms'] == []
+    assert e.client.put('/api/vendor/1/desk-rates/mode', json={'game_id':1,'mode':'slot'}).status_code == 200
+    platform = e.client.get('/api/games/vendor/1/pricing').json['platforms'][0]
+    assert platform['standard']['rate_cards'] == []
+    assert len(platform['game_specific']) == 1
+    assert e.client.patch('/api/vendor/1/desk-rates', json={'game_id':1,'profile':'gta6','revision':1,'archived':True}).status_code == 200
+    assert e.client.get('/api/games/vendor/1/pricing').json['platforms'][0]['game_specific'] == []
+
+
+def test_live_slot_capacity_requires_release_even_after_midnight(env, monkeypatch):
+    from datetime import date
+    monkeypatch.delitem(sys.modules, 'services.live_slot_capacity', raising=False)
+    from services.live_slot_capacity import load_console_holds, free_console_capacity
+    e = env
+    # Three physical consoles, including a squad console, still held from yesterday.
+    e.db.session.execute(text("""INSERT INTO bookings VALUES
+        (10,'{"assigned_console_ids":[14]}'),(11,'{}');
+        INSERT INTO vendor_1_dashboard VALUES
+        (10,11,'current','2030-01-01','20:00','21:00'),
+        (11,12,'current','2030-01-01','23:00','01:00');"""))
+    e.db.session.commit()
+    holds = load_console_holds(1, [1])
+    assert free_console_capacity(holds, 1, date(2030,1,2), time(12), time(12,30)) == 0
+    # A duplicate dashboard row does not consume a fourth console.
+    e.db.session.execute(text("INSERT INTO vendor_1_dashboard VALUES (11,12,'current','2030-01-01','23:00','01:00')"))
+    e.db.session.commit()
+    assert free_console_capacity(load_console_holds(1,[1]),1,'2030-01-02',time(12),time(12,30)) == 0
+    e.db.session.execute(text("UPDATE vendor_1_dashboard SET book_status='completed' WHERE book_id=11"))
+    e.db.session.commit()
+    assert free_console_capacity(load_console_holds(1,[1]),1,'2030-01-02',time(12),time(12,30)) == 1
+    e.db.session.execute(text("CREATE TABLE vendor_2_dashboard (LIKE vendor_1_dashboard)"))
+    e.db.session.commit()
+    assert load_console_holds(2,[1]) == {}
+    # Future reservations only block their actual interval, including overnight.
+    e.db.session.execute(text("UPDATE vendor_1_dashboard SET book_status='completed'; INSERT INTO vendor_1_dashboard VALUES (11,12,'upcoming','2030-01-02','23:00','01:00')"))
+    e.db.session.commit()
+    holds = load_console_holds(1,[1])
+    assert free_console_capacity(holds,1,'2030-01-03',time(0),time(0,30)) == 2
+    assert free_console_capacity(holds,1,'2030-01-03',time(1),time(1,30)) == 3

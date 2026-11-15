@@ -33,6 +33,54 @@ def money(value):
     return amount
 
 
+@desk.get("/games/vendor/<int:vendor_id>/pricing")
+def customer_pricing(vendor_id):
+    """Public price discovery; deliberately excludes staff and physical-console data."""
+    games = db.session.execute(text("""SELECT g.id,g.game_name,g.single_slot_price,
+        COALESCE(s.mode,'slot') AS pricing_mode FROM available_games g
+        LEFT JOIN desk_pricing_settings s ON s.vendor_id=g.vendor_id AND s.game_id=g.id
+        WHERE g.vendor_id=:vendor ORDER BY g.id"""), {"vendor": vendor_id}).mappings().all()
+    rows = db.session.execute(text("""SELECT c.game_id,c.profile,c.revision,c.definition,c.rates
+        FROM desk_rate_cards c JOIN available_games g ON g.id=c.game_id AND g.vendor_id=c.vendor_id
+        WHERE c.vendor_id=:vendor AND c.is_active=true AND c.archived=false
+        ORDER BY c.game_id,c.profile"""), {"vendor": vendor_id}).mappings().all()
+    platforms = {}
+    for game in games:
+        platforms[game["id"]] = {
+            "available_game_id": game["id"], "platform_name": game["game_name"],
+            "standard": {
+                "app_pricing_mode": "slot", "dashboard_pricing_mode": game["pricing_mode"],
+                "base_slot_price": format(Decimal(str(game["single_slot_price"] or 0)), ".2f"),
+                "rate_cards": [],
+            },
+            "game_specific": [],
+        }
+    for row in rows:
+        definition = row["definition"] or legacy_definition(row["profile"], row["rates"])
+        special = bool(str(definition.get("game_variant") or "").strip())
+        platform = platforms[row["game_id"]]
+        if not special and platform["standard"]["dashboard_pricing_mode"] != "variants":
+            continue
+        card = {key: definition.get(key) for key in (
+            "name", "model_name", "screen_size_inches", "game_variant", "controllers_included", "rules"
+        )}
+        card.update(profile=row["profile"], revision=row["revision"],
+                    pricing_type="game_specific" if special else "standard",
+                    booking_channels=["dashboard"])
+        target = platform["game_specific"] if special else platform["standard"]["rate_cards"]
+        target.append(card)
+    response = jsonify({
+        "schema_version": 1, "vendor_id": vendor_id, "currency": "INR",
+        "display_only": True,
+        "app_booking_policy": "standard_slot_pricing",
+        "app_game_specific_booking_supported": False,
+        "standard_quote_url": "/api/bookings/pricing-estimate",
+        "platforms": list(platforms.values()),
+    })
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @desk.get("/vendor/<int:vendor_id>/desk-rates")
 @require_vendor_permission("booking.manage", "pricing.manage")
 def desk_rates(vendor_id):
