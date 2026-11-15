@@ -22,7 +22,15 @@ def meta_get(c,path,params=None):
     response=requests.get(f"https://graph.facebook.com/{c['API_VERSION']}/{path}",
         headers={'Authorization':'Bearer '+c['ACCESS_TOKEN']},params=params,timeout=15)
     if not response.ok:
-        raise ValueError(f'Meta returned HTTP {response.status_code}. Check token permissions, account IDs and API version.')
+        try:error=response.json().get('error',{})
+        except (ValueError,AttributeError):error={}
+        message=str(error.get('message') or 'Meta rejected the request.')
+        for secret in (c.get('ACCESS_TOKEN'),c.get('APP_SECRET'),c.get('VERIFY_TOKEN')):
+            if secret:message=message.replace(secret,'[redacted]')
+        code=error.get('code')
+        subcode=error.get('error_subcode')
+        reference=f"HTTP {response.status_code}"+(f", Meta code {code}" if code is not None else '')+(f", subcode {subcode}" if subcode is not None else '')
+        raise ValueError(f'{reference}: {message}')
     return response.json()
 
 
@@ -62,12 +70,14 @@ def validate_connections():
     c=settings();results=[]
     def check(name,fn):
         try:results.append(dict(name=name,status='passed',detail=fn()))
-        except (ValueError,KeyError,requests.RequestException):
+        except ValueError as error:
+            results.append(dict(name=name,status='failed',detail=str(error)))
+        except (KeyError,requests.RequestException):
             results.append(dict(name=name,status='failed',detail='Could not verify. Check saved credentials, IDs, permissions and provider availability.'))
     if all(c.get(k) for k in ('PHONE_NUMBER_ID','ACCESS_TOKEN','API_VERSION')):
         def sender():
             row=meta_get(c,c['PHONE_NUMBER_ID'],{'fields':'id,verified_name,display_phone_number,quality_rating'})
-            if str(row.get('id'))!=c['PHONE_NUMBER_ID']:raise ValueError()
+            if str(row.get('id'))!=c['PHONE_NUMBER_ID']:raise ValueError('Meta returned a different phone number ID. Check the saved ID.')
             return f"{row.get('verified_name','Sender')} · {row.get('display_phone_number','')} · quality {row.get('quality_rating','not reported')}"
         check('Meta sender',sender)
     else:results.append(dict(name='Meta sender',status='missing',detail='Save the phone number ID, access token and API version first.'))
@@ -75,31 +85,32 @@ def validate_connections():
         def account():
             row=meta_get(c,c['WABA_ID'],{'fields':'id,name,currency'})
             phones=meta_get(c,c['WABA_ID']+'/phone_numbers',{'fields':'id','limit':100})
-            if not any(str(p.get('id'))==c.get('PHONE_NUMBER_ID') for p in phones.get('data',[])):raise ValueError()
+            if not any(str(p.get('id'))==c.get('PHONE_NUMBER_ID') for p in phones.get('data',[])):raise ValueError('The configured phone number ID is not listed under this WABA. Check that both IDs belong to the same WhatsApp account.')
             return f"{row.get('name','WhatsApp account')} · currency {row.get('currency','not reported')} · sender belongs to this account"
         check('Meta account and sender ownership',account)
-        def approved_templates():
-            saved=templates()
-            if not saved:return 'No templates configured. Add approved templates before sending.'
-            found={}
-            cursor=None
-            for _ in range(10):
-                params={'fields':'name,language,status','limit':100}
-                if cursor:params['after']=cursor
-                page=meta_get(c,c['WABA_ID']+'/message_templates',params)
-                for row in page.get('data',[]):found[(row['name'],row['language'])]=row.get('status')
-                if not page.get('paging',{}).get('next'):break
-                cursor=page['paging']['cursors']['after']
-            missing=[t['name'] for t in saved if found.get((t['name'],t['language']))!='APPROVED']
-            if missing:raise ValueError()
-            return f'All {len(saved)} configured templates are approved in Meta.'
-        check('Template approval',approved_templates)
+        saved_templates=templates()
+        if saved_templates:
+            def approved_templates():
+                found={}
+                cursor=None
+                for _ in range(10):
+                    params={'fields':'name,language,status','limit':100}
+                    if cursor:params['after']=cursor
+                    page=meta_get(c,c['WABA_ID']+'/message_templates',params)
+                    for row in page.get('data',[]):found[(row['name'],row['language'])]=row.get('status')
+                    if not page.get('paging',{}).get('next'):break
+                    cursor=page['paging']['cursors']['after']
+                missing=[t['name'] for t in saved_templates if found.get((t['name'],t['language']))!='APPROVED']
+                if missing:raise ValueError('These configured templates are missing or not approved in Meta: '+', '.join(missing)+'.')
+                return f'All {len(saved_templates)} configured templates are approved in Meta.'
+            check('Template approval',approved_templates)
+        else:results.append(dict(name='Template approval',status='missing',detail='No templates are configured. Add at least one Meta-approved template before sending.'))
     else:results.append(dict(name='Meta account and templates',status='missing',detail='Save the WhatsApp Business Account ID (WABA ID).'))
     key=current_app.config.get('RAZORPAY_KEY_ID');secret=current_app.config.get('RAZORPAY_KEY_SECRET')
     if key and secret:
         def payment():
             response=requests.get('https://api.razorpay.com/v1/orders',auth=(key,secret),params={'count':1},timeout=15)
-            if not response.ok:raise ValueError()
+            if not response.ok:raise ValueError(f'Razorpay rejected the read-only API request (HTTP {response.status_code}). Check that the server key ID and key secret match the account mode.')
             mode='TEST' if key.startswith('rzp_test_') else 'LIVE' if key.startswith('rzp_live_') else 'unknown mode'
             return f'Credentials accepted · {mode}. Read-only check; no payment created or charged.'
         check('Razorpay API',payment)
