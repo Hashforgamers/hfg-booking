@@ -1,5 +1,6 @@
 """Read-only provider diagnostics and business reporting for HFG operations."""
 import json
+import re
 from datetime import datetime,timedelta,timezone
 from decimal import Decimal, InvalidOperation
 import requests
@@ -94,14 +95,23 @@ def validate_connections():
                 found={}
                 cursor=None
                 for _ in range(10):
-                    params={'fields':'name,language,status','limit':100}
+                    params={'fields':'name,language,status,components','limit':100}
                     if cursor:params['after']=cursor
                     page=meta_get(c,c['WABA_ID']+'/message_templates',params)
-                    for row in page.get('data',[]):found[(row['name'],row['language'])]=row.get('status')
+                    for row in page.get('data',[]):found[(row['name'],row['language'])]=row
                     if not page.get('paging',{}).get('next'):break
                     cursor=page['paging']['cursors']['after']
-                missing=[t['name'] for t in saved_templates if found.get((t['name'],t['language']))!='APPROVED']
+                missing=[t['name'] for t in saved_templates if found.get((t['name'],t['language'])) is None or found[(t['name'],t['language'])].get('status')!='APPROVED']
                 if missing:raise ValueError('These configured templates are missing or not approved in Meta: '+', '.join(missing)+'.')
+                mismatched=[]
+                for template in saved_templates:
+                    meta_template=found[(template['name'],template['language'])]
+                    body=next((component.get('text','') for component in meta_template.get('components',[]) if component.get('type')=='BODY'),None)
+                    if body is None:continue
+                    expected=len(re.findall(r'\{\{\s*\d+\s*\}\}',body))
+                    actual=len(template['fields'])
+                    if expected!=actual:mismatched.append(f"{template['name']} ({actual} configured, {expected} approved)")
+                if mismatched:raise ValueError('Template parameter mismatch: '+', '.join(mismatched)+'. Set the configured fields to match the Meta BODY placeholders in order.')
                 return f'All {len(saved_templates)} configured templates are approved in Meta.'
             check('Template approval',approved_templates)
         else:results.append(dict(name='Template approval',status='missing',detail='No templates are configured. Add at least one Meta-approved template before sending.'))
