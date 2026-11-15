@@ -52,3 +52,13 @@ def contact_consent(vendor_id):
         dict(v=vendor_id,p=p,s=body['service_consent'],m=body['marketing_consent'],n=note.strip()))
     db.session.commit()
     return jsonify(saved=True)
+
+
+@whatsapp_preferences.get('/vendor/<int:vendor_id>/whatsapp/contacts')
+@require_vendor_permission('account.manage')
+def contact_consent_status(vendor_id):
+    try:p=phone(request.args.get('recipient'))
+    except (ValueError,TypeError):return jsonify(error='Provide a country-code phone number.'),400
+    row=db.session.execute(text('SELECT marketing_consent FROM whatsapp_contacts WHERE vendor_id=:v AND recipient=:p'),{'v':vendor_id,'p':p}).first()
+    opted_out=bool(db.session.execute(text('SELECT 1 FROM whatsapp_optouts WHERE recipient=:p'),{'p':p}).first())
+    return jsonify(marketing_consent=bool(row and row[0]),opted_out=opted_out)
