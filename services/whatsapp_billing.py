@@ -1,7 +1,7 @@
 """Prepaid credits: all grants verified server-side and ledger entries idempotent."""
 import os
 import json
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import text
 from db.extensions import db
 
@@ -12,7 +12,15 @@ CONFIG_FIELDS=SECRET_FIELDS|{'ENABLED','PHONE_NUMBER_ID','API_VERSION','TEMPLATE
 def read_config():
     row=db.session.execute(text('SELECT values_encrypted FROM whatsapp_config WHERE id=1')).first()
     if not row:return {}
-    return json.loads(Fernet(os.environ['WHATSAPP_CONFIG_KEY'].encode()).decrypt(row[0].encode()))
+    key=os.getenv('WHATSAPP_CONFIG_KEY')
+    if not key:raise ValueError('Set WHATSAPP_CONFIG_KEY on the booking server to read saved WhatsApp settings.')
+    try:
+        cipher=Fernet(key.encode())
+        return json.loads(cipher.decrypt(row[0].encode()))
+    except InvalidToken as error:
+        raise ValueError('Saved WhatsApp settings cannot be decrypted. Restore the original WHATSAPP_CONFIG_KEY on the booking server.') from error
+    except (TypeError,ValueError) as error:
+        raise ValueError('WHATSAPP_CONFIG_KEY on the booking server is invalid. Use the original Fernet key.') from error
 
 
 def save_config(values):
