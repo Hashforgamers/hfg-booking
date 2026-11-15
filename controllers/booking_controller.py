@@ -1126,6 +1126,16 @@ def _precheck_slot_booking_eligibility(vendor_id, slot_id, booked_date_obj, requ
     if not is_available:
         return "Slot is marked unavailable."
 
+    from services.live_slot_capacity import load_console_holds, free_console_capacity
+    slot = db.session.execute(text(
+        "SELECT gaming_type_id,start_time,end_time FROM slots WHERE id=:id"
+    ), {"id": int(slot_id)}).first()
+    if not slot:
+        return "Slot not found."
+    holds = load_console_holds(vendor_id, [int(slot[0])])
+    free = free_console_capacity(holds, int(slot[0]), booked_date_obj, slot[1], slot[2])
+    if free < int(required_units or 1):
+        return "Consoles are occupied or reserved. Check out the active session or choose another time."
     return None
 
 

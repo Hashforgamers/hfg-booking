@@ -1,5 +1,6 @@
 from flask import Blueprint, jsonify, current_app, request
 from models.slot import Slot
+from services.live_slot_capacity import load_console_holds, free_console_capacity
 from flask_socketio import emit
 from db.extensions import db
 from sqlalchemy.sql import text, bindparam
@@ -14,6 +15,14 @@ import threading
 
 
 slot_blueprint = Blueprint('slots', __name__)
+
+
+@slot_blueprint.after_request
+def prevent_stale_availability(response):
+    # Live console holds can change immediately on checkout or assignment.
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
 # Operating-hour edits must be visible on the next request across service instances.
 SLOTS_BATCH_CACHE_TTL_SEC = 0
 SLOTS_SINGLE_CACHE_TTL_SEC = 0
@@ -361,6 +370,7 @@ def get_slots_on_game_id(vendorId, gameId, date):
 
         total_slots_for_game = int(available_game.total_slot or 0)
         booking_counts = _load_booking_counts(vendorId, [int(gameId)], [formatted_date])
+        live_holds = load_console_holds(vendorId, [int(gameId)])
         expected_blocks = _expected_blocks_for_date(vendorId, formatted_date)
 
         slots_by_key = {}
@@ -377,6 +387,8 @@ def get_slots_on_game_id(vendorId, gameId, date):
             # decremented by booking flow (including PC squad slot_units). Never inflate
             # availability above this value via booking-row count heuristics.
             resolved_available = min(raw_available, computed_available) if bool(row[1]) else 0
+            resolved_available = min(resolved_available, free_console_capacity(
+                live_holds, int(gameId), formatted_date, slot_start, slot_end))
             slot_is_available = resolved_available > 0
 
             candidate = {
@@ -501,6 +513,7 @@ def get_slots_batch(vendorId):
             for g in AvailableGame.query.filter(AvailableGame.id.in_(game_ids)).all()
         }
         booking_counts = _load_booking_counts(vendorId, game_ids, formatted_dates)
+        live_holds = load_console_holds(vendorId, game_ids)
         expected_blocks_by_date = {
             d: _expected_blocks_for_date(vendorId, d) for d in formatted_dates
         }
@@ -523,6 +536,8 @@ def get_slots_batch(vendorId):
             computed_available = max(int(total_slots_map.get(game_id, 0)) - booked_count, 0)
             # Keep DB availability authoritative; count-based estimate is only a cap.
             resolved_available = min(raw_available, computed_available) if bool(row[2]) else 0
+            resolved_available = min(resolved_available, free_console_capacity(
+                live_holds, game_id, date_obj, row[4], row[5]))
             slot_is_available = resolved_available > 0
             
             candidate = {

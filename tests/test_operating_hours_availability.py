@@ -1,5 +1,6 @@
 """Saved hours must win over spare capacity in booking readers and preflight."""
 import ast
+import pytest
 from datetime import time as clock_time
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,7 +19,8 @@ def compile_functions(path, names, scope):
     return scope
 
 
-def test_single_slot_listing_does_not_offer_disabled_capacity():
+@pytest.mark.parametrize("free_capacity", [0, 1, 3])
+def test_single_slot_listing_does_not_offer_disabled_capacity(free_capacity):
     query = Mock()
     query.filter_by.return_value.first.return_value = SimpleNamespace(total_slot=3, single_slot_price=100)
     scope = dict(time=SimpleNamespace(time=lambda: 1), _slots_single_cache_lock=threading.Lock(),
@@ -27,13 +29,14 @@ def test_single_slot_listing_does_not_offer_disabled_capacity():
         jsonify=lambda data: SimpleNamespace(json=data, headers={}),
         _load_vendor_slot_rows=lambda *args: [(1,False,3,clock_time(9),clock_time(10)),
                                               (2,True,2,clock_time(10),clock_time(11))],
+        load_console_holds=lambda *args: {}, free_console_capacity=lambda *args: free_capacity,
         _load_booking_counts=lambda *args: {}, _expected_blocks_for_date=lambda *args: None)
     compile_functions('controllers/slot_controller.py', {'get_slots_on_game_id','_prefer_slot_candidate'}, scope)
     response, status = scope['get_slots_on_game_id'](1,2,'20261102')
     assert status == 200, response.json
     assert response.json['slots'][0]['is_available'] is False
     assert response.json['slots'][0]['available_slot'] == 0
-    assert response.json['slots'][1]['available_slot'] == 2
+    assert response.json['slots'][1]['available_slot'] == min(2, free_capacity)
 
 
 def test_precheck_rejects_disabled_slot_with_positive_capacity():
@@ -89,9 +92,17 @@ def test_batch_listing_does_not_offer_disabled_capacity():
              time=SimpleNamespace(time=lambda:1,perf_counter=lambda:1),
              _slots_batch_cache_lock=threading.Lock(),_slots_batch_cache={},SLOTS_BATCH_CACHE_TTL_SEC=0,
              _ensure_slots_for_date=lambda *args:None,_force_slot_refresh=lambda:True,
+             load_console_holds=lambda *args:{}, free_console_capacity=lambda *args:3,
              _load_booking_counts=lambda *args:{},_expected_blocks_for_date=lambda *args:None,
              jsonify=lambda data:SimpleNamespace(json=data,headers={}),current_app=SimpleNamespace(logger=Mock())))
     response,status=scope['get_slots_batch'](1)
     assert status==200,response.json
     assert response.json['20261102'][0]['available_slot']==0
     assert not response.json['20261102'][0]['is_available']
+
+
+def test_slot_responses_cannot_be_cached():
+    scope = compile_functions('controllers/slot_controller.py', {'prevent_stale_availability'}, {})
+    response = SimpleNamespace(headers={})
+    assert scope['prevent_stale_availability'](response) is response
+    assert response.headers['Cache-Control'] == 'no-store'
