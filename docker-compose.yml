@@ -64,5 +64,6 @@ services:
         gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 1 app:app -b 0.0.0.0:5054 --timeout 120 &
         rq worker booking_tasks --url \"$$REDIS_URL\" &
         rq-dashboard --redis-url \"$$REDIS_URL\" --port 9181 &
+        (while true; do flask --app app whatsapp-dispatch || echo 'WhatsApp dispatch failed; retrying in 30s'; sleep 30; done) &
         rqscheduler --url \"$$REDIS_URL\" --interval 60
       "
