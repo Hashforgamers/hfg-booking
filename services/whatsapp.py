@@ -49,12 +49,17 @@ def valid_signature(raw, signature):
     return bool(secret) and hmac.compare_digest(expected, signature or '')
 
 
-def process_one():
+def process_one(message_id=None):
     if not configured():
         return False
-    row = db.session.execute(text("""SELECT * FROM whatsapp_outbox
-        WHERE status='queued' AND next_attempt<=now()
-        ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1""")).mappings().first()
+    query="""SELECT * FROM whatsapp_outbox
+        WHERE status='queued' AND next_attempt<=now()"""
+    params={}
+    if message_id is not None:
+        query+=" AND id=:message_id"
+        params['message_id']=message_id
+    query+=" ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1"
+    row = db.session.execute(text(query),params).mappings().first()
     if not row:
         db.session.rollback()
         return False
@@ -95,10 +100,19 @@ def process_one():
         elif response.status_code == 429 and row['attempts'] < 4:
             status, error = 'queued', 'Meta rate limit; queued for retry.'
         else:
-            status, error = 'failed', f'Meta rejected message (HTTP {response.status_code}). Check template and sender configuration.'
-    except (requests.RequestException, ValueError, KeyError, IndexError):
+            try:
+                provider_error=response.json().get('error',{}).get('message')
+            except (ValueError,AttributeError):
+                provider_error=None
+            if provider_error:
+                provider_error=str(provider_error)
+                for secret in (c.get('ACCESS_TOKEN'),c.get('APP_SECRET'),c.get('VERIFY_TOKEN')):
+                    if secret:provider_error=provider_error.replace(secret,'[redacted]')
+            status, error = 'failed', f'Meta rejected message (HTTP {response.status_code})'+(f': {provider_error[:400]}' if provider_error else '. Check template and sender configuration.')
+    except (requests.RequestException, ValueError, KeyError, IndexError) as exc:
         # A timeout can mean Meta accepted it. Never automatically duplicate a message.
-        pass
+        if isinstance(exc,requests.RequestException):
+            error=f'Meta request failed: {type(exc).__name__}. Delivery outcome is unknown; inspect Meta before resending.'
     updated = db.session.execute(text("""UPDATE whatsapp_outbox SET status=:status,provider_id=COALESCE(provider_id,:provider),
         error=:error,updated_at=now(),next_attempt=now()+interval '5 minutes'
         WHERE id=:id AND status='sending'"""),dict(id=row['id'],status=status,provider=provider,error=error))

@@ -50,12 +50,14 @@ def queue_whatsapp(vendor_id):
     if purpose=='promotions':
         allowed=db.session.execute(text('SELECT 1 FROM whatsapp_contacts WHERE vendor_id=:v AND recipient=:p AND marketing_consent=true'),{'v':vendor_id,'p':recipient}).first()
         if not allowed:return jsonify(error='Record separate marketing consent for this customer first.'),409
-    existing=db.session.execute(text('SELECT vendor_id,recipient,template,language,parameters FROM whatsapp_outbox WHERE id=:id'),{'id':message_id}).first()
+    existing=db.session.execute(text('SELECT vendor_id,recipient,template,language,parameters,status FROM whatsapp_outbox WHERE id=:id'),{'id':message_id}).first()
     if existing:
         if existing[0]!=vendor_id:return jsonify(error='Message key is already in use.'),409
         if (existing[1],existing[2],existing[3],existing[4])!=(recipient,template['name'],template['language'],values):
             return jsonify(error='Message key was used for different content. Refresh before sending.'),409
-        return jsonify(id=message_id,queued=True),200
+        if existing[5]=='queued':process_one(message_id)
+        current=db.session.execute(text('SELECT status,error FROM whatsapp_outbox WHERE id=:id'),{'id':message_id}).first()
+        return jsonify(id=message_id,queued=True,status=current[0],error=current[1]),200
     if db.session.execute(text('SELECT 1 FROM whatsapp_optouts WHERE recipient=:p'),{'p':recipient}).first():
         return jsonify(error='This customer opted out of HFG WhatsApp messages.'),409
     # Serialize per-cafe limits even when multiple dashboard requests arrive together.
@@ -70,7 +72,11 @@ def queue_whatsapp(vendor_id):
         dict(id=message_id,v=vendor_id,p=recipient,t=template['name'],l=template['language'],params=json.dumps(values),note=note.strip(),
              purpose=purpose,actor=str((g.vendor_claims.get('staff') or {}).get('id') or 'owner')))
     db.session.commit()
-    return jsonify(id=message_id,queued=True),202
+    # Dispatch this interactive send immediately so delivery failures are visible to staff
+    # without waiting for the periodic worker. The durable outbox remains the source of truth.
+    process_one(message_id)
+    current=db.session.execute(text('SELECT status,error FROM whatsapp_outbox WHERE id=:id'),{'id':message_id}).first()
+    return jsonify(id=message_id,queued=True,status=current[0],error=current[1]),202
 
 
 @whatsapp.route('/whatsapp/webhook',methods=['GET','POST'])
