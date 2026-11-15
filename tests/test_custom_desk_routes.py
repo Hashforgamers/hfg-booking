@@ -179,10 +179,11 @@ def test_public_customer_rates_are_scoped_and_do_not_expose_staff_data(env):
     assert e.client.get('/api/games/vendor/1/pricing').json['platforms'][0]['game_specific'] == []
 
 
-def test_live_slot_capacity_requires_release_even_after_midnight(env, monkeypatch):
-    from datetime import date
+def test_live_slot_capacity_limits_overdue_holds_even_after_midnight(env, monkeypatch):
+    from datetime import date, datetime
     monkeypatch.delitem(sys.modules, 'services.live_slot_capacity', raising=False)
     from services.live_slot_capacity import load_console_holds, free_console_capacity
+    now = datetime(2030, 1, 2, 12, 10)
     e = env
     # Three physical consoles, including a squad console, still held from yesterday.
     e.db.session.execute(text("""INSERT INTO bookings VALUES
@@ -192,14 +193,14 @@ def test_live_slot_capacity_requires_release_even_after_midnight(env, monkeypatc
         (11,12,'current','2030-01-01','23:00','01:00');"""))
     e.db.session.commit()
     holds = load_console_holds(1, [1])
-    assert free_console_capacity(holds, 1, date(2030,1,2), time(12), time(12,30)) == 0
+    assert free_console_capacity(holds, 1, date(2030,1,2), time(12), time(12,30), now=now) == 0
     # A duplicate dashboard row does not consume a fourth console.
     e.db.session.execute(text("INSERT INTO vendor_1_dashboard VALUES (11,12,'current','2030-01-01','23:00','01:00')"))
     e.db.session.commit()
-    assert free_console_capacity(load_console_holds(1,[1]),1,'2030-01-02',time(12),time(12,30)) == 0
+    assert free_console_capacity(load_console_holds(1,[1]),1,'2030-01-02',time(12),time(12,30),now=now) == 0
     e.db.session.execute(text("UPDATE vendor_1_dashboard SET book_status='completed' WHERE book_id=11"))
     e.db.session.commit()
-    assert free_console_capacity(load_console_holds(1,[1]),1,'2030-01-02',time(12),time(12,30)) == 1
+    assert free_console_capacity(load_console_holds(1,[1]),1,'2030-01-02',time(12),time(12,30),now=now) == 1
     e.db.session.execute(text("CREATE TABLE vendor_2_dashboard (LIKE vendor_1_dashboard)"))
     e.db.session.commit()
     assert load_console_holds(2,[1]) == {}
