@@ -34,8 +34,11 @@ def admin(fn):
 def config():
     if request.method=='PUT':
         try:save_config(request.get_json(silent=True) or {})
-        except (ValueError,TypeError,KeyError):return jsonify(error='Invalid settings. Check encryption key, price, sender details and templates.'),400
-    values=read_config()
+        except ValueError as error:return jsonify(error=str(error)),400
+        except (TypeError,KeyError):return jsonify(error='Invalid WhatsApp settings. Check the price, sender details and templates.'),400
+    try:values=read_config()
+    except ValueError as error:return jsonify(error=str(error)),503
+    except KeyError:return jsonify(error='WhatsApp settings cannot be read. Check the booking service encryption key configuration.'),503
     public={k:v for k,v in values.items() if k not in SECRET_FIELDS}
     public['configured_secrets']={k:bool(values.get(k)) for k in SECRET_FIELDS}
     return jsonify(public)
