@@ -14,7 +14,7 @@ whatsapp = Blueprint('whatsapp', __name__)
 @whatsapp.get('/vendor/<int:vendor_id>/whatsapp')
 @require_vendor_permission('account.manage')
 def whatsapp_status(vendor_id):
-    rows = db.session.execute(text("""SELECT id,recipient,template,status,error,created_at
+    rows = db.session.execute(text("""SELECT id,recipient,template,purpose,status,error,created_at
         FROM whatsapp_outbox WHERE vendor_id=:v ORDER BY created_at DESC LIMIT 50"""),{'v':vendor_id}).mappings()
     balance=db.session.execute(text('SELECT credits FROM whatsapp_wallet WHERE vendor_id=:v'),{'v':vendor_id}).scalar() or 0
     ledger=db.session.execute(text('SELECT delta,reference,created_at FROM whatsapp_credit_ledger WHERE vendor_id=:v ORDER BY id DESC LIMIT 30'),{'v':vendor_id}).mappings().all()
