@@ -115,8 +115,25 @@ def validate_connections():
             return f'Credentials accepted · {mode}. Read-only check; no payment created or charged.'
         check('Razorpay API',payment)
     else:results.append(dict(name='Razorpay API',status='missing',detail='Configure RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET on the booking server.'))
-    for name,key in [('Meta signed webhook','APP_SECRET'),('Meta verification token','VERIFY_TOKEN'),('Razorpay signed webhook','PAYMENT_WEBHOOK_SECRET')]:
-        results.append(dict(name=name,status='pending' if c.get(key) else 'missing',detail='Secret saved. Confirm callback receipt in Webhook evidence below.' if c.get(key) else 'Save the required secret first.'))
+    webhook_evidence={row['name']:row['observed_at'] for row in db.session.execute(
+        text('SELECT name,observed_at FROM whatsapp_provider_checks WHERE name IN (:meta_signed,:meta_verify,:razorpay_signed)'),
+        {'meta_signed':'meta_signed_callback','meta_verify':'meta_verification','razorpay_signed':'razorpay_signed_callback'}
+    ).mappings()}
+    saved_at=db.session.execute(text('SELECT updated_at FROM whatsapp_config WHERE id=1')).scalar()
+    for name,key,evidence_key in [
+        ('Meta signed webhook','APP_SECRET','meta_signed_callback'),
+        ('Meta verification token','VERIFY_TOKEN','meta_verification'),
+        ('Razorpay signed webhook','PAYMENT_WEBHOOK_SECRET','razorpay_signed_callback'),
+    ]:
+        observed_at=webhook_evidence.get(evidence_key)
+        current=observed_at is not None and (saved_at is None or observed_at>=saved_at)
+        if not c.get(key):
+            status,detail='missing','Save the required secret first.'
+        elif current:
+            status,detail='passed',f"A successful provider callback was received at {observed_at.isoformat()}."
+        else:
+            status,detail='pending','Secret saved. Complete a successful provider callback after the latest settings save; see Webhook evidence below.'
+        results.append(dict(name=name,status=status,detail=detail))
     return jsonify(checked_at=datetime.now(timezone.utc).isoformat(),checks=results,
         note='API access checks do not prove delivery, payment capture, or webhook signatures. Complete the provider test steps before enabling live use.')
 
