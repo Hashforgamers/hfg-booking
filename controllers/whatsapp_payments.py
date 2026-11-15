@@ -106,6 +106,8 @@ def payment_webhook():
     secret=settings().get('PAYMENT_WEBHOOK_SECRET','')
     expected=hmac.new(secret.encode(),request.get_data(),hashlib.sha256).hexdigest()
     if not secret or not hmac.compare_digest(expected,request.headers.get('X-Razorpay-Signature','')):return '',403
+    db.session.execute(text("INSERT INTO whatsapp_provider_checks(name) VALUES('razorpay_signed_callback') ON CONFLICT(name) DO UPDATE SET observed_at=now()"))
+    db.session.commit()
     body=request.get_json(silent=True) or {}
     if body.get('event')=='payment.captured':
         payment=body.get('payload',{}).get('payment',{}).get('entity',{})

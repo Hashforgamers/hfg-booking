@@ -78,6 +78,8 @@ def whatsapp_webhook():
     c=settings()
     if request.method=='GET':
         if c['VERIFY_TOKEN'] and request.args.get('hub.mode')=='subscribe' and hmac.compare_digest(request.args.get('hub.verify_token',''),c['VERIFY_TOKEN']):
+            db.session.execute(text("INSERT INTO whatsapp_provider_checks(name) VALUES('meta_verification') ON CONFLICT(name) DO UPDATE SET observed_at=now()"))
+            db.session.commit()
             return request.args.get('hub.challenge',''),200
         return '',403
     if not valid_signature(request.get_data(),request.headers.get('X-Hub-Signature-256')):
@@ -87,6 +89,7 @@ def whatsapp_webhook():
         for change in entry.get('changes',[]):
             value=change.get('value',{})
             if value.get('metadata',{}).get('phone_number_id')!=c['PHONE_NUMBER_ID']:continue
+            db.session.execute(text("INSERT INTO whatsapp_provider_checks(name) VALUES('meta_signed_callback') ON CONFLICT(name) DO UPDATE SET observed_at=now()"))
             for item in value.get('statuses',[]):
                 state=item.get('status')
                 if state not in ('sent','delivered','read','failed'):continue

@@ -31,3 +31,6 @@ CREATE TABLE IF NOT EXISTS whatsapp_contacts (
 );
 ALTER TABLE whatsapp_outbox ADD COLUMN IF NOT EXISTS purpose text NOT NULL DEFAULT 'updates';
 ALTER TABLE whatsapp_outbox ADD COLUMN IF NOT EXISTS expires_at timestamptz;
+CREATE TABLE IF NOT EXISTS whatsapp_provider_checks (
+ name text PRIMARY KEY, observed_at timestamptz NOT NULL DEFAULT now()
+);

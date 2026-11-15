@@ -6,7 +6,7 @@ from sqlalchemy import text
 from db.extensions import db
 
 SECRET_FIELDS={'ACCESS_TOKEN','APP_SECRET','VERIFY_TOKEN','PAYMENT_WEBHOOK_SECRET'}
-CONFIG_FIELDS=SECRET_FIELDS|{'ENABLED','PHONE_NUMBER_ID','API_VERSION','TEMPLATES','PACK_PRICE_PAISE'}
+CONFIG_FIELDS=SECRET_FIELDS|{'ENABLED','PHONE_NUMBER_ID','API_VERSION','TEMPLATES','PACK_PRICE_PAISE','WABA_ID'}
 
 
 def read_config():
@@ -28,6 +28,8 @@ def save_config(values):
     import re
     if merged.get('PHONE_NUMBER_ID') and not re.fullmatch(r'\d+',merged['PHONE_NUMBER_ID']):raise ValueError('Phone number ID must be numeric.')
     if merged.get('API_VERSION') and not re.fullmatch(r'v\d+\.\d+',merged['API_VERSION']):raise ValueError('Enter a Meta API version such as v27.0.')
+    if merged.get('WABA_ID') and not merged['WABA_ID'].isdigit():raise ValueError('WABA ID must be numeric.')
+    if merged.get('API_VERSION') and int(merged['API_VERSION'].split('.')[0][1:])<20:raise ValueError('Choose a currently supported Meta API version, not v1.0.')
     rows=json.loads(merged.get('TEMPLATES') or '[]')
     if not isinstance(rows,list) or len(rows)>30:raise ValueError('Provide up to 30 templates.')
     for row in rows:

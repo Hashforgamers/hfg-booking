@@ -38,11 +38,12 @@ def wa(monkeypatch):
             return wrapped
         return decorate
     access=types.ModuleType('services.vendor_access');access.require_vendor_permission=permission;monkeypatch.setitem(sys.modules,access.__name__,access)
-    for name in ('services.whatsapp','services.whatsapp_billing','services.whatsapp_automation','controllers.whatsapp_controller','controllers.whatsapp_payments','controllers.whatsapp_preferences'):
+    for name in ('services.whatsapp','services.whatsapp_billing','services.whatsapp_automation','controllers.whatsapp_controller','controllers.whatsapp_payments','controllers.whatsapp_preferences','controllers.whatsapp_operations'):
         monkeypatch.delitem(sys.modules,name,raising=False)
     module=importlib.import_module('controllers.whatsapp_controller');module.register_whatsapp(app)
     payments=importlib.import_module('controllers.whatsapp_payments');app.register_blueprint(payments.whatsapp_payments,url_prefix='/api')
     prefs=importlib.import_module('controllers.whatsapp_preferences');app.register_blueprint(prefs.whatsapp_preferences,url_prefix='/api')
+    operations=importlib.import_module('controllers.whatsapp_operations');app.register_blueprint(operations.operations,url_prefix='/api')
     service=importlib.import_module('services.whatsapp');billing=importlib.import_module('services.whatsapp_billing')
     with app.app_context():
         db.session.execute(text(f'CREATE SCHEMA {schema}'));db.session.execute(text('CREATE TABLE vendors(id integer primary key,cafe_name text); INSERT INTO vendors VALUES(1,\'Cafe One\'),(2,\'Cafe Two\')'));db.session.commit()
@@ -213,3 +214,54 @@ def test_failed_delivery_callback_refunds_only_once(wa,monkeypatch):
     assert balance(wa)==99
     for _ in range(2):assert webhook(wa,{'statuses':[{'id':'wamid.fail','status':'failed'}]}).status_code==200
     assert balance(wa)==100
+
+
+def test_operations_report_is_authenticated_and_uses_paid_revenue(wa):
+    url='/api/admin/whatsapp/operations'
+    assert wa.client.get(url).status_code==401
+    fund(wa)
+    wa.db.session.execute(text("INSERT INTO whatsapp_purchases(id,vendor_id,amount_paise,status,paid_at) VALUES(:id,1,10000,'paid',now())"),{'id':str(uuid.uuid4())});wa.db.session.commit()
+    data=wa.client.get(url,headers={'x-admin-key':'admin-test-key'}).json
+    assert data['purchases']=={'packs':1,'revenue_paise':10000}
+    assert data['credits']['balance']==100
+    assert data['cafes'][0]['cafe_name']=='Cafe One'
+    assert wa.client.get(url+'?days=1000',headers={'x-admin-key':'admin-test-key'}).status_code==400
+
+
+def test_read_only_validation_and_meta_costs(wa,monkeypatch):
+    import controllers.whatsapp_operations as operations
+    wa.billing.save_config({'WABA_ID':'456'})
+    calls=[]
+    def get(url,**kwargs):
+        calls.append(url)
+        if url.endswith('/123'):body={'id':'123','verified_name':'Hash for Gamers','display_phone_number':'123','quality_rating':'GREEN'}
+        elif url.endswith('/phone_numbers'):body={'data':[{'id':'123'}]}
+        elif url.endswith('/message_templates'):body={'data':[{'name':'hfg_update','language':'en','status':'APPROVED'}]}
+        elif url.endswith('/pricing_analytics'):body={'data':[{'data_points':[{'start':1,'end':2,'pricing_category':'UTILITY','volume':3,'cost':'1.25'}]}]}
+        elif 'razorpay' in url:body={'items':[]}
+        else:body={'name':'HFG','currency':'INR'}
+        return SimpleNamespace(ok=True,json=lambda:body)
+    monkeypatch.setattr(operations.requests,'get',get)
+    headers={'x-admin-key':'admin-test-key'}
+    response=wa.client.post('/api/admin/whatsapp/validate',headers=headers)
+    assert response.status_code==200
+    assert all(c['status']=='passed' for c in response.json['checks'][:4])
+    assert 'secret-token' not in response.text and 'app-secret' not in response.text
+    report=wa.client.get('/api/admin/whatsapp/meta-report',headers=headers).json
+    assert report['cost']=='1.25' and report['balance'] is None
+    assert report['currency']=='INR'
+    monkeypatch.setattr(operations.requests,'get',lambda *a,**kw:SimpleNamespace(ok=False,status_code=401))
+    failed=wa.client.get('/api/admin/whatsapp/meta-report',headers=headers)
+    assert failed.status_code==502 and 'cost' not in failed.json
+
+
+def test_webhook_evidence_and_old_api_version(wa):
+    headers={'x-admin-key':'admin-test-key'}
+    assert wa.client.put('/api/admin/whatsapp/config',headers=headers,json={'API_VERSION':'v1.0'}).status_code==400
+    webhook(wa,{'statuses':[]})
+    body=wa.client.get('/api/admin/whatsapp/operations',headers=headers).json
+    assert body['webhook_checks'][0]['name']=='meta_signed_callback'
+    assert body['webhook_checks'][0]['current'] is True
+    wa.billing.save_config({'VERIFY_TOKEN':'rotated-token'})
+    body=wa.client.get('/api/admin/whatsapp/operations',headers=headers).json
+    assert body['webhook_checks'][0]['current'] is False
