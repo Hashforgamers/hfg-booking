@@ -85,6 +85,8 @@ def create_app():
     from models.passPurchase import PassPurchase
     from controllers.whatsapp_controller import register_whatsapp
     register_whatsapp(app)
+    from controllers.whatsapp_operations import operations
+    app.register_blueprint(operations, url_prefix="/api")
     from controllers.whatsapp_preferences import whatsapp_preferences
     app.register_blueprint(whatsapp_preferences, url_prefix="/api")
     from controllers.whatsapp_payments import whatsapp_payments

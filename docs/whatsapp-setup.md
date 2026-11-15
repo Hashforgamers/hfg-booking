@@ -74,3 +74,20 @@ Reconcile unknown payment orders using their purchase UUID stored as Razorpay re
 ## Verification
 
 Automated tests use disposable PostgreSQL and mocked Meta/Razorpay calls. They cover secret encryption/redaction, authorization boundaries, insufficient credits, idempotent grants/debits, captured payment validation, signed webhooks, out-of-order status callbacks, opt-out, consent, automation timing, booking-link routing and duplicate events. Real provider acceptance still requires configured sender/template/account and sandbox end-to-end testing.
+
+## Operations reporting and connection checks
+
+Super-admin WhatsApp now includes a guided setup checklist, secure verification-token generator, copyable callback URLs, and read-only validation of the saved Meta sender, WABA/sender ownership, configured template approval, and Razorpay API credentials. Save before validating. Razorpay keys remain in the existing booking-server configuration; a successful API check does not prove payment capture or webhook delivery. Webhook evidence is recorded only after a successful verification challenge or valid signed callback for the configured sender. Saving configuration marks older evidence as needing a fresh test.
+
+Add the numeric `WABA_ID` in super-admin (Meta Business Settings → Accounts → WhatsApp Accounts). The sender phone-number ID is a different ID. Use a supported Graph API version; v1.0 is rejected. Use a production system-user access token with `whatsapp_business_management` and `whatsapp_business_messaging` permissions and access to the intended WABA.
+
+The backend URL error means the super-admin host needs server-side `BOOKING_BACKEND_URL` set to the booking origin and a redeployment. The proxy also accepts the existing `NEXT_PUBLIC_BOOKING_URL` as a fallback. It does not guess a production host. Save is disabled while configuration loading fails, and missing reports are not displayed as empty businesses.
+
+Reapply the SQL migration to add `whatsapp_provider_checks`. The operations report provides 7/30/90-day gross captured pack collections, paid packs, current credit balances, message statuses, café totals and CSV export. Collections are not net profit; refunds/taxes/provider fees are not subtracted. Delivery statistics are grouped by the message's queue date, not callback date.
+
+Fetch Meta report calls the official WABA `pricing_analytics` edge, using the account's own currency. This covers the whole WABA, potentially including traffic outside HFG. Empty, denied or missing cost data is not replaced with zero. The report does not expose an authoritative account balance; use the Meta Billing link for payable/prepaid balance and invoices. Café credits are an HFG entitlement, not Meta money. Do not subtract WABA cost from HFG pack collections to claim profit without reconciling currency, timing and account scope.
+
+Provider references:
+- https://developers.facebook.com/docs/graph-api/reference/whats-app-business-account/pricing_analytics/
+- https://developers.facebook.com/docs/graph-api/reference/whats-app-business-account
+- https://razorpay.com/security/checklist/

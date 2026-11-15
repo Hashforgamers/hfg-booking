@@ -12,7 +12,7 @@ from db.extensions import db
 def settings():
     from services.whatsapp_billing import read_config
     values = {key: os.getenv('WHATSAPP_' + key, '') for key in
-            ('ENABLED','PHONE_NUMBER_ID','ACCESS_TOKEN','APP_SECRET','VERIFY_TOKEN','API_VERSION','TEMPLATES','PACK_PRICE_PAISE','PAYMENT_WEBHOOK_SECRET')}
+            ('ENABLED','PHONE_NUMBER_ID','ACCESS_TOKEN','APP_SECRET','VERIFY_TOKEN','API_VERSION','TEMPLATES','PACK_PRICE_PAISE','PAYMENT_WEBHOOK_SECRET','WABA_ID')}
     values.update(read_config())
     return values
 
