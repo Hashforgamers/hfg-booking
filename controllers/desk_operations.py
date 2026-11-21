@@ -18,7 +18,7 @@ def database_error(error):
     db.session.rollback()
     current_app.logger.exception("Desk operations database request failed")
     code = getattr(getattr(error, "orig", None), "pgcode", None)
-    if code in ("42P01", "42703", "42P10", "42883", "23502"):
+    if code in ("42P01", "42703", "42P10", "42883", "23502", "22001"):
         return jsonify(error="Booking database setup is incomplete. Apply the latest desk pricing and history migrations to the booking database, then retry. No rows in this batch were saved."), 503
     return jsonify(error="Could not save or load desk data. Please retry. No rows in this batch were saved."), 503
 
