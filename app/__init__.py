@@ -91,6 +91,8 @@ def create_app():
     app.register_blueprint(whatsapp_preferences, url_prefix="/api")
     from controllers.whatsapp_payments import whatsapp_payments
     app.register_blueprint(whatsapp_payments, url_prefix="/api")
+    from controllers.desk_upi_qr import desk_upi_qr
+    app.register_blueprint(desk_upi_qr, url_prefix="/api")
     from controllers.desk_operations import desk
     app.register_blueprint(desk, url_prefix="/api")
     app.register_blueprint(booking_blueprint, url_prefix="/api")
