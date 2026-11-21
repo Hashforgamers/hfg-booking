@@ -5,6 +5,7 @@ fixed-amount UPI QR -> the customer pays -> the webhook (or a status poll) appli
 the captured payment: the snapshotted rows become paid via ``hash_upi_qr`` and the
 cafe's share is recorded as ``cafe_settlement_status='pending'`` until HFG pays out.
 """
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
@@ -16,6 +17,7 @@ from sqlalchemy import bindparam, text
 from db.extensions import db
 
 QR_LIFETIME = timedelta(minutes=15)
+LINK_LIFETIME = timedelta(minutes=20)  # Razorpay needs expire_by at least 15 minutes ahead.
 MODE_OF_PAYMENT = 'hash_upi_qr'
 PAYMENT_USE_CASE = 'payment_gateway'
 PENDING = ('pending', 'unpaid', 'due')
@@ -67,7 +69,29 @@ def _public(row):
         'close_by': row['close_by'].isoformat() if row['close_by'] else None,
         'paid_at': row['paid_at'].isoformat() if row['paid_at'] else None,
         'cafe_settlement_status': row['cafe_settlement_status'],
+        'link_sent_to': _mask(row.get('link_phone')),
+        'customer_phone': _mask(_customer_phone(row['booking_id'])) if row['status'] == 'open' else None,
     }
+
+
+def _mask(phone):
+    return f'•••••{phone[-4:]}' if phone else None
+
+
+def _normalise_phone(value):
+    digits = re.sub(r'\D', '', str(value or ''))
+    if len(digits) == 12 and digits.startswith('91'):
+        digits = digits[2:]
+    elif len(digits) == 11 and digits.startswith('0'):
+        digits = digits[1:]
+    return digits if re.fullmatch(r'[6-9]\d{9}', digits) else None
+
+
+def _customer_phone(booking_id):
+    raw = db.session.execute(text('''SELECT c.phone FROM bookings b JOIN contact_info c
+                                     ON c.parent_id=b.user_id AND c.parent_type='user'
+                                     WHERE b.id=:b ORDER BY c.id DESC LIMIT 1'''), {'b': booking_id}).scalar()
+    return _normalise_phone(raw)
 
 
 def _get(collection_id, vendor_id=None, lock=False):
@@ -80,6 +104,15 @@ def _get(collection_id, vendor_id=None, lock=False):
     if not row or (vendor_id is not None and row['vendor_id'] != vendor_id):
         raise QrError('Unknown payment QR.', 404)
     return dict(row)
+
+
+def _cancel_link(link_id):
+    if not link_id:
+        return
+    try:
+        gateway().payment_link.cancel(link_id)
+    except Exception:  # Paid/expired links reject cancelling; the status check settles the truth.
+        current_app.logger.warning('desk_upi_qr: could not cancel link %s', link_id)
 
 
 def _close_at_provider(qr_id):
@@ -141,6 +174,7 @@ def create_qr(vendor_id, booking_id, booking_types=None, waive_off_amount=0, act
             raise QrError('This bill was just paid by QR.', 409)
         if state['status'] in ('open', 'creating'):
             _close_at_provider(existing['qr_id'])
+            _cancel_link(existing.get('link_id'))
             db.session.execute(text("UPDATE desk_upi_collections SET status='closed', updated_at=now() WHERE id=:id AND status IN ('creating','open')"),
                                {'id': existing['id']})
         db.session.commit()
@@ -183,8 +217,14 @@ def apply_payment(collection_id, payment):
     """Idempotently mark the snapshotted rows paid. Returns the collection's public state."""
     row = _get(collection_id, lock=True)
     if row['status'] in ('paid', 'paid_unapplied'):
+        pid = payment.get('id')
+        if payment.get('status') == 'captured' and pid and pid != row['payment_id'] and pid not in (row['error'] or ''):
+            # Paid twice (QR and link): keep the first, flag the second for a refund.
+            db.session.execute(text("UPDATE desk_upi_collections SET error=concat_ws('; ', error, :e), updated_at=now() WHERE id=:id"),
+                               {'id': row['id'], 'e': f'Second payment {pid} needs refund'})
+            current_app.logger.error('desk_upi_qr: duplicate payment %s for collection %s', pid, row['id'])
         db.session.commit()
-        return _public(row), False
+        return _public(_get(row['id'])), False
     ok = (payment.get('status') == 'captured' and int(payment.get('amount') or 0) == row['amount_paise']
           and str(payment.get('currency') or 'INR').upper() == 'INR' and payment.get('id'))
     if not ok:
@@ -203,6 +243,7 @@ def apply_payment(collection_id, payment):
                                    WHERE id=:id'''), {'id': row['id'], 'p': payment['id']})
         db.session.commit()
         current_app.logger.error('desk_upi_qr: payment %s for collection %s needs review', payment['id'], row['id'])
+        _close_other_channel(row, payment)
         return _public(_get(row['id'])), True
 
     db.session.execute(text('''UPDATE transactions SET mode_of_payment=:m, payment_use_case=:u, settlement_status='completed',
@@ -229,7 +270,72 @@ def apply_payment(collection_id, payment):
                                cafe_settlement_status='pending', updated_at=now() WHERE id=:id'''),
                        {'id': row['id'], 'p': payment['id']})
     db.session.commit()
+    _close_other_channel(row, payment)
     return _public(_get(row['id'])), True
+
+
+def _close_other_channel(row, payment):
+    # Stop the customer paying the same bill twice through the other route.
+    if row.get('link_id') and payment.get('id'):
+        _cancel_link(row['link_id'])
+    if row.get('qr_id') and not payment.get('_via_qr'):
+        _close_at_provider(row['qr_id'])
+
+
+def _link_payments(link_id):
+    try:
+        client = gateway()
+        link = client.payment_link.fetch(link_id)
+        if link.get('status') != 'paid':
+            return []
+        return [client.payment.fetch(p['payment_id']) for p in (link.get('payments') or [])
+                if p.get('status') == 'captured' and p.get('payment_id')]
+    except Exception:
+        current_app.logger.warning('desk_upi_qr: link lookup failed for %s', link_id)
+        return []
+
+
+def send_link(collection_id, vendor_id, phone=None):
+    """SMS a Razorpay payment link for the open bill to the customer's phone."""
+    row = _get(collection_id, vendor_id, lock=True)
+    if row['status'] != 'open':
+        db.session.commit()
+        raise QrError('This bill is no longer waiting for payment.', 409)
+    number = _normalise_phone(phone) if phone else _customer_phone(row['booking_id'])
+    if not number:
+        db.session.commit()
+        raise QrError('Enter a valid 10-digit mobile number.' if phone else 'No mobile number on file. Enter one.')
+    client = gateway()
+    if row['link_id'] and row['link_phone'] == number:
+        db.session.commit()
+        try:
+            client.payment_link.notifyBy(row['link_id'], 'sms')
+        except Exception:
+            raise QrError('Could not resend the SMS. Try again.', 502)
+        return _public(_get(row['id']))
+    old_link = row['link_id']
+    expire_by = datetime.now(timezone.utc) + LINK_LIFETIME
+    cafe = db.session.execute(text('SELECT cafe_name FROM vendors WHERE id=:v'), {'v': vendor_id}).scalar() or 'Hash cafe'
+    try:
+        link = client.payment_link.create({
+            'amount': row['amount_paise'], 'currency': 'INR', 'accept_partial': False,
+            'description': f'{cafe} · Booking #{row["booking_id"]}'[:2048],
+            'customer': {'contact': '+91' + number},
+            'notify': {'sms': True, 'email': False}, 'reminder_enable': False,
+            'expire_by': int(expire_by.timestamp()),
+            'notes': {'purpose': 'desk_upi_qr', 'collection_id': str(row['id']),
+                      'booking_id': str(row['booking_id']), 'vendor_id': str(vendor_id)},
+        })
+    except Exception:
+        db.session.rollback()
+        raise QrError('Could not send the payment link. Use the QR instead.', 502)
+    # The bill stays payable while the link is live, so extend its expiry to match.
+    db.session.execute(text('''UPDATE desk_upi_collections SET link_id=:l, link_url=:u, link_phone=:ph,
+                               close_by=GREATEST(close_by, :e), updated_at=now() WHERE id=:id'''),
+                       {'id': row['id'], 'l': link['id'], 'u': link.get('short_url'), 'ph': number, 'e': expire_by})
+    db.session.commit()
+    _cancel_link(old_link)
+    return _public(_get(row['id']))
 
 
 def refresh(collection_id, vendor_id=None):
@@ -244,6 +350,11 @@ def refresh(collection_id, vendor_id=None):
         payments = []
     for payment in payments:
         if payment.get('status') == 'captured':
+            state, _ = apply_payment(row['id'], dict(payment, _via_qr=True))
+            if state['status'] != 'open':
+                return state
+    if row.get('link_id'):
+        for payment in _link_payments(row['link_id']):
             state, _ = apply_payment(row['id'], payment)
             if state['status'] != 'open':
                 return state
@@ -261,6 +372,7 @@ def cancel(collection_id, vendor_id):
         return state
     row = _get(collection_id, vendor_id)
     _close_at_provider(row['qr_id'])
+    _cancel_link(row['link_id'])
     # A payment may land between the check and the close; look once more before closing locally.
     state = refresh(collection_id, vendor_id)
     if state['status'] != 'open':
@@ -269,6 +381,10 @@ def cancel(collection_id, vendor_id):
                        {'id': row['id']})
     db.session.commit()
     return _public(_get(row['id']))
+
+
+def collection_for_link(link_id):
+    return db.session.execute(text('SELECT id FROM desk_upi_collections WHERE link_id=:l'), {'l': link_id}).scalar()
 
 
 def collection_for_qr(qr_id):

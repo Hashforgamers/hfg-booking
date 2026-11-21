@@ -22,7 +22,9 @@ SECRET = 'desk-webhook-secret'
 SCHEMA = '''
 CREATE TABLE vendors(id integer primary key, cafe_name text);
 CREATE TABLE available_games(id integer primary key, vendor_id integer);
-CREATE TABLE bookings(id integer primary key, game_id integer);
+CREATE TABLE bookings(id integer primary key, game_id integer, user_id integer);
+CREATE TABLE contact_info(id serial primary key, phone text, parent_id integer, parent_type text);
+INSERT INTO contact_info(phone,parent_id,parent_type) VALUES ('+91 98765 43210',5,'user');
 CREATE TABLE transactions(
  id serial primary key, booking_id integer, vendor_id integer, user_id integer,
  booked_date date NOT NULL, booking_date date NOT NULL, booking_time time NOT NULL, user_name text NOT NULL,
@@ -37,7 +39,7 @@ CREATE TABLE transactions(
  created_at timestamp, updated_at timestamp);
 INSERT INTO vendors VALUES (1,'Cafe One'),(2,'Cafe Two');
 INSERT INTO available_games VALUES (10,1),(20,2);
-INSERT INTO bookings VALUES (100,10),(101,10),(200,20);
+INSERT INTO bookings VALUES (100,10,5),(101,10,5),(200,20,6);
 '''
 
 
@@ -56,6 +58,26 @@ class FakeQr:
 
     def close(self, qid):
         self.closed.append(qid)
+
+
+class FakeLinks:
+    def __init__(self):
+        self.created, self.cancelled, self.notified, self.state = [], [], [], {}
+
+    def create(self, data):
+        lid = f'plink_{len(self.created) + 1}'
+        self.created.append(dict(data, id=lid))
+        self.state[lid] = {'status': 'created', 'payments': []}
+        return {'id': lid, 'short_url': f'https://rzp.io/i/{lid}'}
+
+    def fetch(self, lid):
+        return self.state[lid]
+
+    def cancel(self, lid):
+        self.cancelled.append(lid)
+
+    def notifyBy(self, lid, medium):
+        self.notified.append((lid, medium))
 
 
 @pytest.fixture
@@ -90,7 +112,10 @@ def env(monkeypatch):
     service = importlib.import_module('services.desk_upi_qr')
     controller = importlib.import_module('controllers.desk_upi_qr')
     fake = FakeQr()
-    monkeypatch.setattr(service, 'gateway', lambda: SimpleNamespace(qrcode=fake))
+    links = FakeLinks()
+    paid = {}
+    monkeypatch.setattr(service, 'gateway', lambda: SimpleNamespace(
+        qrcode=fake, payment_link=links, payment=SimpleNamespace(fetch=lambda pid: paid[pid])))
     emitted = []
     app.extensions['socketio'] = SimpleNamespace(emit=lambda *a, **k: emitted.append((a, k)))
     app.register_blueprint(controller.desk_upi_qr, url_prefix='/api')
@@ -99,7 +124,7 @@ def env(monkeypatch):
         db.session.execute(text(SCHEMA))
         db.session.execute(text((ROOT / 'sql/20261121_desk_upi_qr.sql').read_text()))
         db.session.commit()
-    ns = SimpleNamespace(app=app, db=db, client=app.test_client(), fake=fake, emitted=emitted)
+    ns = SimpleNamespace(app=app, db=db, client=app.test_client(), fake=fake, links=links, paid=paid, emitted=emitted)
     yield ns
     with app.app_context():
         db.session.remove(); db.session.execute(text(f'DROP SCHEMA {schema} CASCADE')); db.session.commit()
@@ -128,9 +153,9 @@ def status(env, cid, vendor=1):
     return env.client.get(f'/api/vendor/{vendor}/upi-qr/{cid}', headers={'X-Test-Vendor': str(vendor)})
 
 
-def webhook(env, qr_id, amount, payment_id='pay_1', secret=SECRET, pstatus='captured'):
-    raw = json.dumps({'event': 'qr_code.credited', 'payload': {
-        'qr_code': {'entity': {'id': qr_id}},
+def webhook(env, qr_id, amount, payment_id='pay_1', secret=SECRET, pstatus='captured', link=False):
+    raw = json.dumps({'event': 'payment_link.paid' if link else 'qr_code.credited', 'payload': {
+        ('payment_link' if link else 'qr_code'): {'entity': {'id': qr_id}},
         'payment': {'entity': {'id': payment_id, 'amount': amount, 'currency': 'INR', 'status': pstatus}}}}).encode()
     sig = hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
     return env.client.post('/api/payments/desk-upi-webhook', data=raw, content_type='application/json',
@@ -224,3 +249,46 @@ def test_multi_slot_booking_collects_one_qr(env):
     assert create(env, booking=100, booking_ids=[100, 200]).status_code == 404
     webhook(env, 'qr_1', 40000)
     assert {r['settlement_status'] for r in rows(env, 'SELECT settlement_status FROM transactions')} == {'completed'}
+
+
+def send(env, cid, **body):
+    return env.client.post(f'/api/vendor/1/upi-qr/{cid}/send-link', json=body, headers={'X-Test-Vendor': '1'})
+
+
+def test_send_link_to_customer_phone_and_pay_by_link(env):
+    add_tx(env, amount=90, kind='extra')
+    qr = create(env, booking_types=['extra']).json
+    assert qr['customer_phone'] == '•••••3210'
+    res = send(env, qr['collection_id'])
+    assert res.status_code == 200 and res.json['link_sent_to'] == '•••••3210'
+    sent = env.links.created[0]
+    assert sent['customer']['contact'] == '+919876543210' and sent['amount'] == 9000 and sent['notify']['sms']
+    assert send(env, qr['collection_id']).status_code == 200 and env.links.notified == [('plink_1', 'sms')]
+    assert send(env, qr['collection_id'], phone='12345').status_code == 400
+    assert webhook(env, 'plink_1', 9000, payment_id='pay_link', link=True).status_code == 200
+    col = rows(env, 'SELECT status,payment_id,cafe_settlement_status FROM desk_upi_collections')[0]
+    assert col == {'status': 'paid', 'payment_id': 'pay_link', 'cafe_settlement_status': 'pending'}
+    assert env.fake.closed == ['qr_1']  # The QR can no longer be paid.
+
+
+def test_new_number_replaces_link_and_status_poll_finds_link_payment(env):
+    add_tx(env, amount=50, kind='extra')
+    qr = create(env, booking_types=['extra']).json
+    send(env, qr['collection_id'])
+    assert send(env, qr['collection_id'], phone='9123456789').json['link_sent_to'] == '•••••6789'
+    assert env.links.cancelled == ['plink_1']
+    env.links.state['plink_2'] = {'status': 'paid', 'payments': [{'payment_id': 'pay_l2', 'status': 'captured'}]}
+    env.paid['pay_l2'] = {'id': 'pay_l2', 'amount': 5000, 'currency': 'INR', 'status': 'captured'}
+    assert status(env, qr['collection_id']).json['status'] == 'paid'
+
+
+def test_second_payment_is_flagged_for_refund(env):
+    add_tx(env, amount=50, kind='extra')
+    qr = create(env, booking_types=['extra']).json
+    send(env, qr['collection_id'])
+    webhook(env, 'qr_1', 5000, payment_id='pay_qr')
+    webhook(env, 'plink_1', 5000, payment_id='pay_link', link=True)
+    webhook(env, 'plink_1', 5000, payment_id='pay_link', link=True)
+    col = rows(env, 'SELECT payment_id,error FROM desk_upi_collections')[0]
+    assert col == {'payment_id': 'pay_qr', 'error': 'Second payment pay_link needs refund'}
+    assert env.links.cancelled == ['plink_1']
