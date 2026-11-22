@@ -150,8 +150,19 @@ class BookingService:
         booking.status = "cancelled"
         db.session.commit()
 
-        # Emit real-time cancellation event
-        socketio.emit('booking_updated', {'booking_id': booking_id, 'status': 'cancelled'})
+        # Vendor-scoped so the dashboard-service bridge relays it; it does not
+        # listen for booking_updated, only booking_payment_update.
+        from utils.realtime import emit_vendor_event
+        try:
+            vendor_id = int(AvailableGame.query.get(booking.game_id).vendor_id)
+        except Exception:
+            vendor_id = None
+        event = {'booking_id': booking_id, 'bookingId': booking_id, 'status': 'cancelled'}
+        # `socketio` imported at module level is the flask_socketio package, not
+        # the server: calling .emit on it raised after the cancel had committed.
+        server = current_app.extensions.get('socketio')
+        emit_vendor_event(server, 'booking_updated', event, vendor_id)
+        emit_vendor_event(server, 'booking_payment_update', event, vendor_id)
         return {"message": "Booking cancelled successfully."}
 
     @staticmethod
