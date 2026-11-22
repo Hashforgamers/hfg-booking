@@ -1,6 +1,8 @@
 from flask import Blueprint, jsonify, current_app, request
 from models.slot import Slot
 from services.live_slot_capacity import load_console_holds, free_console_capacity
+from services.game_capacity import sync_game_capacity
+from services.slot_capacity import booking_units
 from flask_socketio import emit
 from db.extensions import db
 from sqlalchemy.sql import text, bindparam
@@ -283,19 +285,29 @@ def _prefer_slot_candidate(current, candidate):
     return current
 
 
+# Bookings in these states no longer hold a console; their slot units were
+# already returned (cancel, failed payment, no-show). Counting them made a cafe
+# look full long before its consoles were.
+RELEASED_BOOKING_STATUSES = (
+    "cancelled", "canceled", "rejected", "verification_failed", "discarded",
+    "no_show", "expired", "failed", "refunded",
+)
+
+
 def _load_booking_counts(vendor_id, game_ids, formatted_dates):
     """
-    Return map {(slot_id, YYYY-MM-DD): count_of_active_bookings}
-    for selected vendor/game/date window.
+    Return map {(slot_id, YYYY-MM-DD): console units held by live bookings}
+    for selected vendor/game/date window. Squad bookings hold one unit per PC.
     """
     if not game_ids or not formatted_dates:
         return {}
 
     rows = (
         db.session.query(
+            Booking.id,
             Booking.slot_id,
+            Booking.squad_details,
             Transaction.booked_date,
-            func.count(Booking.id).label("cnt"),
         )
         .join(Transaction, Transaction.booking_id == Booking.id)
         .filter(
@@ -303,18 +315,69 @@ def _load_booking_counts(vendor_id, game_ids, formatted_dates):
             Transaction.vendor_id == vendor_id,
             Transaction.booked_date.in_(formatted_dates),
             Booking.slot_id.isnot(None),
-            func.lower(func.coalesce(Booking.status, "")).notin_(["cancelled", "rejected"]),
+            func.lower(func.coalesce(Booking.status, "")).notin_(RELEASED_BOOKING_STATUSES),
         )
-        .group_by(Booking.slot_id, Transaction.booked_date)
         .all()
     )
 
     out = {}
+    seen = set()
     for row in rows:
-        if not row.slot_id or not row.booked_date:
+        if not row.slot_id or not row.booked_date or row.id in seen:
             continue
-        out[(int(row.slot_id), row.booked_date.strftime("%Y-%m-%d"))] = int(row.cnt or 0)
+        seen.add(row.id)  # one booking has several transactions (meals, extra time)
+        key = (int(row.slot_id), row.booked_date.strftime("%Y-%m-%d"))
+        try:
+            units = booking_units(row.squad_details)
+        except (TypeError, ValueError):
+            units = 1
+        out[key] = out.get(key, 0) + units
     return out
+
+
+def _load_qr_held_units(vendor_id, formatted_dates):
+    """Units held by self-service QR play (stored in cafe_slot_reservations)."""
+    if not formatted_dates:
+        return {}
+    if not db.session.execute(text("SELECT to_regclass('cafe_slot_reservations')")).scalar():
+        return {}
+    rows = db.session.execute(text("""
+        SELECT slot_id, date, SUM(units) FROM cafe_slot_reservations
+        WHERE vendor_id=:vendor AND released_at IS NULL AND date IN :dates
+        GROUP BY slot_id, date
+    """).bindparams(bindparam("dates", expanding=True)),
+        {"vendor": int(vendor_id), "dates": list(formatted_dates)}).fetchall()
+    return {(int(r[0]), r[1].strftime("%Y-%m-%d")): int(r[2] or 0) for r in rows}
+
+
+def _repair_leaked_capacity(vendor_id, slot_id, formatted_date, raw_available, floor):
+    """Raise a dated row that lost units to an un-released booking path.
+
+    Only ever raises, only for today onward, and only if nobody changed the row
+    since it was read, so a concurrent booking's decrement is never overwritten.
+    """
+    if floor <= raw_available:
+        return raw_available
+    try:
+        day = datetime.strptime(formatted_date, "%Y-%m-%d").date()
+        if day < datetime.now(timezone("Asia/Kolkata")).date():
+            return raw_available
+        updated = db.session.execute(text(f"""
+            UPDATE VENDOR_{int(vendor_id)}_SLOT
+            SET available_slot=:floor, is_available=TRUE
+            WHERE vendor_id=:vendor AND slot_id=:slot AND date=:day AND available_slot=:raw
+        """), {"floor": int(floor), "vendor": int(vendor_id), "slot": int(slot_id),
+                "day": day, "raw": int(raw_available)})
+        db.session.commit()
+        if updated.rowcount == 1:
+            current_app.logger.warning(
+                "slot_capacity.repaired vendor=%s slot=%s date=%s %s->%s",
+                vendor_id, slot_id, formatted_date, raw_available, floor)
+            return int(floor)
+    except Exception:
+        db.session.rollback()
+        current_app.logger.exception("slot_capacity.repair_failed vendor=%s slot=%s", vendor_id, slot_id)
+    return raw_available
 
 @slot_blueprint.route('/slots', methods=['GET'])
 def get_slots():
@@ -368,8 +431,10 @@ def get_slots_on_game_id(vendorId, gameId, date):
             response.headers["X-Cache"] = "MISS"
             return response, 200
 
-        total_slots_for_game = int(available_game.total_slot or 0)
+        # Capacity is the consoles really mapped to this game, not a stale seed.
+        total_slots_for_game = sync_game_capacity(vendorId, int(gameId)) or int(available_game.total_slot or 0)
         booking_counts = _load_booking_counts(vendorId, [int(gameId)], [formatted_date])
+        qr_units = _load_qr_held_units(vendorId, [formatted_date])
         live_holds = load_console_holds(vendorId, [int(gameId)])
         expected_blocks = _expected_blocks_for_date(vendorId, formatted_date)
 
@@ -383,6 +448,9 @@ def get_slots_on_game_id(vendorId, gameId, date):
             raw_available = int(row[2] or 0)
             booked_count = int(booking_counts.get((slot_id, formatted_date), 0))
             computed_available = max(total_slots_for_game - booked_count, 0)
+            raw_available = _repair_leaked_capacity(
+                vendorId, slot_id, formatted_date, raw_available,
+                computed_available - int(qr_units.get((slot_id, formatted_date), 0)))
             # `available_slot` in VENDOR_<id>_SLOT is the source of truth and already
             # decremented by booking flow (including PC squad slot_units). Never inflate
             # availability above this value via booking-row count heuristics.
@@ -510,9 +578,13 @@ def get_slots_batch(vendorId):
         
         total_slots_map = {
             int(g.id): int(g.total_slot or 0)
-            for g in AvailableGame.query.filter(AvailableGame.id.in_(game_ids)).all()
+            for g in AvailableGame.query.filter(
+                AvailableGame.id.in_(game_ids), AvailableGame.vendor_id == vendorId).all()
         }
+        for gid in list(total_slots_map):
+            total_slots_map[gid] = sync_game_capacity(vendorId, gid) or total_slots_map[gid]
         booking_counts = _load_booking_counts(vendorId, game_ids, formatted_dates)
+        qr_units = _load_qr_held_units(vendorId, formatted_dates)
         live_holds = load_console_holds(vendorId, game_ids)
         expected_blocks_by_date = {
             d: _expected_blocks_for_date(vendorId, d) for d in formatted_dates
@@ -534,6 +606,10 @@ def get_slots_batch(vendorId):
             game_id = int(row[8])
             booked_count = int(booking_counts.get((int(row[0]), date_obj.strftime("%Y-%m-%d")), 0))
             computed_available = max(int(total_slots_map.get(game_id, 0)) - booked_count, 0)
+            day_key = date_obj.strftime("%Y-%m-%d")
+            raw_available = _repair_leaked_capacity(
+                vendorId, int(row[0]), day_key, raw_available,
+                computed_available - int(qr_units.get((int(row[0]), day_key), 0)))
             # Keep DB availability authoritative; count-based estimate is only a cap.
             resolved_available = min(raw_available, computed_available) if bool(row[2]) else 0
             resolved_available = min(resolved_available, free_console_capacity(
