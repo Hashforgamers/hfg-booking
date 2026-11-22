@@ -227,6 +227,24 @@ def emit_booking_event(
         logger.exception("emit_booking_event failed: event='%s' error=%s", event, exc)
         return None
 
+def emit_vendor_event(socketio: Any, event: str, data: Dict[str, Any], vendor_id: Optional[int]) -> bool:
+    """Emit to one vendor's room only. Never broadcasts: payloads can carry
+    access codes and customer ids, and every bridge listens per vendor."""
+    if not socketio or not vendor_id:
+        logger.warning("emit_vendor_event skipped: event='%s' vendor=%s", event, vendor_id)
+        return False
+    payload = _to_jsonable(dict(data, vendorId=int(vendor_id), vendor_id=int(vendor_id)))
+    try:
+        try:
+            socketio.emit(event, payload, to=f"vendor_{int(vendor_id)}")
+        except TypeError:
+            socketio.emit(event, payload, room=f"vendor_{int(vendor_id)}")
+        return True
+    except Exception:
+        logger.exception("emit_vendor_event failed: event='%s' vendor=%s", event, vendor_id)
+        return False
+
+
 def build_booking_event_payload(*, vendor_id, booking_id, slot_id, user_id, username,
                                 game_id, game_name, date_value, slot_price,
                                 start_time, end_time, console_id,
