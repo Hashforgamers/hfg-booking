@@ -1,8 +1,23 @@
 # socketio_events.py
 
-from flask import current_app
+import hmac
+import os
+
+from flask import current_app, request
 from flask_socketio import SocketIO, join_room, emit
 from datetime import datetime
+
+
+def _bridge_token_ok() -> bool:
+    """Opt-in: when BOOKING_AUTH_TOKEN is set, only the dashboard-service bridge
+    (which sends the same value as a Bearer header) may connect and join vendor
+    rooms. Unset keeps today's open behaviour, so deploy the bridge env first."""
+    expected = (os.getenv("BOOKING_AUTH_TOKEN") or "").strip()
+    if not expected:
+        return True
+    header = request.headers.get("Authorization", "")
+    supplied = header[7:].strip() if header.lower().startswith("bearer ") else ""
+    return bool(supplied) and hmac.compare_digest(supplied, expected)
 
 socketio: SocketIO | None = None  # Global socket instance
 
@@ -15,7 +30,10 @@ def register_socketio_events(socket: SocketIO):
     socketio = socket
 
     @socketio.on("connect")
-    def handle_connect():
+    def handle_connect(auth=None):
+        if not _bridge_token_ok():
+            current_app.logger.warning("Rejected unauthenticated booking socket connection")
+            return False
         current_app.logger.info("Client connected to WebSocket")
         # Optionally, auto-join a general health room for all clients
         join_room("health")  # harmless if dashboard expects to listen here

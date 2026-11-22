@@ -4807,12 +4807,13 @@ def direct_booking():
         )
 
         # ✅ Emit socket event
+        from utils.realtime import emit_vendor_event
         for booking in bookings:
-            socketio.emit('slot_booked', {
+            emit_vendor_event(socketio, 'slot_booked', {
                 'slot_id': booking.slot_id,
                 'booking_id': booking.id,
                 'status': 'booked'
-            })
+            }, vendor_id)
         # ✅ Emit booking events for dashboard upcoming updates
         for payload in event_payloads:
             try:
@@ -9130,24 +9131,26 @@ def accept_pay_at_cafe_booking():
             accepted_booking_ids, vendor_id
         )
         
-        # Emit acceptance notification via socket
-        socketio = current_app.extensions.get('socketio')
-        if socketio:
-            socketio.emit('pay_at_cafe_accepted', {
-                'bookingId': booking_id,
-                'vendorId': vendor_id,
-                'bookingIds': accepted_booking_ids,
-                'batch_id': batch_id,
-                'userId': booking.user_id,
-                'status': 'confirmed',
-                'access_code': code,
-                'message': 'Your booking has been accepted! Please visit the cafe with this confirmation.',
-                'timestamp': datetime.utcnow().isoformat()
-            })
+        accepted_event = {
+            'bookingId': booking_id,
+            'vendorId': vendor_id,
+            'bookingIds': accepted_booking_ids,
+            'batch_id': batch_id,
+            'userId': booking.user_id,
+            'status': 'confirmed',
+            'access_code': code,
+            'message': 'Your booking has been accepted! Please visit the cafe with this confirmation.',
+            'timestamp': datetime.utcnow().isoformat()
+        }
 
         # Commit all changes
         db.session.commit()
         _invalidate_pay_at_cafe_vendor_cache(int(vendor_id))
+
+        # Publish only after commit (a refetch must see the accepted rows) and
+        # only to this vendor: the payload carries the gamer's access code.
+        from utils.realtime import emit_vendor_event
+        emit_vendor_event(current_app.extensions.get('socketio'), 'pay_at_cafe_accepted', accepted_event, vendor_id)
         if accepted_booking_ids:
             try:
                 source_reason = {
@@ -9294,19 +9297,18 @@ def reject_pay_at_cafe_booking():
         )
         
         # Emit rejection notification via socket
-        socketio = current_app.extensions.get('socketio')
-        if socketio:
-            socketio.emit('pay_at_cafe_rejected', {
-                'bookingId': booking_id,
-                'vendorId': vendor_id,
-                'bookingIds': rejected_booking_ids,
-                'batch_id': batch_id,
-                'userId': booking.user_id,
-                'status': 'cancelled',
-                'reason': rejection_reason,
-                'message': f'Your booking has been rejected by the vendor. Reason: {rejection_reason}',
-                'timestamp': datetime.utcnow().isoformat()
-            })
+        from utils.realtime import emit_vendor_event
+        emit_vendor_event(current_app.extensions.get('socketio'), 'pay_at_cafe_rejected', {
+            'bookingId': booking_id,
+            'vendorId': vendor_id,
+            'bookingIds': rejected_booking_ids,
+            'batch_id': batch_id,
+            'userId': booking.user_id,
+            'status': 'cancelled',
+            'reason': rejection_reason,
+            'message': f'Your booking has been rejected by the vendor. Reason: {rejection_reason}',
+            'timestamp': datetime.utcnow().isoformat()
+        }, vendor_id)
         
         # Send rejection email to customer
         if primary_user and primary_user.contact_info:
@@ -10982,6 +10984,21 @@ def monthly_credit_eligibility(vendor_id, user_id):
     return jsonify(success=True, accounts=rows)
 
 
+def _emit_gamers_credit_updated(vendor_id, user_id=None):
+    """Tell open dashboards (via the dashboard-service bridge) that credit changed."""
+    from utils.realtime import emit_vendor_event
+    emit_vendor_event(current_app.extensions.get('socketio'), 'gamers_credit_updated',
+                      {'user_id': int(user_id) if user_id else None}, vendor_id)
+
+
+def _emit_vendor_transaction_update(vendor_id, transaction_id):
+    """A credit settlement is money in: refresh live Transactions."""
+    from utils.realtime import emit_vendor_event
+    emit_vendor_event(current_app.extensions.get('socketio'), 'booking_payment_update',
+                      {'transaction_id': int(transaction_id) if transaction_id else None,
+                       'payment_use_case': 'monthly_credit_settlement', 'status': 'paid'}, vendor_id)
+
+
 @booking_blueprint.route('/vendor/<int:vendor_id>/monthly-credit/accounts', methods=['GET', 'PUT'])
 @require_vendor_permission("credit.manage")
 def monthly_credit_accounts(vendor_id):
@@ -11061,6 +11078,7 @@ def monthly_credit_accounts(vendor_id):
             description=f"Credit limit ₹{old_limit:.2f} → ₹{limit:.2f}; account {'active' if account.is_active else 'paused'}",
             booked_date=datetime.utcnow().date(),source_channel=actor["source_channel"],staff_id=actor["staff_id"],staff_name=actor["staff_name"]))
         db.session.commit()
+        _emit_gamers_credit_updated(vendor_id, account.user_id)
         return jsonify({"success": True, "account_id": account.id}), 200
     except (ValueError,TypeError,KeyError) as e:
         db.session.rollback()
@@ -11204,6 +11222,8 @@ def settle_monthly_credit(vendor_id):
 
         account.outstanding_amount = max(0.0, float(account.outstanding_amount or 0) - amount)
         db.session.commit()
+        _emit_gamers_credit_updated(vendor_id, account.user_id)
+        _emit_vendor_transaction_update(vendor_id, transaction.id)
 
         return jsonify({
             "success": True,
@@ -11238,6 +11258,7 @@ def adjust_monthly_credit(vendor_id):
             description=reason,booked_date=datetime.utcnow().date(),due_date=datetime.utcnow().date(),
             source_channel=actor['source_channel'],staff_id=actor['staff_id'],staff_name=actor['staff_name']))
         db.session.commit()
+        _emit_gamers_credit_updated(vendor_id, account.user_id)
         return jsonify(success=True,outstanding_amount=balance)
     except (ValueError,TypeError,KeyError) as e:
         db.session.rollback();return jsonify(success=False,message=str(e)),400
