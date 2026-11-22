@@ -93,6 +93,16 @@ def cancel(vendor_id, collection_id):
         return _fail(error)
 
 
+@desk_upi_qr.post('/vendor/<int:vendor_id>/upi-qr/<collection_id>/send-link')
+@require_vendor_permission('booking.manage')
+def send_link(vendor_id, collection_id):
+    body = request.get_json(silent=True) or {}
+    try:
+        return jsonify(success=True, **qr.send_link(collection_id, vendor_id, body.get('phone')))
+    except Exception as error:
+        return _fail(error)
+
+
 @desk_upi_qr.post('/payments/desk-upi-webhook')
 def webhook():
     secret = current_app.config.get('DESK_UPI_WEBHOOK_SECRET') or os.getenv('DESK_UPI_WEBHOOK_SECRET', '')
@@ -100,12 +110,18 @@ def webhook():
     if not secret or not hmac.compare_digest(expected, request.headers.get('X-Razorpay-Signature', '')):
         return '', 403
     body = request.get_json(silent=True) or {}
-    if body.get('event') != 'qr_code.credited':
-        return '', 200
+    event = body.get('event')
     payload = body.get('payload') or {}
-    qr_entity = (payload.get('qr_code') or {}).get('entity') or {}
     payment = (payload.get('payment') or {}).get('entity') or {}
-    collection_id = qr.collection_for_qr(qr_entity.get('id'))
+    if event == 'qr_code.credited':
+        entity_id = ((payload.get('qr_code') or {}).get('entity') or {}).get('id')
+        collection_id = qr.collection_for_qr(entity_id)
+        payment = dict(payment, _via_qr=True)
+    elif event == 'payment_link.paid':
+        entity_id = ((payload.get('payment_link') or {}).get('entity') or {}).get('id')
+        collection_id = qr.collection_for_link(entity_id)
+    else:
+        return '', 200
     if not collection_id:
         return '', 200  # Another product on the shared HFG account.
     try:
@@ -116,6 +132,6 @@ def webhook():
             _emit(vendor_id, state)
     except Exception:
         db.session.rollback()
-        current_app.logger.exception('desk_upi_qr webhook failed for %s', qr_entity.get('id'))
+        current_app.logger.exception('desk_upi_qr webhook failed for %s', entity_id)
         return '', 503  # Razorpay retries.
     return '', 200

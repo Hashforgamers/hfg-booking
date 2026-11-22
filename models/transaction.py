@@ -10,9 +10,9 @@ class Transaction(db.Model):
     booking_id = Column(Integer, ForeignKey('bookings.id'), nullable=True)  # made nullable
     vendor_id = Column(Integer, ForeignKey('vendors.id'), nullable=True)    # nullable for system-wide transactions
     user_id = Column(Integer, nullable=True)
-    booked_date = Column(Date, default=datetime.utcnow().date(), nullable=False)
-    booking_date = Column(Date, default=datetime.utcnow().date(), nullable=False)
-    booking_time = Column(Time, default=datetime.utcnow().time(), nullable=False)
+    booked_date = Column(Date, default=lambda: datetime.utcnow().date(), nullable=False)
+    booking_date = Column(Date, default=lambda: datetime.utcnow().date(), nullable=False)
+    booking_time = Column(Time, default=lambda: datetime.utcnow().time(), nullable=False)
     user_name = Column(String(255), nullable=False)
     amount = Column(Float, nullable=False)
     original_amount = Column(Float, nullable=False)

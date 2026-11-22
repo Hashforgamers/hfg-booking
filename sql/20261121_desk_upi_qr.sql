@@ -31,3 +31,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS desk_upi_one_open_per_booking
  ON desk_upi_collections(booking_id) WHERE status IN ('creating','open');
 CREATE INDEX IF NOT EXISTS desk_upi_cafe_settlement
  ON desk_upi_collections(vendor_id, cafe_settlement_status, paid_at);
+-- Optional payment link sent by SMS to the customer's phone for the same bill.
+ALTER TABLE desk_upi_collections ADD COLUMN IF NOT EXISTS link_id text UNIQUE;
+ALTER TABLE desk_upi_collections ADD COLUMN IF NOT EXISTS link_url text;
+ALTER TABLE desk_upi_collections ADD COLUMN IF NOT EXISTS link_phone text;

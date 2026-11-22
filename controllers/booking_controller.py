@@ -7399,6 +7399,24 @@ def get_vendor_booking_stats(vendor_id):
             'error': str(e)
         }), 500
 
+@booking_blueprint.route('/booking/<int:booking_id>/overtime-quote', methods=['GET'])
+@require_vendor_permission("booking.manage")
+def booking_overtime_quote(booking_id):
+    """Overtime the desk should collect now, priced on the server."""
+    from services.overtime_quote import quote as overtime_quote, parse_played_until, OvertimeError
+    booking = Booking.query.filter_by(id=booking_id).first()
+    if not booking:
+        return jsonify(success=False,message='Booking not found'),404
+    try:
+        result = overtime_quote(db.session, int(g.vendor_id), booking, console_id=request.args.get('console_id'),
+                                played_until=parse_played_until(request.args.get('played_until')))
+    except OvertimeError as exc:
+        return jsonify(success=False,message=exc.message),exc.status
+    response = jsonify(success=True,quote=result)
+    response.headers['Cache-Control'] = 'no-store'
+    return response,200
+
+
 @booking_blueprint.route('/extraBooking', methods=['POST'])
 @require_vendor_permission("booking.manage")
 def extra_booking():
@@ -7408,7 +7426,9 @@ def extra_booking():
     try:
         data = request.get_json(silent=True) or {}
 
-        required_fields = ["consoleNumber", "consoleType", "date", "slotId", "userId", "username", "amount", "gameId", "modeOfPayment", "vendorId"]
+        # With booking_id the amount is priced on the server and a client amount
+        # is ignored. The older call without booking_id still sends one.
+        required_fields = ["consoleNumber", "consoleType", "date", "slotId", "userId", "username", "gameId", "modeOfPayment", "vendorId"]
         if not all(data.get(field) is not None for field in required_fields):
             return jsonify({"message": "Missing required fields"}), 400
 
@@ -7418,7 +7438,7 @@ def extra_booking():
         slot_id = int(data["slotId"])
         user_id = int(data["userId"])
         username = data["username"]
-        amount = float(data["amount"])
+        amount = float(data.get("amount") or 0)
         game_id = int(data["gameId"])
         mode_of_payment = str(data["modeOfPayment"]).strip().lower()
         if mode_of_payment not in {'cash', 'card', 'upi', 'pay_at_cafe', 'monthly_credit', 'pending', 'unpaid'}:
@@ -7489,6 +7509,21 @@ def extra_booking():
             if managed:
                 return jsonify(success=False,code='managed_extension_settlement',runtime_id=managed,
                     message='Use the server session extension settlement; this time is already metered.'),409
+        if requested_booking_id is not None:
+            from services.overtime_quote import quote as overtime_quote, parse_played_until, OvertimeError
+            try:
+                priced = overtime_quote(db.session, vendor_id, primary_booking, console_id=console_number,
+                                        played_until=parse_played_until(data.get('played_until')))
+            except OvertimeError as exc:
+                return jsonify(success=False,message=exc.message),exc.status
+            if priced['needs_end_time'] and not data.get('confirm_full_overtime'):
+                return jsonify(success=False,code='overtime_needs_end_time',quote=priced,
+                    message='This session ran more than 3 hours past its end. Confirm when play really ended.'),409
+            amount = float(priced['amount'])
+            if amount <= 0:
+                return jsonify(success=True,message='No overtime to charge',overtime_quote=priced,booking_id=primary_booking.id),200
+        elif amount <= 0:
+            return jsonify(message='Missing required fields'),400
         created_booking = primary_booking is None
         if created_booking:
             from services.slot_capacity import reserve_slot
