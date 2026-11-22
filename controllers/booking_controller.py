@@ -2930,6 +2930,20 @@ def capture_payment():
         current_app.logger.error(f"Razorpay error during capture: {str(e)}")
         return jsonify({"message": "Error capturing payment", "error": str(e)}), 500
 
+def _user_already_holds_slot(user_id, game_id, slot_id, book_date):
+    """True when this gamer already has a live booking for this game, slot and day."""
+    if not user_id:
+        return False
+    day = book_date.isoformat() if hasattr(book_date, "isoformat") else str(book_date)
+    return db.session.execute(text("""
+        SELECT 1 FROM bookings b
+        WHERE b.user_id = :uid AND b.game_id = :gid AND b.slot_id = :sid
+          AND lower(COALESCE(b.status, '')) IN ('pending_acceptance', 'confirmed', 'checked_in')
+          AND (CAST(b.squad_details AS jsonb)->>'booked_date') = :day
+        LIMIT 1
+    """), {"uid": int(user_id), "gid": int(game_id), "sid": int(slot_id), "day": day[:10]}).first() is not None
+
+
 @booking_blueprint.route('/bookings', methods=['POST'])
 @auth_required_self(decrypt_user=True) 
 def create_booking():
@@ -2999,6 +3013,7 @@ def create_booking():
         log.info("bookings.post.vendor_resolved cid=%s vendor_id=%s", cid, vendor_id)
 
         booking_mappings = []
+        duplicate_slots = []
         processed = 0
         skipped = 0
 
@@ -3021,6 +3036,14 @@ def create_booking():
                     log.info("bookings.post.slot_skipped cid=%s slot_id=%s reason=%s",
                              cid, slot_id,
                              ("no_entry" if slot_entry is None else ("no_slots" if int(slot_entry[0] or 0) < slot_units else "not_available")))
+                    continue
+
+                # One gamer holding the same time twice is a mistaken re-booking,
+                # billed twice and taking a PC from others. Squads book PCs explicitly.
+                if not squad_enabled and _user_already_holds_slot(user_id, game_id, slot_id, book_date_obj):
+                    duplicate_slots.append(slot_id)
+                    skipped += 1
+                    log.info("bookings.post.slot_skipped cid=%s slot_id=%s reason=already_booked", cid, slot_id)
                     continue
 
                 booking = BookingService.create_booking(
@@ -3074,6 +3097,9 @@ def create_booking():
 
         if not booking_mappings:
             log.info("bookings.post.none_booked cid=%s", cid)
+            if duplicate_slots and len(duplicate_slots) == processed:
+                return jsonify({"message": "You already have a booking for this time.",
+                                "error": "already_booked", "slot_ids": duplicate_slots}), 409
             return jsonify({"message": "No slots available for booking"}), 400
 
         # Notify cafe for app-created pay-at-cafe requests immediately.

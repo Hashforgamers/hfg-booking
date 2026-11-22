@@ -294,6 +294,24 @@ RELEASED_BOOKING_STATUSES = (
 )
 
 
+def _booking_play_date(squad_details):
+    """The date a booking reserved, as stored at creation (booked_date)."""
+    details = squad_details
+    if isinstance(details, str):
+        try:
+            import json
+            details = json.loads(details)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(details, dict):
+        return None
+    value = str(details.get("booked_date") or details.get("book_date") or "").strip()[:10]
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date() if value else None
+    except ValueError:
+        return None
+
+
 def _load_booking_counts(vendor_id, game_ids, formatted_dates):
     """
     Return map {(slot_id, YYYY-MM-DD): console units held by live bookings}
@@ -320,13 +338,29 @@ def _load_booking_counts(vendor_id, game_ids, formatted_dates):
         .all()
     )
 
+    # Later adjustments (waive-off, extra time, meals) are dated the day they
+    # are recorded. They must not move an old booking onto that day's slot.
+    play_dates = {}
+    candidate_ids = {int(row.id) for row in rows}
+    if candidate_ids:
+        play_dates = {
+            int(bid): first for bid, first in db.session.query(
+                Transaction.booking_id, func.min(Transaction.booked_date)
+            ).filter(Transaction.booking_id.in_(candidate_ids)).group_by(Transaction.booking_id).all()
+        }
+
     out = {}
     seen = set()
     for row in rows:
         if not row.slot_id or not row.booked_date or row.id in seen:
             continue
         seen.add(row.id)  # one booking has several transactions (meals, extra time)
-        key = (int(row.slot_id), row.booked_date.strftime("%Y-%m-%d"))
+        play_date = _booking_play_date(row.squad_details) or play_dates.get(int(row.id)) or row.booked_date
+        if hasattr(play_date, "strftime"):
+            play_date = play_date.strftime("%Y-%m-%d")
+        if str(play_date)[:10] not in formatted_dates:
+            continue
+        key = (int(row.slot_id), str(play_date)[:10])
         try:
             units = booking_units(row.squad_details)
         except (TypeError, ValueError):
