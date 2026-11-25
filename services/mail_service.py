@@ -6,6 +6,7 @@ from flask_mail import Message
 
 from db.extensions import mail
 from services.email_template import build_hfg_email_html, email_text
+from services.walkin_contact import is_placeholder_email, public_email, public_phone
 
 
 def _to_float(value, default=0.0) -> float:
@@ -25,7 +26,8 @@ def _normalize_recipients(recipients: Iterable[str]) -> list[str]:
     normalized = []
     for item in recipients or []:
         email = str(item or "").strip()
-        if email:
+        # Walk-ins without an email have NULL or a placeholder address.
+        if email and not is_placeholder_email(email):
             normalized.append(email)
     return normalized
 
@@ -140,8 +142,8 @@ def booking_mail(
     <p style=\"margin:0 0 16px 0;color:#cbd5e1;\">Your booking at <strong>{_safe(cafe_name)}</strong> is confirmed.</p>
 
     <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"border:1px solid #1e2a44;border-radius:8px;overflow:hidden;background:#08142c;\">
-      <tr><td style=\"padding:9px;color:#94a3b8;\">Phone</td><td style=\"padding:9px;\">{_safe(gamer_phone)}</td></tr>
-      <tr><td style=\"padding:9px;color:#94a3b8;\">Email</td><td style=\"padding:9px;\">{_safe(gamer_email)}</td></tr>
+      <tr><td style=\"padding:9px;color:#94a3b8;\">Phone</td><td style=\"padding:9px;\">{_safe(public_phone(gamer_phone) or "Not provided")}</td></tr>
+      <tr><td style=\"padding:9px;color:#94a3b8;\">Email</td><td style=\"padding:9px;\">{_safe(public_email(gamer_email) or "Not provided")}</td></tr>
       <tr><td style=\"padding:9px;color:#94a3b8;\">Booking Date</td><td style=\"padding:9px;\">{_safe(booking_date)}</td></tr>
       <tr><td style=\"padding:9px;color:#94a3b8;\">Booked For</td><td style=\"padding:9px;\">{_safe(booked_for_date)}</td></tr>
       <tr><td style=\"padding:9px;color:#94a3b8;\">Total Paid</td><td style=\"padding:9px;color:#22c55e;font-weight:700;\">₹{paid_amount:.2f}</td></tr>
