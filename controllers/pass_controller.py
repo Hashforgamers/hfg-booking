@@ -1,3 +1,4 @@
+from services.walkin_contact import public_email
 import html
 # controllers/pass_controller.py
 from flask import Blueprint, request, jsonify, current_app, g
@@ -400,7 +401,7 @@ def send_dashboard_pass_otp():
             .filter(User.id == int(user_id))
             .first()
         )
-        if not user or not user.contact_info or not user.contact_info.email:
+        if not user or not user.contact_info or not public_email(user.contact_info.email):
             return jsonify({"success": False, "message": "User email not found for OTP delivery"}), 400
 
         User.query.filter_by(id=user_id).with_for_update().first()

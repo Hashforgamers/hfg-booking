@@ -7,8 +7,8 @@ class ContactInfo(db.Model):
     __tablename__ = 'contact_info'
     
     id = Column(Integer, primary_key=True)
-    email = Column(String(255), nullable=False)
-    phone = Column(String(50), nullable=False)
+    email = Column(String(255), nullable=True)  # NULL for walk-ins without email
+    phone = Column(String(50), nullable=True)  # NULL for walk-ins without phone
     
     # Generic parent relationship columns
     parent_id = Column(Integer, ForeignKey('users.id'), nullable=False)
