@@ -26,6 +26,26 @@ from rq import get_current_job
 import uuid
 
 
+def _compact_slot_date(transaction_date, squad_details):
+    """The booked day: the transaction's date, else the date stored on the booking."""
+    if transaction_date:
+        return transaction_date.isoformat()
+    details = squad_details
+    if isinstance(details, str):
+        try:
+            import json
+            details = json.loads(details)
+        except (ValueError, TypeError):
+            details = None
+    if isinstance(details, dict):
+        value = str(details.get("booked_date") or details.get("book_date") or "").strip()
+        if len(value) == 8 and value.isdigit():
+            value = f"{value[:4]}-{value[4:6]}-{value[6:]}"
+        if len(value) >= 10 and value[4] == "-" and value[7] == "-":
+            return value[:10]
+    return None
+
+
 class BookingService:
     socketio = None  # Placeholder for the socketio instance
 
@@ -71,7 +91,8 @@ class BookingService:
                 s.id AS slot_id,
                 s.start_time,
                 s.end_time,
-                tx.booked_date
+                tx.booked_date,
+                b.squad_details
             FROM bookings b
             LEFT JOIN available_games ag ON ag.id = b.game_id
             LEFT JOIN slots s ON s.id = b.slot_id
@@ -99,6 +120,7 @@ class BookingService:
                 "booking_mode": row["booking_mode"] or "regular",
                 "access_code": None,
                 "book_date": row["booked_date"].isoformat() if row["booked_date"] else None,
+                "slot_date": _compact_slot_date(row["booked_date"], row["squad_details"]),
                 "created_at": row["created_at"].isoformat() if row["created_at"] else None,
                 "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
                 "extra_services": [],
