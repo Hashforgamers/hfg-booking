@@ -62,6 +62,7 @@ from sqlalchemy import and_, or_, cast, String
 import sqlalchemy as sa
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy import func, distinct
+from services.walkin_contact import storable_contact, public_email, public_phone
 from services.mail_service import booking_mail, reject_booking_mail, extra_booking_time_mail, vendor_booking_notification_mail
 from services.console_catalog_service import (
     get_merged_console_catalog,
@@ -381,7 +382,8 @@ def _log_pricing_event(event: str, **fields):
 
 DEFAULT_VENDOR_BOOKING_FIELD_CONFIG = {
     "name": {"visible": True, "required": True},
-    "phone": {"visible": True, "required": True},
+    # Walk-ins (e.g. kids) may have no phone or email: name alone is enough.
+    "phone": {"visible": True, "required": False},
     "email": {"visible": True, "required": False},
 }
 _VENDOR_BOOKING_FIELD_PREF_TABLE_READY = False
@@ -431,7 +433,7 @@ def _normalize_vendor_booking_field_config(payload):
 
     show_phone = _to_bool(incoming.get("show_phone", True), True)
     show_email = _to_bool(incoming.get("show_email", True), True)
-    require_phone = _to_bool(incoming.get("require_phone", True), True)
+    require_phone = _to_bool(incoming.get("require_phone", False), False)
     require_email = _to_bool(incoming.get("require_email", False), False)
 
     # Required contact field must be visible.
@@ -445,16 +447,14 @@ def _normalize_vendor_booking_field_config(payload):
         show_email = False
 
     if not show_phone and not show_email:
-        return None, "At least one contact field (phone/email) must stay visible"
+        # Keep phone on the form so staff can still capture it when available.
+        show_phone = True
 
     # If hidden, it cannot remain required.
     if not show_phone:
         require_phone = False
     if not show_email:
         require_email = False
-
-    if not require_phone and not require_email:
-        return None, "At least one contact field (phone/email) must be required"
 
     return {
         "name": {"visible": True, "required": True},
@@ -1420,18 +1420,8 @@ def _resolve_or_create_squad_member_user(member_name: str, member_phone: str):
     if contact_match and contact_match.parent_id:
         return int(contact_match.parent_id)
 
-    safe_phone = "".join(ch for ch in phone if ch.isdigit())[-10:] or str(random.randint(1000000000, 9999999999))
-    base_email = f"squad+{safe_phone}@hash.local"
-    email_candidate = base_email
-    suffix = 1
-    while ContactInfo.query.filter(
-        and_(
-            ContactInfo.parent_type == "user",
-            ContactInfo.email == email_candidate,
-        )
-    ).first():
-        email_candidate = f"squad+{safe_phone}.{suffix}@hash.local"
-        suffix += 1
+    safe_phone = "".join(ch for ch in phone if ch.isdigit())[-10:] or "0000"
+    stored_phone, stored_email = storable_contact(phone, None)
 
     username_base = "".join(ch for ch in (name.lower() or "player") if ch.isalnum())[:16] or "player"
     game_username = f"{username_base}_{random.randint(1000, 9999)}"
@@ -1446,8 +1436,8 @@ def _resolve_or_create_squad_member_user(member_name: str, member_phone: str):
         parent_type="user",
     )
     new_contact = ContactInfo(
-        phone=phone,
-        email=email_candidate,
+        phone=stored_phone,
+        email=stored_email,
         parent_type="user",
     )
     new_user.contact_info = new_contact
@@ -5147,8 +5137,6 @@ def new_booking(vendor_id):
             return jsonify({"message": "Phone number is required"}), 400
         if email_required and not email:
             return jsonify({"message": "Email is required"}), 400
-        if not phone and not email:
-            return jsonify({"message": "Either phone or email is required"}), 400
 
         # ✅ Validate console type
         if not console_type:
@@ -5399,14 +5387,8 @@ def new_booking(vendor_id):
                     user = User.query.filter_by(id=existing_contact.parent_id).first()
 
         if not user:
-            safe_phone = "".join(ch for ch in phone if ch.isdigit())[-10:] if phone else ""
-            if not safe_phone:
-                safe_phone = str(random.randint(1000000000, 9999999999))
-
-            if not email:
-                email = f"noemail_{safe_phone}@hash.local"
-            if not phone:
-                phone = safe_phone
+            # Name-only walk-ins get NULL phone/email (never a made-up number).
+            stored_phone, stored_email = storable_contact(phone, email)
 
             user = User(
                 fid=generate_fid(),
@@ -5417,8 +5399,8 @@ def new_booking(vendor_id):
 
             )
             contact_info = ContactInfo(
-                phone=phone,
-                email=email,
+                phone=stored_phone,
+                email=stored_email,
                 parent_type="user"
             )
             user.contact_info = contact_info
@@ -5426,11 +5408,10 @@ def new_booking(vendor_id):
             db.session.flush()
             current_app.logger.info(f"Created new user: {name}")
         elif not getattr(user, "contact_info", None):
-            fallback_phone = phone or str(random.randint(1000000000, 9999999999))
-            fallback_email = email or f"noemail_{''.join(ch for ch in fallback_phone if ch.isdigit())[-10:]}@hash.local"
+            stored_phone, stored_email = storable_contact(phone, email)
             user.contact_info = ContactInfo(
-                phone=fallback_phone,
-                email=fallback_email,
+                phone=stored_phone,
+                email=stored_email,
                 parent_type="user"
             )
             db.session.add(user.contact_info)
@@ -7867,8 +7848,8 @@ def get_user_details(vendor_id):
 
             if not name:
                 return jsonify({"success": False, "message": "name is required"}), 400
-            if not phone and not email:
-                return jsonify({"success": False, "message": "phone or email is required"}), 400
+            if not phone and whatsapp:
+                phone = whatsapp
 
             # Deduplicate by phone/email before creating a new user.
             existing_contact = None
@@ -7886,8 +7867,8 @@ def get_user_details(vendor_id):
                         "user": {
                             "id": existing_user.id,
                             "name": existing_user.name,
-                            "email": existing_contact.email,
-                            "phone": existing_contact.phone,
+                            "email": public_email(existing_contact.email),
+                            "phone": public_phone(existing_contact.phone),
                         }
                     }), 200
 
@@ -7898,11 +7879,8 @@ def get_user_details(vendor_id):
             while User.query.filter_by(game_username=game_username).first():
                 game_username = f"{slug}{random.randint(1000, 9999)}"
 
-            if not email:
-                safe_phone = "".join(ch for ch in phone if ch.isdigit())[-10:] or str(random.randint(1000000000, 9999999999))
-                email = f"noemail_{safe_phone}@hash.local"
-            if not phone:
-                phone = "0000000000"
+            # Name-only gamers (e.g. kids) get NULL phone/email.
+            phone, email = storable_contact(phone, email)
 
             user = User(
                 fid=generate_fid(),
@@ -7924,10 +7902,6 @@ def get_user_details(vendor_id):
             user.contact_info = contact_info
             db.session.add(contact_info)
 
-            # Optional metadata passthrough for upcoming recovery workflows.
-            if whatsapp and not body.get("phone"):
-                contact_info.phone = whatsapp
-
             db.session.commit()
             return jsonify({
                 "success": True,
@@ -7935,8 +7909,8 @@ def get_user_details(vendor_id):
                 "user": {
                     "id": user.id,
                     "name": user.name,
-                    "email": contact_info.email,
-                    "phone": contact_info.phone,
+                    "email": public_email(contact_info.email),
+                    "phone": public_phone(contact_info.phone),
                     "address": address or None,
                     "whatsapp_number": whatsapp or None,
                 }
@@ -8003,8 +7977,8 @@ def get_user_details(vendor_id):
                 {
                     "id": row.id,
                     "name": row.name,
-                    "email": row.email,
-                    "phone": row.phone,
+                    "email": public_email(row.email),
+                    "phone": public_phone(row.phone),
                 }
                 for row in rows
             ]), 200
@@ -8031,8 +8005,8 @@ def get_user_details(vendor_id):
                 "avatar_path": user.avatar_path,
                 "gender": user.gender,
                 "dob": user.dob.isoformat() if user.dob else None,
-                "email": contact.email if contact else None,
-                "phone": contact.phone if contact else None
+                "email": public_email(contact.email) if contact else None,
+                "phone": public_phone(contact.phone) if contact else None
             })
 
         return jsonify(user_list), 200
