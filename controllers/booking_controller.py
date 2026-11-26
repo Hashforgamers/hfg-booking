@@ -7407,6 +7407,19 @@ def get_vendor_booking_stats(vendor_id):
             'error': str(e)
         }), 500
 
+def _overtime_squad_multiplier(booking, vendor_id):
+    """How many times /extraBooking multiplies a slot-rate overtime amount:
+    PC squads pay per player, every other booking once."""
+    details = booking.squad_details if isinstance(booking.squad_details, dict) else {}
+    try:
+        count = max(int(details.get("player_count") or details.get("playerCount") or 1), 1)
+    except (TypeError, ValueError):
+        count = 1
+    game = AvailableGame.query.filter_by(id=booking.game_id, vendor_id=int(vendor_id)).first()
+    name = str(getattr(game, "game_name", "") or "")
+    return count if count > 1 and _requires_multi_console_units(name, vendor_id=vendor_id) else 1
+
+
 @booking_blueprint.route('/booking/<int:booking_id>/overtime-quote', methods=['GET'])
 @require_vendor_permission("booking.manage")
 def booking_overtime_quote(booking_id):
@@ -7417,7 +7430,8 @@ def booking_overtime_quote(booking_id):
         return jsonify(success=False,message='Booking not found'),404
     try:
         result = overtime_quote(db.session, int(g.vendor_id), booking, console_id=request.args.get('console_id'),
-                                played_until=parse_played_until(request.args.get('played_until')))
+                                played_until=parse_played_until(request.args.get('played_until')),
+                                squad_multiplier=_overtime_squad_multiplier(booking, int(g.vendor_id)))
     except OvertimeError as exc:
         return jsonify(success=False,message=exc.message),exc.status
     response = jsonify(success=True,quote=result)
@@ -7534,7 +7548,8 @@ def extra_booking():
             from services.overtime_quote import quote as overtime_quote, parse_played_until, OvertimeError
             try:
                 priced = overtime_quote(db.session, vendor_id, primary_booking, console_id=console_number,
-                                        played_until=parse_played_until(data.get('played_until')))
+                                        played_until=parse_played_until(data.get('played_until')),
+                                        squad_multiplier=_overtime_squad_multiplier(primary_booking, vendor_id))
             except OvertimeError as exc:
                 return jsonify(success=False,message=exc.message),exc.status
             if priced['needs_end_time'] and not data.get('confirm_full_overtime'):
@@ -7545,6 +7560,8 @@ def extra_booking():
                 return jsonify(success=True,message='No overtime to charge',overtime_quote=priced,booking_id=primary_booking.id),200
         elif amount <= 0:
             return jsonify(message='Missing required fields'),400
+        else:
+            priced = None
         created_booking = primary_booking is None
         if created_booking:
             from services.slot_capacity import reserve_slot
@@ -7568,6 +7585,9 @@ def extra_booking():
             and (squad_details.get("enabled") is True or squad_player_count > 1)
         )
         effective_multiplier = max(squad_player_count, 1) if is_pc_squad else 1
+        if priced and priced.get('amount_covers_squad'):
+            # Priced from the cafe's rate card for the whole squad already.
+            effective_multiplier = 1
 
         # Frontend sends overtime amount at per-player rate.
         # For PC squad, apply to full squad so billing remains transparent and complete.

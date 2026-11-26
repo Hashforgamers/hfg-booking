@@ -55,18 +55,20 @@ def price_overtime(overtime_seconds, hourly_rate):
     return float(math.ceil(overtime_seconds / 3600.0 * hourly_rate))
 
 
-def chain_end(rows, booking_id):
-    """End of the run of back-to-back slots that contains this booking.
+def chain_bounds(rows, booking_id):
+    """(start, end, booked_seconds) of the run of back-to-back slots that
+    contains this booking, or None.
 
     rows: dicts with book_id, date, start_time, end_time for one gamer on one
     console. Consecutive bookings are merged on the dashboard, so overtime
-    only starts after the last of them.
+    only starts after the last of them, and the whole run is the booked play.
     """
-    spans = sorted((_span(r["date"], r["start_time"], r["end_time"]) + (int(r["book_id"]),) for r in rows),
+    spans = sorted(set(_span(r["date"], r["start_time"], r["end_time"]) + (int(r["book_id"]),) for r in rows),
                    key=lambda s: s[0])
     own = [s for s in spans if s[2] == int(booking_id)]
     if not own:
         return None
+    start = min(s[0] for s in own)
     end = max(s[1] for s in own)
     changed = True
     while changed:
@@ -76,10 +78,70 @@ def chain_end(rows, booking_id):
                 if finish > end:
                     end = finish
                     changed = True
-    return end
+            if begin < start <= finish:
+                start = begin
+                changed = True
+    covered, cursor = 0.0, start
+    for begin, finish, _ in spans:
+        if finish <= start or begin >= end:
+            continue
+        begin, finish = max(begin, cursor), min(finish, end)
+        if finish > begin:
+            covered += (finish - begin).total_seconds()
+            cursor = finish
+    return start, end, covered
 
 
-def quote(session, vendor_id, booking, console_id=None, played_until=None, now=None):
+def chain_end(rows, booking_id):
+    bounds = chain_bounds(rows, booking_id)
+    return bounds[1] if bounds else None
+
+
+def load_rate_cards(session, vendor_id, game_id):
+    """(pricing_mode, cards) for this device from the desk rate-card tables."""
+    mode = session.execute(text("""SELECT mode FROM desk_pricing_settings
+        WHERE vendor_id=:v AND game_id=:g"""), {"v": vendor_id, "g": game_id}).scalar() or "slot"
+    cards = session.execute(text("""SELECT profile,revision,definition,rates,is_active,archived
+        FROM desk_rate_cards WHERE vendor_id=:v AND game_id=:g
+          AND is_active=true AND archived=false ORDER BY profile"""),
+        {"v": vendor_id, "g": game_id}).mappings().all()
+    return mode, [dict(c) for c in cards]
+
+
+def booking_players(booking):
+    details = booking.squad_details if isinstance(getattr(booking, "squad_details", None), dict) else {}
+    try:
+        return max(1, int(details.get("player_count") or details.get("playerCount") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def rate_card_price(session, vendor_id, booking, console_id, booked_seconds, own_seconds, overtime_seconds):
+    """(price_in_rupees, card, players) from the cafe's rate card, or (None, None, players)."""
+    from services import extra_play_pricing as epp
+
+    players = booking_players(booking)
+    details = booking.squad_details if isinstance(getattr(booking, "squad_details", None), dict) else {}
+    desk = details.get("desk_pricing") if isinstance(details.get("desk_pricing"), dict) else {}
+    mode, cards = load_rate_cards(session, vendor_id, booking.game_id)
+    if not cards:
+        return None, None, players
+    physical = details.get("desk_console_ids") or details.get("assigned_console_ids") or []
+    console = physical[0] if isinstance(physical, list) and len(physical) == 1 else console_id
+    candidates = epp.candidate_cards(cards, pricing_mode=mode, stored_profile=desk.get("profile"),
+                                     game_title=desk.get("selected_game") or "", console_id=console)
+    # What the booked part actually cost, for a fixed package the card cannot
+    # quote by duration. Only known when this booking is the whole run.
+    paid_base = desk.get("slot_base_amount") if abs(booked_seconds - own_seconds) < 1 else None
+    price, card = epp.best_extra_price(candidates, booked_seconds / 60.0, overtime_seconds / 60.0,
+                                       players, paid_base)
+    return (None if price is None else float(math.ceil(price))), card, players
+
+
+def quote(session, vendor_id, booking, console_id=None, played_until=None, now=None, squad_multiplier=1):
+    """squad_multiplier: how many times the desk multiplies a slot-rate amount
+    for this squad (PC squads pay per player). A rate-card amount already
+    covers the whole squad, so the desk must not multiply it again."""
     from models.availableGame import AvailableGame
     from models.slot import Slot
 
@@ -100,13 +162,14 @@ def quote(session, vendor_id, booking, console_id=None, played_until=None, now=N
         {"uid": first["user_id"], "day": first["date"], "next_day": first["date"] + timedelta(days=1),
          "cid": first["console_id"]}).mappings().all()
     rows = list(rows) + [dict(r) for r in own]
-    end = chain_end(rows, booking.id)
+    _start, end, booked_seconds = chain_bounds(rows, booking.id)
 
     game = AvailableGame.query.filter_by(id=booking.game_id, vendor_id=vendor_id).first()
     slot = Slot.query.filter_by(id=booking.slot_id).first()
     if not game or not slot:
         raise OvertimeError("Booking price could not be found", 409)
     begin, finish = _span(first["date"], slot.start_time, slot.end_time)
+    own_seconds = (finish - begin).total_seconds()
     hourly = rate_per_hour(game.single_slot_price, (finish - begin).total_seconds())
 
     overtime_until = now
@@ -121,6 +184,18 @@ def quote(session, vendor_id, booking, console_id=None, played_until=None, now=N
           AND COALESCE(settlement_status,'') NOT IN ('cancelled','canceled','refunded','reversed')"""),
         {"bid": booking.id}).scalar() or 0)
     gross = price_overtime(seconds, hourly)
+    multiplier = max(1, int(squad_multiplier or 1))
+    card_price, card, players = rate_card_price(session, vendor_id, booking, console_id,
+                                                booked_seconds, own_seconds, seconds)
+    # The rate card is used only when it is no dearer than the old slot-rate
+    # charge for the same play (gross x squad multiplier). This change can
+    # therefore only lower what a gamer pays for extra time, never raise it.
+    source = "slot_rate"
+    if card_price is not None and card_price <= gross * multiplier:
+        source = "rate_card"
+        gross = card_price
+        if seconds:
+            hourly = gross * 3600.0 / seconds
     return {
         "booking_id": booking.id,
         "scheduled_end": end.isoformat(),
@@ -131,10 +206,21 @@ def quote(session, vendor_id, booking, console_id=None, played_until=None, now=N
         "gross_amount": gross,
         "already_recorded": round(recorded, 2),
         "amount": max(0.0, round(gross - recorded, 2)),
+        "pricing_source": source,
+        "rate_card": epp_summary(card) if source == "rate_card" else None,
+        "booked_minutes": round(booked_seconds / 60.0, 2),
+        "players": players,
+        # A rate-card amount is already the whole squad's price.
+        "amount_covers_squad": source == "rate_card",
         "needs_end_time": played_until is None and seconds > STALE_OVERTIME_SECONDS,
         "stale_after_seconds": STALE_OVERTIME_SECONDS,
         "server_time": now.isoformat(),
     }
+
+
+def epp_summary(card):
+    from services.extra_play_pricing import card_summary
+    return card_summary(card)
 
 
 def parse_played_until(value):
