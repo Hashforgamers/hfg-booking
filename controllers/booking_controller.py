@@ -9282,6 +9282,7 @@ def reject_pay_at_cafe_booking():
 
         vendor = Vendor.query.filter_by(id=vendor_id).first()
         rejected_booking_ids = []
+        released_slots = []
         primary_user = None
         for booking_row in bookings_to_reject:
             available_game = AvailableGame.query.filter_by(id=booking_row.game_id).first()
@@ -9293,23 +9294,36 @@ def reject_pay_at_cafe_booking():
                 primary_user = user
 
             booked_date = resolve_booking_booked_date(booking_row)
+
+            # Free the reserved capacity inside this transaction. The old
+            # BookingService.release_slot only handles pending_verified rows and
+            # ends with db.session.remove(), which threw away the 'cancelled'
+            # status set here, so rejected requests stayed pending_acceptance.
+            try:
+                _release_slot_for_booking(booking_row, vendor_id, booked_date)
+            except ValueError as release_err:
+                # Missing schedule row: nothing to give back, still reject.
+                current_app.logger.warning(
+                    "pay_at_cafe.reject slot_release_skipped booking_id=%s err=%s",
+                    booking_row.id,
+                    release_err,
+                )
+
             booking_row.status = 'cancelled'
             booking_row.updated_at = datetime.utcnow()
-
-            try:
-                BookingService.release_slot(booking_row.slot_id, booking_row.id, booked_date.strftime('%Y-%m-%d'))
-                current_app.logger.info(f"Slot {booking_row.slot_id} released for cancelled booking {booking_row.id}")
-            except Exception as e:
-                current_app.logger.error(f"Failed to release slot for booking {booking_row.id}: {e}")
-
             rejected_booking_ids.append(booking_row.id)
-        
+            released_slots.append((booking_row.id, booking_row.slot_id))
+
         current_app.logger.info(
             "Pay-at-cafe batch rejected booking_ids=%s vendor_id=%s reason=%s",
             rejected_booking_ids, vendor_id, rejection_reason
         )
-        
-        # Emit rejection notification via socket
+
+        # Commit before telling anyone: listeners refetch the pending list and
+        # must not see these rows again.
+        db.session.commit()
+        _invalidate_pay_at_cafe_vendor_cache(int(vendor_id))
+
         from utils.realtime import emit_vendor_event
         emit_vendor_event(current_app.extensions.get('socketio'), 'pay_at_cafe_rejected', {
             'bookingId': booking_id,
@@ -9322,19 +9336,34 @@ def reject_pay_at_cafe_booking():
             'message': f'Your booking has been rejected by the vendor. Reason: {rejection_reason}',
             'timestamp': datetime.utcnow().isoformat()
         }, vendor_id)
-        
-        # Send rejection email to customer
+        # Same shape release_slot uses, so slot grids show the capacity again.
+        for released_id, released_slot in released_slots:
+            try:
+                emit_booking_event(current_app.extensions.get('socketio'), event='booking', data={
+                    'vendor_id': vendor_id,
+                    'status': 'cancelled',
+                    'slot_id': released_slot,
+                    'slot_status': 'available',
+                    'booking_id': released_id,
+                    'booking_status': 'cancelled',
+                }, vendor_id=vendor_id)
+            except Exception as emit_err:
+                current_app.logger.warning(
+                    "pay_at_cafe.reject emit_failed booking_id=%s err=%s", released_id, emit_err
+                )
+
         if primary_user and primary_user.contact_info:
-            reject_booking_mail(
-                gamer_name=primary_user.name,
-                gamer_email=primary_user.contact_info.email,
-                cafe_name=vendor.cafe_name if vendor else "Gaming Cafe",
-                reason=rejection_reason
-            )
-        
-        # Commit changes
-        db.session.commit()
-        _invalidate_pay_at_cafe_vendor_cache(int(vendor_id))
+            try:
+                reject_booking_mail(
+                    gamer_name=primary_user.name,
+                    gamer_email=primary_user.contact_info.email,
+                    cafe_name=vendor.cafe_name if vendor else "Gaming Cafe",
+                    reason=rejection_reason
+                )
+            except Exception as mail_err:
+                current_app.logger.warning(
+                    "pay_at_cafe.reject mail_failed booking_id=%s err=%s", booking_id, mail_err
+                )
         if rejected_booking_ids:
             try:
                 _log_pay_at_cafe_action(
@@ -10764,6 +10793,7 @@ def get_slot_bookings(vendor_id, records_view=False):
             bookings_data.append({
                 'booking_id': booking.id,
                 'booking_fid': f"#BK-{booking.id}",
+                'user_id': booking.user_id,
                 'customer_name': user.name if user else "Unknown",
                 'customer_email': contact_info.email if contact_info else "N/A",
                 'customer_phone': contact_info.phone if contact_info else "N/A",
