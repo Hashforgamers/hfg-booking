@@ -7502,6 +7502,7 @@ def extra_booking():
                 ORDER BY b.id DESC LIMIT 1 FOR UPDATE OF b"""),
                 {'slot':slot_id,'game':game_id,'user':user_id,'day':booked_date}).scalar()
             primary_booking = Booking.query.filter_by(id=primary_id).populate_existing().first() if primary_id else None
+        kiosk_transfer = False
         if primary_booking and reference_id:
             existing = Transaction.query.filter_by(booking_id=primary_booking.id,vendor_id=vendor_id,reference_id=reference_id,booking_type='extra').first()
             if existing:
@@ -7514,10 +7515,22 @@ def extra_booking():
                   AND (source_id=:booking OR booking_ids::jsonb @> to_jsonb(CAST(:bid AS integer)))
                   AND (CAST(r.console_id AS text)=:console OR CAST(c.console_number AS text)=:console)
                 LIMIT 1"""), {'vendor':vendor_id,'booking':str(primary_booking.id),'bid':primary_booking.id,'console':str(console_number)}).scalar()
-            if managed:
+            if managed and data.get('kiosk_transfer'):
+                # PC extra time the session engine moved to this booking's bill
+                # (method booking_bill) is charged here, once, for credit or UPI QR.
+                transferred = db.session.execute(text("""SELECT COALESCE(SUM(amount),0) FROM kiosk_session_receipts
+                    WHERE runtime_id=:rid AND method='booking_bill'"""), {'rid': managed}).scalar() or 0
+                if int(transferred) <= 0:
+                    return jsonify(success=False,message='No PC extra time was moved to this bill. Refresh and try again.'),409
+                amount = int(transferred) / 100.0
+                reference_id = f"kiosk-transfer-{managed}"
+                kiosk_transfer = True
+                if Transaction.query.filter_by(booking_id=primary_booking.id,vendor_id=vendor_id,reference_id=reference_id,booking_type='extra').first():
+                    return jsonify(success=True,message='PC extra time already on this bill'),200
+            elif managed:
                 return jsonify(success=False,code='managed_extension_settlement',runtime_id=managed,
                     message='Use the server session extension settlement; this time is already metered.'),409
-        if requested_booking_id is not None:
+        if requested_booking_id is not None and not kiosk_transfer:
             from services.overtime_quote import quote as overtime_quote, parse_played_until, OvertimeError
             try:
                 priced = overtime_quote(db.session, vendor_id, primary_booking, console_id=console_number,
