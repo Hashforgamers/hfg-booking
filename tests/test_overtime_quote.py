@@ -51,6 +51,7 @@ def models(monkeypatch):
         m = ModuleType(name); model = MagicMock(); model.query.filter_by.return_value.first.return_value = obj
         setattr(m, cls_name, model); monkeypatch.setitem(sys.modules, name, m)
     monkeypatch.setattr(oq, "RATE_BASIS", "slot")
+    monkeypatch.setattr(oq, "load_rate_cards", lambda *a: ("slot", []))
 
 
 def test_quote_subtracts_recorded_overtime_and_flags_forgotten_sessions(models):
