@@ -10751,6 +10751,7 @@ def get_slot_bookings(vendor_id, records_view=False):
             bookings_data.append({
                 'booking_id': booking.id,
                 'booking_fid': f"#BK-{booking.id}",
+                'user_id': booking.user_id,
                 'customer_name': user.name if user else "Unknown",
                 'customer_email': contact_info.email if contact_info else "N/A",
                 'customer_phone': contact_info.phone if contact_info else "N/A",
