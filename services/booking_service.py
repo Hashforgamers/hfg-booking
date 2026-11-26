@@ -563,9 +563,10 @@ class BookingService:
             dashboard_rows.append({
                 "username": user.name,
                 "user_id": user.id,
-                "start_time": slot.start_time,
-                "end_time": slot.end_time,
-                "date": transaction.booked_date,
+                # Flex windows carry their exact times; slot bookings keep the slot window.
+                "start_time": meta.get("start_time", slot.start_time),
+                "end_time": meta.get("end_time", slot.end_time),
+                "date": meta.get("date", transaction.booked_date),
                 "book_id": booking.id,
                 "game_id": booking.game_id,
                 "game_name": game.game_name,

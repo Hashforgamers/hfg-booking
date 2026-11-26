@@ -196,7 +196,8 @@ def get_desk_card(vendor, game, profile):
     return dict(definition=row['definition'] or legacy_definition(row['profile'],row['rates']),revision=row['revision'])
 
 
-def desk_slot_prices(vendor, game, profile, players, slots, revision=None, pricing_game=None):
+def checked_desk_card(vendor, game, profile, revision=None, pricing_game=None):
+    """The active card for a desk booking, checked against the chosen game and revision."""
     card = get_desk_card(vendor,game,profile)
     if pricing_game is not None:
         rows = db.session.execute(text("""SELECT definition, profile, rates FROM desk_rate_cards
@@ -206,6 +207,17 @@ def desk_slot_prices(vendor, game, profile, players, slots, revision=None, prici
             raise ValueError('The selected rate does not match this game. Refresh and choose its game rate.')
     if revision is not None and revision != card['revision']:
         raise ValueError("The rate changed. Refresh and review the new price.")
+    return card
+
+
+def desk_minutes_price(vendor, game, profile, players, minutes, revision=None, pricing_game=None):
+    """Flex windows are priced on their exact duration by the same card rules."""
+    card = checked_desk_card(vendor, game, profile, revision, pricing_game)
+    return quote(card['definition'], minutes, players)
+
+
+def desk_slot_prices(vendor, game, profile, players, slots, revision=None, pricing_game=None):
+    card = checked_desk_card(vendor, game, profile, revision, pricing_game)
     minutes = {}
     for slot in slots:
         duration = datetime.combine(date.min, slot.end_time) - datetime.combine(date.min, slot.start_time)
