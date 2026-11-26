@@ -63,6 +63,7 @@ import sqlalchemy as sa
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy import func, distinct
 from services.walkin_contact import storable_contact, public_email, public_phone
+from services.flex_timing import FlexError
 from services.mail_service import booking_mail, reject_booking_mail, extra_booking_time_mail, vendor_booking_notification_mail
 from services.console_catalog_service import (
     get_merged_console_catalog,
@@ -1351,6 +1352,9 @@ def _release_slot_for_booking(booking, vendor_id: int, booked_date):
         release_slot(db.session,vendor_id,booking.slot_id,booked_date,slot_units)
         if 'remaining_slot_units' in squad_details:
             updated=dict(squad_details);updated['remaining_slot_units']=0;booking.squad_details=updated
+        # Flex windows also hold their other overlapped slots (no rows for slot bookings).
+        from services.flex_booking import release_holds
+        release_holds(vendor_id, booking.id)
         return True
     except Exception as e:
         current_app.logger.warning("Slot release failed booking_id=%s vendor=%s error=%s", booking.id if booking else None, vendor_id, e)
@@ -5042,6 +5046,26 @@ def new_booking(vendor_id):
         selected_meals = data.get("selectedMeals", [])
         squad_payload = data.get("squadDetails") or {}
 
+        # Flex start ("any minute"): opt-in via timingMode. The server derives the
+        # overlapped slots; the base slot keeps slot_id/bookedDate for old readers.
+        flex_plan = None
+        flex_settings = None
+        flex_occurrences = []
+        flex_previous = None
+        if str(data.get("timingMode") or "").strip().lower() == "flex":
+            from controllers.flex_booking_controller import parse_request as flex_parse, previous_flex_booking
+            from services import flex_booking
+            flex_settings, flex_game, flex_start, flex_minutes = flex_parse(vendor_id, data)
+            if desk_mode == 'pass':
+                raise FlexError("Pass checkout uses slot times. Choose slot times for pass customers.", 400, "pass_not_supported")
+            if data.get("extendsBookingId"):
+                flex_previous = previous_flex_booking(vendor_id, data["extendsBookingId"], flex_start)
+            flex_plan, flex_occurrences = flex_booking.plan_window(
+                vendor_id, flex_game.id, flex_start, flex_minutes, flex_settings)
+            booked_date = flex_plan.base.day.isoformat()
+            slot_ids, invalid_slot_ids = [flex_plan.base.slot_id], []
+            console_type = console_type or flex_game.game_name
+
         booked_date_obj = _coerce_date_value(booked_date)
         if not booked_date_obj:
             return jsonify({"message": "Invalid bookedDate format. Use YYYY-MM-DD or YYYYMMDD."}), 400
@@ -5456,6 +5480,20 @@ def new_booking(vendor_id):
         realtime = current_app.extensions.get('socketio')
         socketio = DeferredBookingRealtime(realtime) if realtime else None
 
+        flex_console_ids = []
+        if flex_plan:
+            # Lock every overlapped dated slot (date, slot_id order), then the stations.
+            flex_booking.lock_consumed(vendor_id, flex_plan.consumed, slot_units_required)
+            if not data.get("deskProfile"):
+                requested_consoles = data.get("flexConsoleIds")
+                if not requested_consoles and flex_previous and int(flex_previous.get("console_id") or -1) > 0:
+                    requested_consoles = [int(flex_previous["console_id"])]
+                if not requested_consoles and is_rapid_booking and console_id not in (None, ""):
+                    requested_consoles = [int(console_id)]
+                flex_console_ids, _ = flex_booking.pick_consoles(
+                    vendor_id, available_game.id, flex_plan, slot_units_required, requested_consoles,
+                    exclude_booking_ids=[flex_previous["book_id"]] if flex_previous else ())
+
         # ✅ MODIFIED: Use BookingService.create_booking with booking_mode
         bookings = []
         failed_slots = []
@@ -5464,7 +5502,7 @@ def new_booking(vendor_id):
         for slot_id in slot_ids:
             try:
                 with db.session.begin_nested():
-                    precheck_error = _precheck_slot_booking_eligibility(
+                    precheck_error = None if flex_plan else _precheck_slot_booking_eligibility(
                         vendor_id=vendor_id,
                         slot_id=slot_id,
                         booked_date_obj=booked_date_obj,
@@ -5531,6 +5569,10 @@ def new_booking(vendor_id):
                 "failed_slots": failed_slots,
                 "failed_slot_details": failed_slot_details,
             }), 400
+
+        if flex_plan:
+            flex_booking.hold_extra(vendor_id, bookings[0].id, flex_plan.extra, slot_units_required)
+            flex_booking.write_timing(bookings[0].id, flex_plan.start, flex_plan.end)
 
         # ✅ Since BookingService.create_booking already handles slot decrement,
         # we don't need to manually update VENDOR_X_SLOT table here
@@ -5638,23 +5680,53 @@ def new_booking(vendor_id):
         if (not active_desk_rates and data.get("deskProfile")
                 and not (selected_desk_card and selected_desk_card["definition"].get("game_variant"))):
             raise ValueError("This device now uses slot pricing. Refresh and review the price.")
+        flex_price = None
+        if flex_plan:
+            from controllers.flex_booking_controller import window_price as flex_window_price
+            flex_squad = {
+                "players": int(normalized_squad_details.get("player_count", 1)),
+                "multiplier": int(normalized_squad_details.get("player_count", 1))
+                if squad_enabled and _requires_multi_console_units(available_game.game_name or "", vendor_id=vendor_id) else 1,
+                "discount_percent": float(_resolve_squad_discount_percent(
+                    available_game.game_name or "", int(normalized_squad_details.get("player_count", 1)),
+                    policy=vendor_squad_policy, vendor_id=vendor_id) or 0.0)
+                if squad_enabled and _resolve_squad_pricing_mode(available_game.game_name or "", vendor_id=vendor_id) == "squad_discount" else 0.0,
+            }
+            flex_price = flex_window_price(
+                vendor_id, available_game, flex_plan, flex_occurrences, flex_settings, flex_squad["players"], flex_squad,
+                data.get("deskProfile"), selected_desk_card["revision"] if selected_desk_card else None,
+                data.get("pricingGame", "") if data.get("deskProfile") else None,
+                flex_previous["minutes"] if flex_previous else 0)
         if data.get("deskProfile"):
             from controllers.desk_operations import desk_slot_prices
-            desk_prices = desk_slot_prices(vendor_id, available_game.id, data["deskProfile"],
-                                          int(normalized_squad_details.get("player_count", 1)),
-                                          runtime_slot_map.values(), revision=selected_desk_card["revision"],
-                                          pricing_game=data.get("pricingGame", ""))
+            if flex_plan:
+                desk_prices = {int(bookings[0].slot_id): float(flex_price["base_amount"])}
+            else:
+                desk_prices = desk_slot_prices(vendor_id, available_game.id, data["deskProfile"],
+                                              int(normalized_squad_details.get("player_count", 1)),
+                                              runtime_slot_map.values(), revision=selected_desk_card["revision"],
+                                              pricing_game=data.get("pricingGame", ""))
             expected = sum(round(amount * 100) for amount in desk_prices.values())
             if round(float(data.get("deskSubtotal", -1)) * 100) != expected:
                 raise ValueError("The desk rate changed. Refresh and review the new price.")
         if selected_desk_card:
             from services.desk_consoles import reserve as reserve_desk_consoles, windows as desk_windows
             quantity = int(normalized_squad_details.get("player_count",1)) if squad_enabled and uses_multi_slot_units else 1
+            desk_spans = [(flex_plan.start, flex_plan.end)] if flex_plan else desk_windows(booked_date_obj,runtime_slot_map.values())
             desk_console_ids = reserve_desk_consoles(vendor_id,available_game.id,selected_desk_card["definition"],
-                desk_windows(booked_date_obj,runtime_slot_map.values()),quantity,data.get("deskConsoleIds"))
+                desk_spans,quantity,data.get("deskConsoleIds") or data.get("flexConsoleIds"))
             for booking in bookings:
                 details = dict(booking.squad_details or {})
                 details["desk_console_ids"] = desk_console_ids
+                details["assigned_console_ids"] = desk_console_ids
+                booking.squad_details = details
+        if flex_plan and not selected_desk_card:
+            # A flex window holds its stations from creation, like a linked desk rate.
+            desk_console_ids = list(flex_console_ids)
+            if squad_enabled:
+                normalized_squad_details["assigned_console_ids"] = desk_console_ids
+            for booking in bookings:
+                details = dict(booking.squad_details or {})
                 details["assigned_console_ids"] = desk_console_ids
                 booking.squad_details = details
         if data.get("deskPricingMode") is not None:
@@ -5686,6 +5758,10 @@ def new_booking(vendor_id):
                 (base_slot_price * squad_discount_percent / 100.0)
                 if squad_discount_applicable else 0.0
             )
+            if flex_price and not desk_prices:
+                unit_price = float(flex_price["unit_price"])
+                base_slot_price = float(flex_price["base_amount"])
+                slot_discount = float(flex_price["squad_discount_amount"])
             if desk_prices:
                 unit_price = base_slot_price = desk_prices[booking.slot_id]
                 slot_discount = 0.0
@@ -5922,6 +5998,8 @@ def new_booking(vendor_id):
             runtime_console_id = desk_console_ids[0] if desk_console_ids else (int(console_id) if console_id is not None else -1)
 
             slot_start, slot_end = _slot_window_for_date(booked_for_date_obj, slot_obj.start_time, slot_obj.end_time)
+            if flex_plan:
+                slot_start, slot_end = flex_plan.start, flex_plan.end
             if slot_start != previous_live_end:
                 reserved_console_ids = []
             is_continuation = bool(reserved_console_ids)
@@ -6021,6 +6099,9 @@ def new_booking(vendor_id):
                 "dashboard_status": runtime_status,
                 "console_id": runtime_console_id,
             }
+            if flex_plan:
+                booking_runtime[int(booking.id)].update(
+                    date=flex_plan.start.date(), start_time=flex_plan.start.time(), end_time=flex_plan.end.time())
 
         # Persist transaction and dashboard records together. Reuse the loaded
         # objects instead of re-querying and committing each record separately.
@@ -6033,6 +6114,16 @@ def new_booking(vendor_id):
             "new_booking.persisted vendor_id=%s bookings=%s elapsed_ms=%.1f",
             vendor_id, len(bookings), (time.perf_counter() - started_at) * 1000,
         )
+
+        flex_event_fields = {}
+        if flex_plan:
+            from services import flex_timing as flex_rules
+            flex_event_fields = {
+                "timing_mode": "flex",
+                "start_at": flex_rules.iso(flex_plan.start),
+                "end_at": flex_rules.iso(flex_plan.end),
+                "duration_minutes": flex_plan.minutes,
+            }
 
         # Emit real-time booking lifecycle after confirmation so dashboard cards update immediately.
         if socketio:
@@ -6066,14 +6157,16 @@ def new_booking(vendor_id):
                         game_name=available_game.game_name,
                         date_value=booked_date_obj.isoformat(),
                         slot_price=event_slot_price,
-                        start_time=(slot_obj.start_time if slot_obj else None),
-                        end_time=(slot_obj.end_time if slot_obj else None),
+                        start_time=(runtime_meta.get("start_time") or (slot_obj.start_time if slot_obj else None)),
+                        end_time=(runtime_meta.get("end_time") or (slot_obj.end_time if slot_obj else None)),
                         console_id=(runtime_console_id if runtime_console_id > 0 else None),
                         status=event_status,
                         booking_status=runtime_status,
                         squad_details=booking.squad_details or {},
                     )
                     event_payload.update(settlement_status=settlement_status, payment_use_case=payment_use_case)
+                    if flex_plan:
+                        event_payload.update(flex_event_fields)
                     emit_booking_event(socketio, event="booking", data=event_payload, vendor_id=vendor_id)
                     socketio.emit("booking_admin", sanitize_realtime_payload(event_payload), to="dashboard_admin")
                 except Exception as emit_err:
@@ -6085,6 +6178,8 @@ def new_booking(vendor_id):
                     )
 
                 if runtime_status == "current" and slot_obj:
+                    shown_start = runtime_meta.get("start_time") or slot_obj.start_time
+                    shown_end = runtime_meta.get("end_time") or slot_obj.end_time
                     current_slot_payload = {
                         "vendorId": int(vendor_id),
                         "slotId": int(booking.slot_id),
@@ -6093,10 +6188,10 @@ def new_booking(vendor_id):
                         "bookingId": int(booking.id),
                         "book_id": int(booking.id),
                         "booking_id": int(booking.id),
-                        "startTime": slot_obj.start_time.strftime("%I:%M %p"),
-                        "endTime": slot_obj.end_time.strftime("%I:%M %p"),
-                        "start_time": slot_obj.start_time.isoformat(),
-                        "end_time": slot_obj.end_time.isoformat(),
+                        "startTime": shown_start.strftime("%I:%M %p"),
+                        "endTime": shown_end.strftime("%I:%M %p"),
+                        "start_time": shown_start.isoformat(),
+                        "end_time": shown_end.isoformat(),
                         "status": "Booked",
                         "consoleId": (runtime_console_id if runtime_console_id > 0 else None),
                         "console_id": (runtime_console_id if runtime_console_id > 0 else None),
@@ -6125,6 +6220,8 @@ def new_booking(vendor_id):
                         "slot_price": event_slot_price,
                         "single_slot_price": event_slot_price,
                     }
+                    if flex_plan:
+                        current_slot_payload.update(flex_event_fields)
                     try:
                         socketio.emit("current_slot", current_slot_payload, room=f"vendor_{int(vendor_id)}")
                         if runtime_console_id > 0:
@@ -6151,6 +6248,8 @@ def new_booking(vendor_id):
         for booking in bookings:
             slot_obj = slot_map.get(int(booking.slot_id))
             slot_time = f"{str(slot_obj.start_time)} - {str(slot_obj.end_time)}" if slot_obj else "N/A"
+            if flex_plan:
+                slot_time = f"{flex_plan.start.strftime('%H:%M:%S')} - {flex_plan.end.strftime('%H:%M:%S')}"
             booking_details.append({
                 "booking_id": booking.id,
                 "slot_time": slot_time
@@ -6277,6 +6376,14 @@ def new_booking(vendor_id):
             ]
         }
 
+        if flex_plan:
+            response.update(flex_event_fields)
+            response["blocked_slots"] = flex_plan.slot_payload()
+            response["console_ids"] = [int(c) for c in desk_console_ids]
+            response["flex_price"] = flex_price
+            if flex_previous:
+                response["extends_booking_id"] = int(flex_previous["book_id"])
+
         # ✅ Add failed slots info if any
         if failed_slots:
             response['partial_success'] = True
@@ -6292,6 +6399,11 @@ def new_booking(vendor_id):
             socketio.dispatch()
         return jsonify(response), 200
 
+    except FlexError as e:
+        db.session.rollback()
+        body = {"success": False, "code": e.code, "message": str(e)}
+        body.update(e.details)
+        return jsonify(body), e.status
     except ValueError as e:
         db.session.rollback()
         return jsonify(success=False, message=str(e)), 400
