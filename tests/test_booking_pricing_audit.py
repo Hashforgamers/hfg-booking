@@ -286,3 +286,33 @@ def test_interval_amount_lowest_offer_and_midnight():
                            end_time=clock_time(2), offered_price=Decimal('30'), is_active=True)
     assert interval_amount(60, [late], at(22, 30), at(0, 30, date(2026, 11, 22)), 3600) == Decimal('75')  # 30 min at 60 + 90 min at 30
     assert interval_amount(60, [], at(22), at(22, 10), 1800) == Decimal('20')
+
+
+# ---- 10. GST: pay-at-cafe stores and bills GST like the desk ---------------------------
+
+def test_pay_at_cafe_accept_stores_the_desk_gst_breakdown():
+    source = (ROOT / 'controllers/booking_controller.py').read_text()
+    accept = source.split('def accept_pay_at_cafe_booking', 1)[1].split('def reject_pay_at_cafe_booking', 1)[0]
+    assert 'gst = calculate_gst_breakdown(vendor_id, final_amount)' in accept
+    for field in ('taxable_amount', 'gst_rate', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_with_tax'):
+        assert f'{field}=gst["{field}"]' in accept
+    pending = source.split('def get_pending_pay_at_cafe_bookings', 1)[1].split('def pay_at_cafe_email_action', 1)[0]
+    assert 'calculate_gst_breakdown' in pending
+
+
+def gst_scope(profile):
+    query = Mock(); query.filter_by.return_value.first.return_value = profile
+    return compile_functions('controllers/booking_controller.py', {'calculate_gst_breakdown'},
+                             dict(VendorTaxProfile=SimpleNamespace(query=query)))['calculate_gst_breakdown']
+
+
+def test_gst_on_top_matches_the_desk_rounding():
+    exclusive = SimpleNamespace(gst_registered=True, gst_enabled=True, gst_rate=18, tax_inclusive=False,
+                                state_code='29', place_of_supply_state_code='29')
+    g = gst_scope(exclusive)(1, 100.0)
+    assert g == dict(taxable_amount=100.0, gst_rate=18.0, cgst_amount=9.0, sgst_amount=9.0, igst_amount=0.0,
+                     total_with_tax=118.0)
+    assert gst_scope(exclusive)(1, 33.33)['total_with_tax'] == 39.33          # 33.33 + 6.00
+    inclusive = SimpleNamespace(**dict(vars(exclusive), tax_inclusive=True))
+    assert gst_scope(inclusive)(1, 118.0)['total_with_tax'] == 118.0
+    assert gst_scope(None)(1, 100.0)['total_with_tax'] == 100.0

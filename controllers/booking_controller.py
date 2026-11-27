@@ -3146,7 +3146,8 @@ def create_booking():
                             slot_obj=slot_obj,
                             include_controller=line_index == 0,
                         )
-                        line_amount = float(line_pricing.get("final_amount") or 0.0)
+                        line_amount = float(calculate_gst_breakdown(
+                            int(vendor_id), float(line_pricing.get("final_amount") or 0.0))["total_with_tax"])
                         total_estimated += line_amount
                         slot_label = "N/A"
                         if slot_obj and slot_obj.start_time and slot_obj.end_time:
@@ -8889,7 +8890,8 @@ def get_pending_pay_at_cafe_bookings(vendor_id):
                         slot_obj=slot_obj,
                         include_controller=key not in notifications_by_key,
                     )
-                    unit_total = float(pricing.get("final_amount") or 0.0)
+                    unit_total = float(calculate_gst_breakdown(
+                        vendor_id, float(pricing.get("final_amount") or 0.0))["total_with_tax"])
                 else:
                     unit_total = float(booking.single_slot_price or 0.0)
                 
@@ -9221,6 +9223,9 @@ def accept_pay_at_cafe_booking():
             controller_amount = float(pricing.get("controller_amount") or 0.0)
             controller_qty = int(pricing.get("controller_qty") or 0)
             app_fee_amount = resolve_app_fee_amount(final_amount, data, source_channel="app")
+            # GST exactly as desk bookings store it: amount stays pre-tax and the
+            # bill (payment summary) uses total_with_tax.
+            gst = calculate_gst_breakdown(vendor_id, final_amount)
 
             updated_details["pricing_mode"] = pricing.get("pricing_mode")
             updated_details["console_group"] = pricing.get("console_group")
@@ -9266,6 +9271,12 @@ def accept_pay_at_cafe_booking():
                 controller_amount=controller_amount,
                 waive_off_amount=discount_amount,
                 app_fee_amount=float(app_fee_amount or 0.0),
+                taxable_amount=gst["taxable_amount"],
+                gst_rate=gst["gst_rate"],
+                cgst_amount=gst["cgst_amount"],
+                sgst_amount=gst["sgst_amount"],
+                igst_amount=gst["igst_amount"],
+                total_with_tax=gst["total_with_tax"],
             )
             db.session.add(transaction)
             db.session.flush()
@@ -9309,9 +9320,9 @@ def accept_pay_at_cafe_booking():
                         "booking_id": booking_row.id,
                         "slot_time": f"{slot_obj.start_time} - {slot_obj.end_time}"
                     }],
-                    price_paid=final_amount,
+                    price_paid=float(gst["total_with_tax"]),
                     app_fee_amount=float(app_fee_amount or 0.0),
-                    net_total=max(float(final_amount or 0.0) - float(app_fee_amount or 0.0), 0.0),
+                    net_total=max(float(gst["total_with_tax"] or 0.0) - float(app_fee_amount or 0.0), 0.0),
                 )
 
         current_app.logger.info(
