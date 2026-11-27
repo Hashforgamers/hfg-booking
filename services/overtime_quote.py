@@ -108,6 +108,19 @@ def load_rate_cards(session, vendor_id, game_id):
     return mode, [dict(c) for c in cards]
 
 
+def load_offers(session, vendor_id, game_id, start, end):
+    """Active console offers that overlap start..end (naive IST)."""
+    from types import SimpleNamespace
+    try:
+        rows = session.execute(text("""SELECT start_date,start_time,end_date,end_time,offered_price,is_active
+            FROM console_pricing_offers WHERE vendor_id=:v AND available_game_id=:g AND is_active=true
+              AND start_date <= :last AND end_date >= :first"""),
+            {"v": vendor_id, "g": game_id, "first": start.date(), "last": end.date()}).mappings().all()
+        return [SimpleNamespace(**dict(r)) for r in rows]
+    except Exception:
+        return []
+
+
 def booking_players(booking):
     details = booking.squad_details if isinstance(getattr(booking, "squad_details", None), dict) else {}
     try:
@@ -185,7 +198,18 @@ def quote(session, vendor_id, booking, console_id=None, played_until=None, now=N
         FROM transactions WHERE booking_id=:bid AND booking_type='extra'
           AND COALESCE(settlement_status,'') NOT IN ('cancelled','canceled','refunded','reversed')"""),
         {"bid": booking.id}).scalar() or 0)
-    gross = price_overtime(seconds, hourly)
+    offers = load_offers(session, vendor_id, booking.game_id, end, end + timedelta(seconds=seconds)) if seconds else []
+    if offers:
+        # An offer running during the extra time lowers it, the same lowest
+        # price rule slot bookings use (IST wall clock, offer must cover the
+        # minutes it discounts). Same whole-rupee round-up as before.
+        from services.pricing_math import interval_amount
+        slot_seconds = 3600 if (RATE_BASIS == "hour" or not own_seconds) else own_seconds
+        exact = interval_amount(game.single_slot_price, offers, end, end + timedelta(seconds=seconds), slot_seconds)
+        gross = float(math.ceil(exact)) if exact > 0 else 0.0
+        hourly = gross * 3600.0 / seconds
+    else:
+        gross = price_overtime(seconds, hourly)
     multiplier = max(1, int(squad_multiplier or 1))
     card_price, card, players = rate_card_price(session, vendor_id, booking, console_id,
                                                 booked_seconds, own_seconds, seconds)

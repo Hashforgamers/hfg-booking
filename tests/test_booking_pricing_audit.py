@@ -229,3 +229,60 @@ def test_time_wallet_credit_uses_the_paid_slot_amount():
     assert paid([dict(booking_type='direct', amount=0)]) == 0.0          # pass booking: nothing paid
     assert paid([dict(booking_type='direct', amount=100, settlement_status='refunded')]) is None
     assert paid([]) is None
+
+
+# ---- 9. offers apply to extra time ----------------------------------------------------
+
+def ot_offer(day, start, end, price):
+    return SimpleNamespace(start_date=day, start_time=start, end_date=day, end_time=end,
+                           offered_price=Decimal(price), is_active=True)
+
+
+def overtime_env(monkeypatch, offers):
+    import sys
+    from types import ModuleType
+    from services import overtime_quote as oq
+    game = SimpleNamespace(single_slot_price=60)
+    slot = SimpleNamespace(start_time=clock_time(20, 0), end_time=clock_time(21, 0))
+    for name, cls_name, obj in (("models.availableGame", "AvailableGame", game), ("models.slot", "Slot", slot)):
+        m = ModuleType(name); model = Mock(); model.query.filter_by.return_value.first.return_value = obj
+        setattr(m, cls_name, model); monkeypatch.setitem(sys.modules, name, m)
+    monkeypatch.setattr(oq, "RATE_BASIS", "slot")
+    monkeypatch.setattr(oq, "load_rate_cards", lambda *a: ("slot", []))
+    monkeypatch.setattr(oq, "load_offers", lambda *a: offers)
+    return oq
+
+
+def test_overtime_inside_an_offer_pays_the_offer_rate(monkeypatch):
+    from tests.test_overtime_quote import fake_session, row
+    d = date(2026, 11, 21)
+    oq = overtime_env(monkeypatch, [ot_offer(d, clock_time(21), clock_time(23), '40.00')])
+    own = [dict(row(5, clock_time(20), clock_time(21)), user_id=1, console_id=3, book_status="current")]
+    b = SimpleNamespace(id=5, game_id=2, slot_id=7, squad_details={})
+    q = oq.quote(fake_session(own, []), 41, b, now=datetime(2026, 11, 21, 21, 30))
+    assert q["amount"] == 20 and q["rate_per_hour"] == 40          # was Rs 30 at the base rate
+    # PC squad of 3: Rs 60 shown and charged.
+    q = oq.quote(fake_session(own, []), 41, b, now=datetime(2026, 11, 21, 21, 30), squad_multiplier=3)
+    assert q["amount"] == 60 and q["amount_covers_squad"]
+
+
+def test_overtime_straddling_the_offer_end_splits_the_rate(monkeypatch):
+    from tests.test_overtime_quote import fake_session, row
+    d = date(2026, 11, 21)
+    oq = overtime_env(monkeypatch, [ot_offer(d, clock_time(20), clock_time(21, 30), '40.00')])
+    own = [dict(row(5, clock_time(20), clock_time(21)), user_id=1, console_id=3, book_status="current")]
+    b = SimpleNamespace(id=5, game_id=2, slot_id=7, squad_details={})
+    q = oq.quote(fake_session(own, []), 41, b, now=datetime(2026, 11, 21, 22, 0))
+    assert q["amount"] == 50                                          # 30 min at 40/h + 30 min at 60/h
+    oq = overtime_env(monkeypatch, [])
+    assert oq.quote(fake_session(own, []), 41, b, now=datetime(2026, 11, 21, 22, 0))["amount"] == 60
+
+
+def test_interval_amount_lowest_offer_and_midnight():
+    from services.pricing_math import interval_amount
+    d = date(2026, 11, 21)
+    at = lambda h, m=0, day=d: datetime.combine(day, clock_time(h, m))
+    late = SimpleNamespace(start_date=d, start_time=clock_time(23), end_date=date(2026, 11, 22),
+                           end_time=clock_time(2), offered_price=Decimal('30'), is_active=True)
+    assert interval_amount(60, [late], at(22, 30), at(0, 30, date(2026, 11, 22)), 3600) == Decimal('75')  # 30 min at 60 + 90 min at 30
+    assert interval_amount(60, [], at(22), at(22, 10), 1800) == Decimal('20')
