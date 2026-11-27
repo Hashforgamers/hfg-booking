@@ -288,7 +288,7 @@ def test_interval_amount_lowest_offer_and_midnight():
     assert interval_amount(60, [], at(22), at(22, 10), 1800) == Decimal('20')
 
 
-# ---- 10. GST: pay-at-cafe stores and bills GST like the desk ---------------------------
+# ---- 10. GST is inside the price on every channel ------------------------------------
 
 def test_pay_at_cafe_accept_stores_the_desk_gst_breakdown():
     source = (ROOT / 'controllers/booking_controller.py').read_text()
@@ -296,23 +296,35 @@ def test_pay_at_cafe_accept_stores_the_desk_gst_breakdown():
     assert 'gst = calculate_gst_breakdown(vendor_id, final_amount)' in accept
     for field in ('taxable_amount', 'gst_rate', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_with_tax'):
         assert f'{field}=gst["{field}"]' in accept
-    pending = source.split('def get_pending_pay_at_cafe_bookings', 1)[1].split('def pay_at_cafe_email_action', 1)[0]
-    assert 'calculate_gst_breakdown' in pending
 
 
 def gst_scope(profile):
+    from decimal import ROUND_HALF_UP
     query = Mock(); query.filter_by.return_value.first.return_value = profile
     return compile_functions('controllers/booking_controller.py', {'calculate_gst_breakdown'},
-                             dict(VendorTaxProfile=SimpleNamespace(query=query)))['calculate_gst_breakdown']
+                             dict(VendorTaxProfile=SimpleNamespace(query=query), Decimal=Decimal,
+                                  ROUND_HALF_UP=ROUND_HALF_UP))['calculate_gst_breakdown']
 
 
-def test_gst_on_top_matches_the_desk_rounding():
-    exclusive = SimpleNamespace(gst_registered=True, gst_enabled=True, gst_rate=18, tax_inclusive=False,
-                                state_code='29', place_of_supply_state_code='29')
-    g = gst_scope(exclusive)(1, 100.0)
-    assert g == dict(taxable_amount=100.0, gst_rate=18.0, cgst_amount=9.0, sgst_amount=9.0, igst_amount=0.0,
-                     total_with_tax=118.0)
-    assert gst_scope(exclusive)(1, 33.33)['total_with_tax'] == 39.33          # 33.33 + 6.00
-    inclusive = SimpleNamespace(**dict(vars(exclusive), tax_inclusive=True))
-    assert gst_scope(inclusive)(1, 118.0)['total_with_tax'] == 118.0
+PROFILE = dict(gst_registered=True, gst_enabled=True, gst_rate=18, state_code='29', place_of_supply_state_code='29')
+
+
+@pytest.mark.parametrize('inclusive_flag', [False, True])
+def test_gst_is_worked_back_from_the_price_never_added_on_top(inclusive_flag):
+    g = gst_scope(SimpleNamespace(**PROFILE, tax_inclusive=inclusive_flag))
+    # Rs 118 charged: taxable 100, CGST 9 + SGST 9, total stays Rs 118.
+    assert g(1, 118.0) == dict(taxable_amount=100.0, gst_rate=18.0, cgst_amount=9.0, sgst_amount=9.0,
+                               igst_amount=0.0, total_with_tax=118.0)
+    # Rs 100 charged (the old "on top" setting made it Rs 118).
+    r = g(1, 100.0)
+    assert r['total_with_tax'] == 100.0 and r['taxable_amount'] == 84.75
+    assert round(r['cgst_amount'] + r['sgst_amount'], 2) == 15.25
+    # Rounding: parts always add back up to the price.
+    r = g(1, 33.33)
+    assert r['taxable_amount'] == 28.25 and round(r['taxable_amount'] + r['cgst_amount'] + r['sgst_amount'], 2) == 33.33
+
+
+def test_interstate_and_unregistered_gst():
+    r = gst_scope(SimpleNamespace(**dict(PROFILE, place_of_supply_state_code='27'), tax_inclusive=False))(1, 118.0)
+    assert r['igst_amount'] == 18.0 and r['cgst_amount'] == 0.0 and r['total_with_tax'] == 118.0
     assert gst_scope(None)(1, 100.0)['total_with_tax'] == 100.0

@@ -293,7 +293,8 @@ def gst(amount, inclusive=False, rate=18):
                               state_code='29', place_of_supply_state_code='29')
     query = Mock(); query.filter_by.return_value.first.return_value = profile
     return compile_functions(CONTROLLER, {'calculate_gst_breakdown'},
-                             dict(VendorTaxProfile=SimpleNamespace(query=query)))['calculate_gst_breakdown'](1, amount)
+                             dict(VendorTaxProfile=SimpleNamespace(query=query), Decimal=Decimal,
+                                  ROUND_HALF_UP=ROUND_HALF_UP))['calculate_gst_breakdown'](1, amount)
 
 
 def desk_variant_price(minutes, players, rule_amount=90):
@@ -450,25 +451,33 @@ def scenarios():
     total = confirm_total([33.33, 33.0])
     rows.append(sc('RND-1', 'app', 'float total 66.33 paid as int(x*100)', 'Rs33.33 + Rs33', 66.33, round(shown, 2),
                    total if gateway_ok(paise, total) else f'REJECTED {paise}p', total))
-    rows.append(sc('RND-2', 'desk', 'GST on top Rs33.33', 'GST 18% exclusive', 39.33, gst(33.33)['total_with_tax'],
-                   gst(33.33)['total_with_tax'], gst(33.33)['total_with_tax']))
-    # GST.
-    rows.append(sc('GST-DESK', 'desk', 'GST 18% on top, Rs100 booking', 'tax exclusive', 118, gst(100)['total_with_tax'],
-                   gst(100)['total_with_tax'], gst(100)['total_with_tax']))
-    rows.append(sc('GST-PAC', 'pay_at_cafe', 'GST 18% on top, Rs100 booking', 'accept stores desk breakdown', 118,
-                   gst(pay_at_cafe([100]))['total_with_tax'], gst(pay_at_cafe([100]))['total_with_tax'],
-                   gst(pay_at_cafe([100]))['total_with_tax']))
-    rows.append(sc('GST-INCL', 'desk', 'GST 18% inclusive, Rs118 booking', 'tax inclusive', 118,
-                   gst(118, inclusive=True)['total_with_tax'], gst(118, inclusive=True)['total_with_tax'],
-                   gst(118, inclusive=True)['total_with_tax']))
-    rows.append(sc('GST-APP', 'app', 'GST 18% on top, Rs100 booking', 'app sums prices on the phone', 118,
-                   app_display_total([100])[0], confirm_total([100]), confirm_total([100]),
-                   pending='Blocked: app computes its own total (booking_summary_screen.dart:816-863); '
-                           'charging GST needs an app release. Desk charges Rs118, app Rs100.'))
-    rows.append(sc('GST-WEB', 'website', 'GST 18% on top, Rs100 booking', 'shares /bookings/confirm body with app', 118,
-                   preview([S19], [], base=100), confirm_total([100]), confirm_total([100]),
-                   pending='Blocked: website sends the same confirm body as the app (booking.js:101-113). '
-                           'Desk charges Rs118, website Rs100.'))
+    # GST is inside every price (Bhanu, 2026-11-27): the charge is the price as set,
+    # GST is worked back from it for reports (taxable = price x 100 / 118).
+    g = gst(118)
+    rows.append(sc('GST-BREAKDOWN', 'desk', 'Rs118 price, GST 18% inside', 'taxable + CGST + SGST', '100/9/9',
+                   f"{g['taxable_amount']:.0f}/{g['cgst_amount']:.0f}/{g['sgst_amount']:.0f}",
+                   f"{g['taxable_amount']:.0f}/{g['cgst_amount']:.0f}/{g['sgst_amount']:.0f}",
+                   f"{g['taxable_amount']:.0f}/{g['cgst_amount']:.0f}/{g['sgst_amount']:.0f}"))
+    r = gst(33.33)
+    rows.append(sc('RND-2', 'desk', 'GST inside Rs33.33 adds back to the price', 'taxable 28.25 + GST 5.08', 33.33,
+                   r['total_with_tax'], round(r['taxable_amount'] + r['cgst_amount'] + r['sgst_amount'], 2),
+                   r['total_with_tax']))
+    for flag in (False, True):
+        rows.append(sc(f'GST-DESK-{"incl" if flag else "ontop"}', 'desk',
+                       f'Rs118 booking, old setting "{"inclusive" if flag else "add on top"}"', 'charge = price', 118,
+                       118, gst(118, inclusive=flag)['total_with_tax'], gst(118, inclusive=flag)['total_with_tax']))
+    rows.append(sc('GST-PAC', 'pay_at_cafe', 'Rs118 booking, GST inside', 'accept stores the breakdown', 118,
+                   listing_price(118, [], DAY, S19), pay_at_cafe([118]), gst(pay_at_cafe([118]))['total_with_tax']))
+    rows.append(sc('GST-KIOSK', 'kiosk', 'Rs118 next-slot booking, GST inside', 'kiosk next slot', 118,
+                   118, gst(118)['total_with_tax'], gst(118)['total_with_tax']))
+    rows.append(sc('GST-OT', 'overtime', 'Rs118/h, 30 min over, GST inside', 'extraBooking total_with_tax', 59,
+                   overtime_quote([], 30)[0] * 118 / 60, gst(59)['total_with_tax'], gst(59)['total_with_tax']))
+    rows.append(sc('GST-FOOD', 'desk', 'Rs50 food x2 added, GST inside', 'add-meals total_with_tax', 100,
+                   100, gst(100)['total_with_tax'], gst(100)['total_with_tax']))
+    rows.append(sc('GST-APP', 'app', 'Rs118 slot, GST inside', 'app total = listing price', 118,
+                   app_display_total([listing_price(118, [], DAY, S19)])[0], confirm_total([118]), confirm_total([118])))
+    rows.append(sc('GST-WEB', 'website', 'Rs118 slot, GST inside', 'pricing-preview -> confirm', 118,
+                   preview([S19], [], base=118), confirm_total([118]), confirm_total([118])))
     # Variant / rate-card devices in the app.
     rows.append(sc('VAR-APP', 'app', 'rate-card (variants) device, 60 min', 'desk card Rs90/h, slot Rs60', 90,
                    app_display_total([60])[0], confirm_total([60]), confirm_total([60]),

@@ -2295,14 +2295,16 @@ def calculate_gst_breakdown(vendor_id: int, amount: float):
     if rate <= 0:
         return zero
 
-    if profile.tax_inclusive:
-        taxable = round(amount / (1 + rate / 100.0), 2)
-        gst_total = round(amount - taxable, 2)
-        total = round(amount, 2)
-    else:
-        taxable = round(amount, 2)
-        gst_total = round(taxable * rate / 100.0, 2)
-        total = round(taxable + gst_total, 2)
+    # Cafe prices already include GST (decided 2026-11-27): the gamer pays the
+    # price as set on every channel and GST is only shown inside it, worked
+    # back from the inclusive amount. profile.tax_inclusive is kept for
+    # compatibility but no longer adds GST on top when it is off.
+    paid = Decimal(str(amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    taxable_dec = (paid * Decimal(100) / (Decimal(100) + Decimal(str(rate)))).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP)
+    taxable = float(taxable_dec)
+    gst_total = float(paid - taxable_dec)
+    total = float(paid)
 
     is_intrastate = bool(
         profile.state_code
