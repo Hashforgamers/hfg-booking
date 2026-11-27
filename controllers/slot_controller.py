@@ -260,6 +260,50 @@ def _load_vendor_slot_rows(vendor_id, game_id, formatted_date):
     ).fetchall()
 
 
+def _slot_price_lookup(vendor_id, game_ids, dates):
+    """price(game_id, base, day, start, end) -> the price checkout charges for that slot.
+
+    Slot listings used to return the console's base price while every checkout
+    (/bookings/confirm, pay-at-cafe accept, dashboard newBooking) charges the
+    offer that covers the slot (get_effective_price_for_schedule). The app
+    sums the listed price for the Razorpay order, so an active offer made the
+    captured amount differ from the booking total and confirmation failed.
+    Same rule as services.pricing_math.effective_price; any failure falls back
+    to the base price so a listing never breaks.
+    """
+    from datetime import date as _date
+    from types import SimpleNamespace
+    from services.pricing_math import effective_price, slot_window
+    offers = {}
+    try:
+        days = sorted(_date.fromisoformat(str(d)[:10]) for d in dates)
+        if game_ids and days:
+            rows = db.session.execute(text("""SELECT available_game_id,start_date,start_time,end_date,end_time,
+                    offered_price,is_active FROM console_pricing_offers
+                WHERE vendor_id=:vendor AND available_game_id IN :games AND is_active=true
+                  AND start_date <= :last AND end_date >= :first""").bindparams(bindparam("games", expanding=True)),
+                {"vendor": int(vendor_id), "games": [int(g) for g in game_ids],
+                 "first": days[0] - timedelta(days=1), "last": days[-1] + timedelta(days=1)}).mappings().all()
+            for row in rows:
+                offers.setdefault(int(row["available_game_id"]), []).append(SimpleNamespace(**dict(row)))
+    except Exception as error:
+        current_app.logger.warning("slot offer lookup failed vendor_id=%s err=%s", vendor_id, error)
+        offers = {}
+
+    def price(game_id, base, day, start, end):
+        candidates = offers.get(int(game_id))
+        if not candidates or base is None:
+            return base
+        try:
+            day = _date.fromisoformat(str(day)[:10]) if not isinstance(day, _date) else day
+            left, right = slot_window(day, start, end)
+            value = effective_price(base, candidates, left, right)
+            return int(value) if value == int(value) else float(value)
+        except Exception:
+            return base
+    return price
+
+
 def _prefer_slot_candidate(current, candidate):
     """
     Choose the better slot row when duplicate logical slots exist for same time.
@@ -472,6 +516,7 @@ def get_slots_on_game_id(vendorId, gameId, date):
         live_holds = load_console_holds(vendorId, [int(gameId)])
         expected_blocks = _expected_blocks_for_date(vendorId, formatted_date)
 
+        slot_price = _slot_price_lookup(vendorId, [int(gameId)], [formatted_date])
         slots_by_key = {}
         for row in result:
             slot_id = int(row[0])
@@ -499,7 +544,10 @@ def get_slots_on_game_id(vendorId, gameId, date):
                 "end_time": slot_end.strftime("%H:%M:%S"),
                 "is_available": bool(slot_is_available),
                 "available_slot": int(resolved_available),
-                "single_slot_price": single_slot_price
+                # The price checkout charges for this slot (offers applied);
+                # base_slot_price is the console's undiscounted price.
+                "single_slot_price": slot_price(int(gameId), single_slot_price, formatted_date, slot_start, slot_end),
+                "base_slot_price": single_slot_price,
             }
             dedupe_key = (candidate["start_time"],)
             slots_by_key[dedupe_key] = _prefer_slot_candidate(slots_by_key.get(dedupe_key), candidate)
@@ -629,6 +677,7 @@ def get_slots_batch(vendorId):
             slots_by_date[date] = []
 
         merged_slots_by_date = {date: {} for date in normalized_dates}
+        slot_price = _slot_price_lookup(vendorId, game_ids, formatted_dates)
         
         for row in result:
             date_obj = row[1]
@@ -656,7 +705,8 @@ def get_slots_batch(vendorId):
                 "end_time": row[5].strftime("%H:%M:%S") if hasattr(row[5], 'strftime') else str(row[5]),
                 "is_available": slot_is_available,
                 "available_slot": resolved_available,
-                "single_slot_price": row[7],
+                "single_slot_price": slot_price(game_id, row[7], date_obj, row[4], row[5]),
+                "base_slot_price": row[7],
                 "console_id": game_id
             }
             dedupe_key = (candidate["start_time"], int(candidate["console_id"]))

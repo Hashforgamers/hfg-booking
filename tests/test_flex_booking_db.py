@@ -217,6 +217,18 @@ def test_quote_walk_in_window_slots_price_and_stations(env):
                            json=dict(gameId=2, startAt=utc, durationMinutes=120)).status_code == 404
 
 
+def test_quote_prices_each_covered_slot_at_its_own_offer(env, monkeypatch):
+    """Booking pricing audit: an offer on the 11:00 slot only lowers the 11:00 minutes."""
+    enable(env)
+    pricing = sys.modules["controllers.booking_controller"]
+    monkeypatch.setattr(pricing, "get_effective_price_for_schedule",
+                        lambda vendor, game, day, slot=None: 40.0 if slot is not None and slot.start_time == time(11)
+                        else float(game.single_slot_price))
+    body = quote(env, 10, 12, 120).json
+    # 48 min of 10:00 at Rs 100 + 11:00 at Rs 40 + 12 min of 12:00 at Rs 100 = 80 + 40 + 20.
+    assert body["price"]["basis"] == "slot_prorated" and body["price"]["net_amount"] == 140.0
+
+
 # Scenario 2: station busy later -> max minutes + other station suggested.
 def test_station_with_later_booking_suggests_other_station_and_max_minutes(env):
     enable(env)

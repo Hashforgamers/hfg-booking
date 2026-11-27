@@ -82,7 +82,7 @@ import requests
 import hmac
 import hashlib
 import razorpay
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 from services.security import auth_required_self
@@ -548,9 +548,13 @@ def _save_vendor_booking_field_config(vendor_id: int, config: dict):
     db.session.commit()
 
 
-def _compute_pay_at_cafe_pricing(vendor_id: int, available_game, squad_details: dict, booking_date=None, slot_obj=None):
+def _compute_pay_at_cafe_pricing(vendor_id: int, available_game, squad_details: dict, booking_date=None, slot_obj=None,
+                                 include_controller: bool = True):
     """
     Resolve pay-at-cafe pricing with squad support.
+    include_controller: extra controllers are hired once for a squad visit, so
+    callers pricing a multi-slot squad batch pass False for every slot but the
+    first (app confirm, dashboard newBooking and pricing-preview charge them once).
     Returns dict: base_amount, discounted_amount, final_amount, controller_amount, controller_qty,
     player_count, pricing_mode, console_group, discount_percent.
     """
@@ -606,6 +610,8 @@ def _compute_pay_at_cafe_pricing(vendor_id: int, available_game, squad_details: 
     controller_qty = int(details.get("suggested_extra_controller_qty") or details.get("suggestedExtraControllerQty") or 0)
     if pricing_mode == "controller_pricing":
         controller_qty = max(controller_qty, player_count - 1)
+    if not include_controller:
+        controller_qty = 0
     controller_amount = 0.0
 
     if _requires_multi_console_units(getattr(available_game, "game_name", "") or "", vendor_id=vendor_id):
@@ -2258,6 +2264,10 @@ def calculate_slot_minutes(slot_obj: Slot) -> int:
         return 0
     start_dt = datetime.combine(datetime.utcnow().date(), slot_obj.start_time)
     end_dt = datetime.combine(datetime.utcnow().date(), slot_obj.end_time)
+    if end_dt <= start_dt:
+        # A slot such as 23:30-00:30 ends the next day. It used to count as
+        # 0 minutes, so crediting it to the time wallet silently skipped it.
+        end_dt += timedelta(days=1)
     mins = int((end_dt - start_dt).total_seconds() / 60)
     return max(mins, 0)
 
@@ -3124,7 +3134,7 @@ def create_booking():
                     slot_map = {int(s.id): s for s in slot_rows}
                     booking_details = []
                     total_estimated = 0.0
-                    for item in booking_mappings:
+                    for line_index, item in enumerate(booking_mappings):
                         slot_id_val = int(item.get("slot_id"))
                         slot_obj = slot_map.get(slot_id_val)
                         squad_details_for_line = item.get("squad_details") if isinstance(item.get("squad_details"), dict) else {}
@@ -3134,6 +3144,7 @@ def create_booking():
                             squad_details_for_line,
                             booking_date=book_date_obj,
                             slot_obj=slot_obj,
+                            include_controller=line_index == 0,
                         )
                         line_amount = float(line_pricing.get("final_amount") or 0.0)
                         total_estimated += line_amount
@@ -3804,6 +3815,7 @@ def confirm_booking():
         mail_jobs = []
         vendor_mail_jobs = {}
         voucher_used = False
+        extras_saved = False
 
         booking_objects = (
             Booking.query
@@ -4139,9 +4151,12 @@ def confirm_booking():
             # Add per-slot share of extras
             amount_payable += extras_total_per_booking
 
-            # Apply voucher discount (only on remaining amount)
+            # Apply the voucher to every booking in this checkout. The app
+            # takes the percentage off the whole subtotal (all slots + food),
+            # so discounting only the first booking (and truncating to whole
+            # rupees) made the paid amount differ from the booking total.
             voucher = None
-            if voucher_code and amount_payable > 0 and not voucher_used:
+            if voucher_code and amount_payable > 0:
                 if user.id not in voucher_cache:
                     voucher_cache[user.id] = Voucher.query.filter_by(
                         code=voucher_code,
@@ -4150,7 +4165,7 @@ def confirm_booking():
                     ).first()
                 voucher = voucher_cache[user.id]
                 if voucher:
-                    voucher_discount = int(amount_payable * voucher.discount_percentage / 100)
+                    voucher_discount = voucher_discount_amount(amount_payable, voucher.discount_percentage)
                     discount_amount += voucher_discount
                     amount_payable -= voucher_discount
 
@@ -4240,9 +4255,10 @@ def confirm_booking():
             if payment_id and payment_mode_used == "payment_gateway":
                 BookingService.save_payment_transaction_mapping(booking.id, transaction.id, payment_id)
 
-            # Save extras
+            # Save extras once per checkout (they are charged once, split over
+            # the bookings); repeating them per slot consumed stock N times.
             BookingExtraService.query.filter_by(booking_id=booking.id).delete()
-            for extra in extra_services_list:
+            for extra in (extra_services_list if not extras_saved else []):
                 menu_obj = menu_map.get(extra.get('item_id'))
                 if not menu_obj:
                     continue
@@ -4264,9 +4280,10 @@ def confirm_booking():
                     total_price=total_price
                 )
                 db.session.add(booking_extra)
+            extras_saved = True
 
-            # Mark voucher as used
-            if voucher:
+            # Mark voucher as used (once per checkout)
+            if voucher and not voucher_used:
                 voucher.is_active = False
                 voucher_used = True
                 db.session.add(VoucherRedemptionLog(
@@ -4486,7 +4503,7 @@ def confirm_booking():
         if razorpay_payment is not None:
             expected_paise = int((Decimal(str(total_amount_paid)) * Decimal("100")).quantize(Decimal("1")))
             if (
-                int(razorpay_payment.get("amount") or 0) != expected_paise
+                not gateway_amount_matches(razorpay_payment.get("amount"), expected_paise)
                 or str(razorpay_payment.get("currency") or "").upper() != "INR"
             ):
                 db.session.rollback()
@@ -4539,6 +4556,24 @@ def confirm_booking():
         db.session.rollback()
         current_app.logger.exception("Error confirming booking")
         return jsonify({'error': str(e)}), 500
+
+
+def voucher_discount_amount(amount, percent):
+    """Voucher discount on one booking line, to the paisa (the app never truncates to rupees)."""
+    value = Decimal(str(amount or 0)) * Decimal(str(percent or 0)) / Decimal("100")
+    value = min(max(value, Decimal("0")), Decimal(str(amount or 0)))
+    return float(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def gateway_amount_matches(captured_paise, expected_paise):
+    """The app builds the order as int(total * 100), which truncates a float total
+    such as 66.33 to 6632 paise. Accept that one-paisa shortfall, never more, and
+    never an overpayment."""
+    try:
+        captured = int(captured_paise or 0)
+    except (TypeError, ValueError):
+        return False
+    return expected_paise - 1 <= captured <= expected_paise
 
 
 @booking_blueprint.route('/redeem-voucher', methods=['POST'])
@@ -5585,7 +5620,9 @@ def new_booking(vendor_id):
                 if not menu_obj:
                     continue
                 menu_id = int(menu_obj.id)
-                required_qty_by_menu[menu_id] += int(meal_detail.get("quantity") or 0) * len(bookings)
+                # Food is ordered once for the whole visit (charged once, split
+                # over the slot transactions), not once per booked slot.
+                required_qty_by_menu[menu_id] += int(meal_detail.get("quantity") or 0)
                 menu_ref[menu_id] = menu_obj
 
             for menu_id, required_qty in required_qty_by_menu.items():
@@ -5598,8 +5635,10 @@ def new_booking(vendor_id):
                         "message": stock_error,
                     }), 400
 
-        # Add extra services to bookings
-        for booking in bookings:
+        # Add extra services once, on the first booking. Repeating them on every
+        # slot booking used up stock N times and showed N times the food on the
+        # bill while the transactions charged it once.
+        for booking in bookings[:1]:
             for meal_detail in meal_details:
                 _consume_menu_stock(meal_detail['menu_item'], int(meal_detail['quantity'] or 0))
                 booking_extra_service = BookingExtraService(
@@ -8839,6 +8878,8 @@ def get_pending_pay_at_cafe_bookings(vendor_id):
                             auto_rejected_ids.append(int(booking.bookingId))
                             continue
 
+                batch_id = details.get("batch_id")
+                key = str(batch_id) if batch_id else f"booking:{booking.bookingId}"
                 if available_game_obj:
                     pricing = _compute_pay_at_cafe_pricing(
                         vendor_id,
@@ -8846,6 +8887,7 @@ def get_pending_pay_at_cafe_bookings(vendor_id):
                         details,
                         booking_date=resolved_date,
                         slot_obj=slot_obj,
+                        include_controller=key not in notifications_by_key,
                     )
                     unit_total = float(pricing.get("final_amount") or 0.0)
                 else:
@@ -8861,9 +8903,6 @@ def get_pending_pay_at_cafe_bookings(vendor_id):
                         time_slot = "N/A"
                 else:
                     time_slot = "N/A"
-
-                batch_id = details.get("batch_id")
-                key = str(batch_id) if batch_id else f"booking:{booking.bookingId}"
 
                 if key not in notifications_by_key:
                     notifications_by_key[key] = {
@@ -9144,6 +9183,7 @@ def accept_pay_at_cafe_booking():
 
         accepted_booking_ids = []
         event_payloads = []
+        controller_charged = False
         for booking_row in bookings_to_accept:
             available_game = AvailableGame.query.filter_by(id=booking_row.game_id).first()
             if not available_game or available_game.vendor_id != vendor_id:
@@ -9171,7 +9211,10 @@ def accept_pay_at_cafe_booking():
                 updated_details,
                 booking_date=booked_date,
                 slot_obj=slot_obj,
+                include_controller=not controller_charged,
             )
+            if float(pricing.get("controller_amount") or 0.0) > 0:
+                controller_charged = True
             base_amount = float(pricing.get("base_amount") or 0.0)
             discount_amount = float(pricing.get("discounted_amount") or 0.0)
             final_amount = float(pricing.get("final_amount") or 0.0)
