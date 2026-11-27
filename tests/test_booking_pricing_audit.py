@@ -328,3 +328,53 @@ def test_interstate_and_unregistered_gst():
     r = gst_scope(SimpleNamespace(**dict(PROFILE, place_of_supply_state_code='27'), tax_inclusive=False))(1, 118.0)
     assert r['igst_amount'] == 18.0 and r['cgst_amount'] == 0.0 and r['total_with_tax'] == 118.0
     assert gst_scope(None)(1, 100.0)['total_with_tax'] == 100.0
+
+
+# ---- 11. rate-card (variant) devices: app/website pay the desk's default rate ---------
+
+def card_def(name, rules, variant=''):
+    from services.desk_pricing import validate_definition
+    return validate_definition(dict(name=name, model_name='m', game_variant=variant, rules=[dict(
+        min_minutes=r[0], max_minutes=r[1], min_players=1, max_players=8, amount=str(r[2]),
+        unit_minutes=r[3], per_player=r[4] if len(r) > 4 else False) for r in rules]))
+
+
+def test_default_variant_is_the_cheapest_standard_card():
+    from services.desk_pricing import default_variant_slot_price as dv
+    ps55 = card_def('PS5 55"', [(1, None, 90, 60)])
+    ps65 = card_def('PS5 65"', [(1, None, 120, 60)])
+    gta = card_def('GTA6', [(1, None, 50, 60)], variant='GTA6')       # title override: never the default
+    assert dv([ps65, ps55, gta], 60) == Decimal('90.00')
+    assert dv([ps65, ps55], 30) == Decimal('45.00')                  # 30-minute slots
+    assert dv([gta], 60) is None
+
+
+def test_default_variant_refuses_cards_the_app_cannot_add_up():
+    from services.desk_pricing import default_variant_slot_price as dv
+    tiered = card_def('PC', [(1, 119, 60, 60), (120, 180, 50, 60), (181, None, 40, 60)])
+    package = card_def('Racing', [(30, 30, 200, 0), (60, 60, 350, 0)])
+    # 2 slots at the desk = Rs 100 (tier), the app would add 60 + 60: keep slot pricing.
+    assert dv([tiered], 60) is None
+    assert dv([package], 30) is None
+
+
+def test_listing_and_checkout_use_the_default_variant(monkeypatch):
+    from services import variant_pricing
+    monkeypatch.setattr(variant_pricing, 'load_variant_definitions',
+                        lambda v, g: [card_def('PS5 65"', [(1, None, 120, 60)]), card_def('PS5 55"', [(1, None, 90, 60)])])
+    from sqlalchemy import text, bindparam
+    from datetime import timedelta
+    session = Mock(); session.execute.return_value.mappings.return_value.all.return_value = []
+    scope = compile_functions('controllers/slot_controller.py', {'_slot_price_lookup'},
+                              dict(db=SimpleNamespace(session=session), text=text, bindparam=bindparam,
+                                   timedelta=timedelta, current_app=SimpleNamespace(logger=Mock())))
+    price = scope['_slot_price_lookup'](1, [2], ['2026-11-27'])
+    assert price(2, 60, '2026-11-27', clock_time(19), clock_time(20)) == 90
+    model = Mock(); model.query.filter.return_value.all.return_value = []
+    sched = compile_functions('controllers/booking_controller.py', {'get_effective_price_for_schedule'},
+                              dict(ConsolePricingOffer=SimpleNamespace(query=model.query, vendor_id=0, available_game_id=0,
+                                                                       is_active=0, start_date=date.min, end_date=date.max),
+                                   datetime=datetime))
+    game = SimpleNamespace(id=2, single_slot_price=60)
+    assert sched['get_effective_price_for_schedule'](1, game, date(2026, 11, 27),
+                                                     SimpleNamespace(start_time=clock_time(19), end_time=clock_time(20))) == 90.0

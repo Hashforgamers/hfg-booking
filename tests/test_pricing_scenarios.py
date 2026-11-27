@@ -297,6 +297,13 @@ def gst(amount, inclusive=False, rate=18):
                                   ROUND_HALF_UP=ROUND_HALF_UP))['calculate_gst_breakdown'](1, amount)
 
 
+def _card(name, rules):
+    from services.desk_pricing import validate_definition
+    return validate_definition(dict(name=name, model_name='m', rules=[dict(
+        min_minutes=r[0], max_minutes=r[1], min_players=1, max_players=8, amount=str(r[2]),
+        unit_minutes=r[3], per_player=False) for r in rules]))
+
+
 def desk_variant_price(minutes, players, rule_amount=90):
     from services.desk_pricing import validate_definition, quote
     card = validate_definition(dict(name='PS5 65"', model_name='m', rules=[dict(
@@ -478,12 +485,43 @@ def scenarios():
                    app_display_total([listing_price(118, [], DAY, S19)])[0], confirm_total([118]), confirm_total([118])))
     rows.append(sc('GST-WEB', 'website', 'Rs118 slot, GST inside', 'pricing-preview -> confirm', 118,
                    preview([S19], [], base=118), confirm_total([118]), confirm_total([118])))
-    # Variant / rate-card devices in the app.
-    rows.append(sc('VAR-APP', 'app', 'rate-card (variants) device, 60 min', 'desk card Rs90/h, slot Rs60', 90,
-                   app_display_total([60])[0], confirm_total([60]), confirm_total([60]),
-                   pending=f'Waiting on Bhanu: app charges Rs60 slot price, desk charges Rs{desk_variant_price(60, 1):.0f} rate card.'))
-    rows.append(sc('VAR-DESK', 'desk', 'rate-card (variants) device, 60 min', 'desk card Rs90/h', 90,
-                   desk_variant_price(60, 1), desk_variant_price(60, 1), desk_variant_price(60, 1)))
+    # Rate-card (variants) devices: app/website pay the desk's default rate (Bhanu, 2026-11-27).
+    from services import variant_pricing
+    cards = [_card('PS5 65"', [(1, None, 120, 60)]), _card('PS5 55"', [(1, None, 90, 60)])]
+    saved = variant_pricing.load_variant_definitions
+    variant_pricing.load_variant_definitions = lambda v, g: cards
+    try:
+        app_listed = listing_price(60, HAPPY, DAY, S19)
+        app_charge = schedule_price(60, HAPPY, DAY, S19)
+        two = [schedule_price(60, [], DAY, s) for s in (S19, S20)]
+        web = preview([S19, S20], [])
+        inside_offer = schedule_price(60, HAPPY, DAY, S15)
+    finally:
+        variant_pricing.load_variant_definitions = saved
+    desk_one = desk_variant_price(60, 1)
+    desk_two = desk_variant_price(120, 1)
+    rows.append(sc('VAR-APP', 'app', 'rate-card device, 1 slot (default = cheapest card, PS5 55")',
+                   'cards Rs90/h + Rs120/h, slot Rs60', 90, app_display_total([app_listed])[0],
+                   confirm_total([app_charge]), confirm_total([app_charge])))
+    rows.append(sc('VAR-APP-V', 'app', 'rate-card device, 2 slots + 10% voucher', 'Rs90/h default card', 162,
+                   app_display_total([app_listed, app_listed], voucher_pct=10)[0],
+                   confirm_total(two, voucher_pct=10), confirm_total(two, voucher_pct=10)))
+    rows.append(sc('VAR-WEB', 'website', 'rate-card device, 2 slots', 'pricing-preview', 180, web, sum(two), sum(two)))
+    rows.append(sc('VAR-OFFER', 'app', 'rate-card device inside a Rs40 offer', 'offers do not apply to rate cards (as desk)', 90,
+                   inside_offer, inside_offer, inside_offer))
+    rows.append(sc('VAR-DESK', 'desk', 'rate-card device, 1 and 2 slots, default card', 'Rs90/h', '90/180',
+                   f"{desk_one:.0f}/{desk_two:.0f}", f"{desk_one:.0f}/{desk_two:.0f}", f"{desk_one:.0f}/{desk_two:.0f}"))
+    tiered = [_card('PC', [(1, 119, 60, 60), (120, 180, 50, 60)])]
+    variant_pricing.load_variant_definitions = lambda v, g: tiered
+    try:
+        tier_listed = listing_price(60, [], DAY, S19)
+    finally:
+        variant_pricing.load_variant_definitions = saved
+    rows.append(sc('VAR-TIER', 'app', 'tiered rate card (Rs60/h, Rs50/h from 2h)', 'app adds slots; desk prices session',
+                   100, app_display_total([tier_listed, tier_listed])[0], 120.0, 120.0,
+                   pending='Not shipped for duration-tiered or package cards: the app adds per-slot prices '
+                           '(booking_summary_screen.dart:842), so it cannot pay the desk\'s 2-hour tier (Rs100). '
+                           'These devices keep the slot price (Rs60/slot) in app and website.'))
     return rows
 
 

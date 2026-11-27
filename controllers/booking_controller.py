@@ -679,6 +679,12 @@ def get_effective_price_for_schedule(vendor_id: int, available_game, booking_dat
         # Date-only estimates cannot assume that an offer covers an unspecified slot.
         return float(available_game.single_slot_price or 0)
     start, end = slot_window(booking_date, slot_obj.start_time, slot_obj.end_time)
+    from services.variant_pricing import variant_slot_price
+    variant = variant_slot_price(vendor_id, getattr(available_game, "id", None), int((end - start).total_seconds() // 60))
+    if variant is not None:
+        # Rate-card device: the desk's default rate, like the desk (offers are
+        # not applied to rate cards on any channel).
+        return float(variant)
     offers = ConsolePricingOffer.query.filter(
         ConsolePricingOffer.vendor_id == vendor_id,
         ConsolePricingOffer.available_game_id == available_game.id,

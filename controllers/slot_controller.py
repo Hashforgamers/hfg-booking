@@ -291,6 +291,15 @@ def _slot_price_lookup(vendor_id, game_ids, dates):
         offers = {}
 
     def price(game_id, base, day, start, end):
+        try:
+            from services.variant_pricing import variant_slot_price
+            left, right = slot_window(_date(2000, 1, 1), start, end)
+            variant = variant_slot_price(vendor_id, game_id, int((right - left).total_seconds() // 60))
+        except Exception:
+            variant = None
+        if variant is not None:
+            # Rate-card device: the desk's default rate (checkout charges the same).
+            return int(variant) if variant == int(variant) else float(variant)
         candidates = offers.get(int(game_id))
         if not candidates or base is None:
             return base
