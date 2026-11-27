@@ -256,6 +256,30 @@ def fallback_price(minutes, slot_price, slot_minutes, step_minutes):
     return min(amount, cap).quantize(Decimal("0.01"))
 
 
+def blended_slot_price(start, end, priced_slots, slot_minutes):
+    """One per-slot price for a window whose slots are priced differently.
+
+    priced_slots: (slot_start, slot_end, price) for the slots the window uses.
+    Each slot contributes its own per-minute rate for the minutes the window
+    spends in it, so a 18:30-20:30 window over 18-19 (Rs 60), 19-20 (offer
+    Rs 40) and 20-21 (Rs 60) costs 30 + 40 + 30 = Rs 100 instead of 2 x the
+    first slot's price. Returned as an equivalent price per ``slot_minutes`` so
+    fallback_price keeps its step rounding and cap. None when nothing overlaps.
+    """
+    total, covered = Decimal("0"), Decimal("0")
+    for left, right, price in priced_slots:
+        a, b = max(start, left), min(end, right)
+        length = Decimal(str((right - left).total_seconds()))
+        if b <= a or length <= 0:
+            continue
+        seconds = Decimal(str((b - a).total_seconds()))
+        total += Decimal(str(price or 0)) * seconds / length
+        covered += seconds
+    if covered <= 0:
+        return None
+    return (total * Decimal(60) * Decimal(int(slot_minutes)) / covered).quantize(Decimal("0.01"))
+
+
 def typical_slot_minutes(occurrences):
     counts = {}
     for item in occurrences:

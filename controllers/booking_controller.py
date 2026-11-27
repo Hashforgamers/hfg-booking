@@ -82,7 +82,7 @@ import requests
 import hmac
 import hashlib
 import razorpay
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 from services.security import auth_required_self
@@ -548,9 +548,13 @@ def _save_vendor_booking_field_config(vendor_id: int, config: dict):
     db.session.commit()
 
 
-def _compute_pay_at_cafe_pricing(vendor_id: int, available_game, squad_details: dict, booking_date=None, slot_obj=None):
+def _compute_pay_at_cafe_pricing(vendor_id: int, available_game, squad_details: dict, booking_date=None, slot_obj=None,
+                                 include_controller: bool = True):
     """
     Resolve pay-at-cafe pricing with squad support.
+    include_controller: extra controllers are hired once for a squad visit, so
+    callers pricing a multi-slot squad batch pass False for every slot but the
+    first (app confirm, dashboard newBooking and pricing-preview charge them once).
     Returns dict: base_amount, discounted_amount, final_amount, controller_amount, controller_qty,
     player_count, pricing_mode, console_group, discount_percent.
     """
@@ -606,6 +610,8 @@ def _compute_pay_at_cafe_pricing(vendor_id: int, available_game, squad_details: 
     controller_qty = int(details.get("suggested_extra_controller_qty") or details.get("suggestedExtraControllerQty") or 0)
     if pricing_mode == "controller_pricing":
         controller_qty = max(controller_qty, player_count - 1)
+    if not include_controller:
+        controller_qty = 0
     controller_amount = 0.0
 
     if _requires_multi_console_units(getattr(available_game, "game_name", "") or "", vendor_id=vendor_id):
@@ -673,6 +679,12 @@ def get_effective_price_for_schedule(vendor_id: int, available_game, booking_dat
         # Date-only estimates cannot assume that an offer covers an unspecified slot.
         return float(available_game.single_slot_price or 0)
     start, end = slot_window(booking_date, slot_obj.start_time, slot_obj.end_time)
+    from services.variant_pricing import variant_slot_price
+    variant = variant_slot_price(vendor_id, getattr(available_game, "id", None), int((end - start).total_seconds() // 60))
+    if variant is not None:
+        # Rate-card device: the desk's default rate, like the desk (offers are
+        # not applied to rate cards on any channel).
+        return float(variant)
     offers = ConsolePricingOffer.query.filter(
         ConsolePricingOffer.vendor_id == vendor_id,
         ConsolePricingOffer.available_game_id == available_game.id,
@@ -2258,6 +2270,10 @@ def calculate_slot_minutes(slot_obj: Slot) -> int:
         return 0
     start_dt = datetime.combine(datetime.utcnow().date(), slot_obj.start_time)
     end_dt = datetime.combine(datetime.utcnow().date(), slot_obj.end_time)
+    if end_dt <= start_dt:
+        # A slot such as 23:30-00:30 ends the next day. It used to count as
+        # 0 minutes, so crediting it to the time wallet silently skipped it.
+        end_dt += timedelta(days=1)
     mins = int((end_dt - start_dt).total_seconds() / 60)
     return max(mins, 0)
 
@@ -2285,14 +2301,16 @@ def calculate_gst_breakdown(vendor_id: int, amount: float):
     if rate <= 0:
         return zero
 
-    if profile.tax_inclusive:
-        taxable = round(amount / (1 + rate / 100.0), 2)
-        gst_total = round(amount - taxable, 2)
-        total = round(amount, 2)
-    else:
-        taxable = round(amount, 2)
-        gst_total = round(taxable * rate / 100.0, 2)
-        total = round(taxable + gst_total, 2)
+    # Cafe prices already include GST (decided 2026-11-27): the gamer pays the
+    # price as set on every channel and GST is only shown inside it, worked
+    # back from the inclusive amount. profile.tax_inclusive is kept for
+    # compatibility but no longer adds GST on top when it is off.
+    paid = Decimal(str(amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    taxable_dec = (paid * Decimal(100) / (Decimal(100) + Decimal(str(rate)))).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP)
+    taxable = float(taxable_dec)
+    gst_total = float(paid - taxable_dec)
+    total = float(paid)
 
     is_intrastate = bool(
         profile.state_code
@@ -3124,7 +3142,7 @@ def create_booking():
                     slot_map = {int(s.id): s for s in slot_rows}
                     booking_details = []
                     total_estimated = 0.0
-                    for item in booking_mappings:
+                    for line_index, item in enumerate(booking_mappings):
                         slot_id_val = int(item.get("slot_id"))
                         slot_obj = slot_map.get(slot_id_val)
                         squad_details_for_line = item.get("squad_details") if isinstance(item.get("squad_details"), dict) else {}
@@ -3134,8 +3152,10 @@ def create_booking():
                             squad_details_for_line,
                             booking_date=book_date_obj,
                             slot_obj=slot_obj,
+                            include_controller=line_index == 0,
                         )
-                        line_amount = float(line_pricing.get("final_amount") or 0.0)
+                        line_amount = float(calculate_gst_breakdown(
+                            int(vendor_id), float(line_pricing.get("final_amount") or 0.0))["total_with_tax"])
                         total_estimated += line_amount
                         slot_label = "N/A"
                         if slot_obj and slot_obj.start_time and slot_obj.end_time:
@@ -3804,6 +3824,7 @@ def confirm_booking():
         mail_jobs = []
         vendor_mail_jobs = {}
         voucher_used = False
+        extras_saved = False
 
         booking_objects = (
             Booking.query
@@ -4139,9 +4160,12 @@ def confirm_booking():
             # Add per-slot share of extras
             amount_payable += extras_total_per_booking
 
-            # Apply voucher discount (only on remaining amount)
+            # Apply the voucher to every booking in this checkout. The app
+            # takes the percentage off the whole subtotal (all slots + food),
+            # so discounting only the first booking (and truncating to whole
+            # rupees) made the paid amount differ from the booking total.
             voucher = None
-            if voucher_code and amount_payable > 0 and not voucher_used:
+            if voucher_code and amount_payable > 0:
                 if user.id not in voucher_cache:
                     voucher_cache[user.id] = Voucher.query.filter_by(
                         code=voucher_code,
@@ -4150,7 +4174,7 @@ def confirm_booking():
                     ).first()
                 voucher = voucher_cache[user.id]
                 if voucher:
-                    voucher_discount = int(amount_payable * voucher.discount_percentage / 100)
+                    voucher_discount = voucher_discount_amount(amount_payable, voucher.discount_percentage)
                     discount_amount += voucher_discount
                     amount_payable -= voucher_discount
 
@@ -4240,9 +4264,10 @@ def confirm_booking():
             if payment_id and payment_mode_used == "payment_gateway":
                 BookingService.save_payment_transaction_mapping(booking.id, transaction.id, payment_id)
 
-            # Save extras
+            # Save extras once per checkout (they are charged once, split over
+            # the bookings); repeating them per slot consumed stock N times.
             BookingExtraService.query.filter_by(booking_id=booking.id).delete()
-            for extra in extra_services_list:
+            for extra in (extra_services_list if not extras_saved else []):
                 menu_obj = menu_map.get(extra.get('item_id'))
                 if not menu_obj:
                     continue
@@ -4264,9 +4289,10 @@ def confirm_booking():
                     total_price=total_price
                 )
                 db.session.add(booking_extra)
+            extras_saved = True
 
-            # Mark voucher as used
-            if voucher:
+            # Mark voucher as used (once per checkout)
+            if voucher and not voucher_used:
                 voucher.is_active = False
                 voucher_used = True
                 db.session.add(VoucherRedemptionLog(
@@ -4486,7 +4512,7 @@ def confirm_booking():
         if razorpay_payment is not None:
             expected_paise = int((Decimal(str(total_amount_paid)) * Decimal("100")).quantize(Decimal("1")))
             if (
-                int(razorpay_payment.get("amount") or 0) != expected_paise
+                not gateway_amount_matches(razorpay_payment.get("amount"), expected_paise)
                 or str(razorpay_payment.get("currency") or "").upper() != "INR"
             ):
                 db.session.rollback()
@@ -4539,6 +4565,24 @@ def confirm_booking():
         db.session.rollback()
         current_app.logger.exception("Error confirming booking")
         return jsonify({'error': str(e)}), 500
+
+
+def voucher_discount_amount(amount, percent):
+    """Voucher discount on one booking line, to the paisa (the app never truncates to rupees)."""
+    value = Decimal(str(amount or 0)) * Decimal(str(percent or 0)) / Decimal("100")
+    value = min(max(value, Decimal("0")), Decimal(str(amount or 0)))
+    return float(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def gateway_amount_matches(captured_paise, expected_paise):
+    """The app builds the order as int(total * 100), which truncates a float total
+    such as 66.33 to 6632 paise. Accept that one-paisa shortfall, never more, and
+    never an overpayment."""
+    try:
+        captured = int(captured_paise or 0)
+    except (TypeError, ValueError):
+        return False
+    return expected_paise - 1 <= captured <= expected_paise
 
 
 @booking_blueprint.route('/redeem-voucher', methods=['POST'])
@@ -5585,7 +5629,9 @@ def new_booking(vendor_id):
                 if not menu_obj:
                     continue
                 menu_id = int(menu_obj.id)
-                required_qty_by_menu[menu_id] += int(meal_detail.get("quantity") or 0) * len(bookings)
+                # Food is ordered once for the whole visit (charged once, split
+                # over the slot transactions), not once per booked slot.
+                required_qty_by_menu[menu_id] += int(meal_detail.get("quantity") or 0)
                 menu_ref[menu_id] = menu_obj
 
             for menu_id, required_qty in required_qty_by_menu.items():
@@ -5598,8 +5644,10 @@ def new_booking(vendor_id):
                         "message": stock_error,
                     }), 400
 
-        # Add extra services to bookings
-        for booking in bookings:
+        # Add extra services once, on the first booking. Repeating them on every
+        # slot booking used up stock N times and showed N times the food on the
+        # bill while the transactions charged it once.
+        for booking in bookings[:1]:
             for meal_detail in meal_details:
                 _consume_menu_stock(meal_detail['menu_item'], int(meal_detail['quantity'] or 0))
                 booking_extra_service = BookingExtraService(
@@ -8839,6 +8887,8 @@ def get_pending_pay_at_cafe_bookings(vendor_id):
                             auto_rejected_ids.append(int(booking.bookingId))
                             continue
 
+                batch_id = details.get("batch_id")
+                key = str(batch_id) if batch_id else f"booking:{booking.bookingId}"
                 if available_game_obj:
                     pricing = _compute_pay_at_cafe_pricing(
                         vendor_id,
@@ -8846,8 +8896,10 @@ def get_pending_pay_at_cafe_bookings(vendor_id):
                         details,
                         booking_date=resolved_date,
                         slot_obj=slot_obj,
+                        include_controller=key not in notifications_by_key,
                     )
-                    unit_total = float(pricing.get("final_amount") or 0.0)
+                    unit_total = float(calculate_gst_breakdown(
+                        vendor_id, float(pricing.get("final_amount") or 0.0))["total_with_tax"])
                 else:
                     unit_total = float(booking.single_slot_price or 0.0)
                 
@@ -8861,9 +8913,6 @@ def get_pending_pay_at_cafe_bookings(vendor_id):
                         time_slot = "N/A"
                 else:
                     time_slot = "N/A"
-
-                batch_id = details.get("batch_id")
-                key = str(batch_id) if batch_id else f"booking:{booking.bookingId}"
 
                 if key not in notifications_by_key:
                     notifications_by_key[key] = {
@@ -9144,6 +9193,7 @@ def accept_pay_at_cafe_booking():
 
         accepted_booking_ids = []
         event_payloads = []
+        controller_charged = False
         for booking_row in bookings_to_accept:
             available_game = AvailableGame.query.filter_by(id=booking_row.game_id).first()
             if not available_game or available_game.vendor_id != vendor_id:
@@ -9171,13 +9221,19 @@ def accept_pay_at_cafe_booking():
                 updated_details,
                 booking_date=booked_date,
                 slot_obj=slot_obj,
+                include_controller=not controller_charged,
             )
+            if float(pricing.get("controller_amount") or 0.0) > 0:
+                controller_charged = True
             base_amount = float(pricing.get("base_amount") or 0.0)
             discount_amount = float(pricing.get("discounted_amount") or 0.0)
             final_amount = float(pricing.get("final_amount") or 0.0)
             controller_amount = float(pricing.get("controller_amount") or 0.0)
             controller_qty = int(pricing.get("controller_qty") or 0)
             app_fee_amount = resolve_app_fee_amount(final_amount, data, source_channel="app")
+            # GST exactly as desk bookings store it: amount stays pre-tax and the
+            # bill (payment summary) uses total_with_tax.
+            gst = calculate_gst_breakdown(vendor_id, final_amount)
 
             updated_details["pricing_mode"] = pricing.get("pricing_mode")
             updated_details["console_group"] = pricing.get("console_group")
@@ -9223,6 +9279,12 @@ def accept_pay_at_cafe_booking():
                 controller_amount=controller_amount,
                 waive_off_amount=discount_amount,
                 app_fee_amount=float(app_fee_amount or 0.0),
+                taxable_amount=gst["taxable_amount"],
+                gst_rate=gst["gst_rate"],
+                cgst_amount=gst["cgst_amount"],
+                sgst_amount=gst["sgst_amount"],
+                igst_amount=gst["igst_amount"],
+                total_with_tax=gst["total_with_tax"],
             )
             db.session.add(transaction)
             db.session.flush()
@@ -9266,9 +9328,9 @@ def accept_pay_at_cafe_booking():
                         "booking_id": booking_row.id,
                         "slot_time": f"{slot_obj.start_time} - {slot_obj.end_time}"
                     }],
-                    price_paid=final_amount,
+                    price_paid=float(gst["total_with_tax"]),
                     app_fee_amount=float(app_fee_amount or 0.0),
-                    net_total=max(float(final_amount or 0.0) - float(app_fee_amount or 0.0), 0.0),
+                    net_total=max(float(gst["total_with_tax"] or 0.0) - float(app_fee_amount or 0.0), 0.0),
                 )
 
         current_app.logger.info(
@@ -11070,6 +11132,32 @@ def get_time_wallet(vendor_id, user_id):
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+NON_GAMING_BOOKING_TYPES = {"extra", "additional_meals", "extra_controller", "settlement_waive_off"}
+VOID_SETTLEMENTS = {"cancelled", "canceled", "refunded", "reversed", "rejected"}
+
+
+def paid_gaming_amount(lines):
+    """What a booking's gaming time actually cost the gamer, or None with no gaming line.
+
+    lines: the booking's transactions as dicts. Only the slot lines count
+    (not extra time, food, controllers or a bill-wide waiver), net of their
+    food/controller share, so squad pricing, squad discount, rate card,
+    staff waive-off, voucher and passes (Rs 0) are all already applied.
+    """
+    total, found = Decimal("0"), False
+    for line in lines or []:
+        kind = str(line.get("booking_type") or "").strip().lower()
+        if kind in NON_GAMING_BOOKING_TYPES:
+            continue
+        if str(line.get("settlement_status") or "").strip().lower() in VOID_SETTLEMENTS:
+            continue
+        found = True
+        amount = Decimal(str(line.get("amount") or 0))
+        amount -= Decimal(str(line.get("meals_amount") or 0)) + Decimal(str(line.get("controller_amount") or 0))
+        total += max(amount, Decimal("0"))
+    return float(total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)) if found else None
+
+
 @booking_blueprint.route('/vendor/<int:vendor_id>/time-wallet/credit-unused', methods=['POST'])
 def credit_unused_slots_to_wallet(vendor_id):
     """
@@ -11110,7 +11198,21 @@ def credit_unused_slots_to_wallet(vendor_id):
                 continue
 
             booked_date = resolve_booking_booked_date(booking)
-            slot_amount = float(get_effective_price_for_schedule(vendor_id, game, booked_date, slot))
+            paid_lines = (
+                Transaction.query
+                .filter(Transaction.booking_id == booking.id, Transaction.vendor_id == vendor_id)
+                .all()
+            )
+            slot_amount = paid_gaming_amount([{
+                "booking_type": tx.booking_type,
+                "settlement_status": tx.settlement_status,
+                "amount": tx.amount,
+                "meals_amount": tx.meals_amount,
+                "controller_amount": tx.controller_amount,
+            } for tx in paid_lines])
+            if slot_amount is None:
+                # No booking transaction to read (legacy rows): the scheduled price.
+                slot_amount = float(get_effective_price_for_schedule(vendor_id, game, booked_date, slot))
             account.balance_minutes = int(account.balance_minutes or 0) + slot_minutes
             account.balance_amount = float(account.balance_amount or 0) + slot_amount
             credited_minutes += slot_minutes

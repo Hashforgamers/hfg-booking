@@ -32,7 +32,8 @@ def test_single_slot_listing_does_not_offer_disabled_capacity(free_capacity):
         load_console_holds=lambda *args: {}, free_console_capacity=lambda *args: free_capacity,
         _load_booking_counts=lambda *args: {}, _expected_blocks_for_date=lambda *args: None,
         sync_game_capacity=lambda *args: 3, _load_qr_held_units=lambda *args: {},
-        _repair_leaked_capacity=lambda vendor, slot, day, raw, floor: raw)
+        _repair_leaked_capacity=lambda vendor, slot, day, raw, floor: raw,
+        _slot_price_lookup=lambda *args: (lambda game, base, *rest: base))
     compile_functions('controllers/slot_controller.py', {'get_slots_on_game_id','_prefer_slot_candidate'}, scope)
     response, status = scope['get_slots_on_game_id'](1,2,'20261102')
     assert status == 200, response.json
@@ -93,6 +94,7 @@ def test_batch_listing_does_not_offer_disabled_capacity():
              AvailableGame=SimpleNamespace(query=game_query,id=Mock(),vendor_id=Mock()),
              sync_game_capacity=lambda *args:3,_load_qr_held_units=lambda *args:{},
              _repair_leaked_capacity=lambda vendor,slot,day,raw,floor:raw,
+             _slot_price_lookup=lambda *args:(lambda game,base,*rest:base),
              time=SimpleNamespace(time=lambda:1,perf_counter=lambda:1),
              _slots_batch_cache_lock=threading.Lock(),_slots_batch_cache={},SLOTS_BATCH_CACHE_TTL_SEC=0,
              _ensure_slots_for_date=lambda *args:None,_force_slot_refresh=lambda:True,

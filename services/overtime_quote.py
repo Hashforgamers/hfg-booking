@@ -108,6 +108,19 @@ def load_rate_cards(session, vendor_id, game_id):
     return mode, [dict(c) for c in cards]
 
 
+def load_offers(session, vendor_id, game_id, start, end):
+    """Active console offers that overlap start..end (naive IST)."""
+    from types import SimpleNamespace
+    try:
+        rows = session.execute(text("""SELECT start_date,start_time,end_date,end_time,offered_price,is_active
+            FROM console_pricing_offers WHERE vendor_id=:v AND available_game_id=:g AND is_active=true
+              AND start_date <= :last AND end_date >= :first"""),
+            {"v": vendor_id, "g": game_id, "first": start.date(), "last": end.date()}).mappings().all()
+        return [SimpleNamespace(**dict(r)) for r in rows]
+    except Exception:
+        return []
+
+
 def booking_players(booking):
     details = booking.squad_details if isinstance(getattr(booking, "squad_details", None), dict) else {}
     try:
@@ -179,11 +192,24 @@ def quote(session, vendor_id, booking, console_id=None, played_until=None, now=N
         overtime_until = max(end, played_until)
     seconds = max(0, int((overtime_until - end).total_seconds()))
 
-    recorded = float(session.execute(text("""SELECT COALESCE(SUM(COALESCE(base_amount,amount)),0)
+    # What earlier overtime lines billed for the whole squad, before any waiver
+    # (a waived rupee must not be billed again at the next check out).
+    recorded = float(session.execute(text("""SELECT COALESCE(SUM(COALESCE(original_amount,base_amount,amount)),0)
         FROM transactions WHERE booking_id=:bid AND booking_type='extra'
           AND COALESCE(settlement_status,'') NOT IN ('cancelled','canceled','refunded','reversed')"""),
         {"bid": booking.id}).scalar() or 0)
-    gross = price_overtime(seconds, hourly)
+    offers = load_offers(session, vendor_id, booking.game_id, end, end + timedelta(seconds=seconds)) if seconds else []
+    if offers:
+        # An offer running during the extra time lowers it, the same lowest
+        # price rule slot bookings use (IST wall clock, offer must cover the
+        # minutes it discounts). Same whole-rupee round-up as before.
+        from services.pricing_math import interval_amount
+        slot_seconds = 3600 if (RATE_BASIS == "hour" or not own_seconds) else own_seconds
+        exact = interval_amount(game.single_slot_price, offers, end, end + timedelta(seconds=seconds), slot_seconds)
+        gross = float(math.ceil(exact)) if exact > 0 else 0.0
+        hourly = gross * 3600.0 / seconds
+    else:
+        gross = price_overtime(seconds, hourly)
     multiplier = max(1, int(squad_multiplier or 1))
     card_price, card, players = rate_card_price(session, vendor_id, booking, console_id,
                                                 booked_seconds, own_seconds, seconds)
@@ -196,6 +222,15 @@ def quote(session, vendor_id, booking, console_id=None, played_until=None, now=N
         gross = card_price
         if seconds:
             hourly = gross * 3600.0 / seconds
+    else:
+        # Price the whole squad here, like the rate card does. Earlier lines in
+        # `recorded` are whole-squad amounts, so subtracting them from a
+        # per-player gross under-charged the next check out (PC squad of 3 at
+        # Rs 60/h: 1h over with Rs 90 already billed came out as Rs 0, not
+        # Rs 90), and the desk showed the per-player figure while /extraBooking
+        # charged three times it.
+        gross = gross * multiplier
+        hourly = hourly * multiplier
     return {
         "booking_id": booking.id,
         "scheduled_end": end.isoformat(),
@@ -210,8 +245,10 @@ def quote(session, vendor_id, booking, console_id=None, played_until=None, now=N
         "rate_card": epp_summary(card) if source == "rate_card" else None,
         "booked_minutes": round(booked_seconds / 60.0, 2),
         "players": players,
-        # A rate-card amount is already the whole squad's price.
-        "amount_covers_squad": source == "rate_card",
+        "squad_multiplier": multiplier,
+        # amount is the whole squad's price (rate card, or slot rate x squad
+        # multiplier), so /extraBooking must not multiply it again.
+        "amount_covers_squad": source == "rate_card" or multiplier > 1,
         "needs_end_time": played_until is None and seconds > STALE_OVERTIME_SECONDS,
         "stale_after_seconds": STALE_OVERTIME_SECONDS,
         "server_time": now.isoformat(),
