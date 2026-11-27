@@ -89,6 +89,16 @@ def window_price(vendor_id, game, plan, occurrences, settings, players, squad, d
     slot = SimpleNamespace(id=plan.base.slot_id, start_time=plan.base.start.time(), end_time=plan.base.end.time())
     slot_price = get_effective_price_for_schedule(vendor_id, game, plan.base.day, slot) or 0
     slot_minutes = ft.minutes_between(plan.base.start, plan.base.end) or ft.typical_slot_minutes(occurrences)
+    # A window crossing into slots with another price (an offer on one of them)
+    # pays each slot's own rate for its minutes, not the base slot's rate throughout.
+    priced = [(item.start, item.end, slot_price if item.key() == plan.base.key() else
+               (get_effective_price_for_schedule(vendor_id, game, item.day, SimpleNamespace(
+                   id=item.slot_id, start_time=item.start.time(), end_time=item.end.time())) or 0))
+              for item in plan.consumed]
+    if len({Decimal(str(price)) for _, _, price in priced}) > 1:
+        blended = ft.blended_slot_price(plan.start, plan.end, priced, slot_minutes)
+        if blended is not None:
+            slot_price = blended
     step = settings["step_minutes"]
     def fallback(total):
         return ft.fallback_price(total, slot_price, slot_minutes, step) if total else Decimal("0")

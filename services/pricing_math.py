@@ -84,3 +84,30 @@ def session_amount(base, slots, offers, start, minutes):
     if cursor != end:
         raise ValueError('Console schedule does not cover this session')
     return int((total * 100).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+
+
+def interval_amount(base, offers, start, end, slot_seconds):
+    """Price of play from start to end (naive IST) at `base` per `slot_seconds`,
+    lowered wherever an active offer covers the time.
+
+    For extra time with no slot grid to follow: the stretch is cut at offer
+    edges and each piece pays the lowest offer covering all of it (same
+    lowest-price, capped-by-base rule as effective_price). Returns a Decimal
+    in rupees, unrounded; callers keep their own rounding.
+    """
+    if end <= start or not slot_seconds:
+        return Decimal('0')
+    edges = {start, end}
+    for offer in offers or []:
+        if not getattr(offer, 'is_active', True):
+            continue
+        left, right = offer_window(offer)
+        for edge in (left, right):
+            if start < edge < end:
+                edges.add(edge)
+    points = sorted(edges)
+    total = Decimal('0')
+    for left, right in zip(points, points[1:]):
+        price = effective_price(base, offers or [], left, right)
+        total += price * Decimal(str((right - left).total_seconds())) / Decimal(str(slot_seconds))
+    return total

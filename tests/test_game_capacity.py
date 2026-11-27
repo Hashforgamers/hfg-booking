@@ -34,7 +34,7 @@ def listing_scope(raw, total, booked=None, qr=None, repaired=None):
         load_console_holds=lambda *args: {}, free_console_capacity=lambda *args: 99,
         _load_booking_counts=lambda *args: booked or {}, _expected_blocks_for_date=lambda *args: None,
         sync_game_capacity=lambda *args: total, _load_qr_held_units=lambda *args: qr or {},
-        _repair_leaked_capacity=repair)
+        _repair_leaked_capacity=repair, _slot_price_lookup=lambda *args: (lambda game, base, *rest: base))
 
 
 def test_eleven_pcs_are_sold_even_when_rows_were_seeded_for_four():

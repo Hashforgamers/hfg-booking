@@ -115,3 +115,42 @@ def rates_for_game(definitions, selected_game):
     key = game_rate_key(selected_game)
     special = [d for d in definitions if key and game_rate_key(d.get('game_variant', '')) == key]
     return special or [d for d in definitions if not game_rate_key(d.get('game_variant', ''))]
+
+
+def default_variant_slot_price(definitions, slot_minutes, players=1, max_minutes=720):
+    """Per-slot price of a variant-priced device for channels that add up slot prices.
+
+    "Default variant" = what the desk preselects when staff pick nothing
+    (hash-dashboard desk-rate-card.tsx resolveSessionRate): the cheapest active
+    standard card (no game-title override) that prices the session. There is no
+    explicit default flag in desk_rate_cards.
+
+    The app and website add up per-slot prices while the desk prices the whole
+    session once, so a slot price is returned only when that is the same thing:
+    for every run of k slots (up to max_minutes) the cheapest card costs exactly
+    k x the one-slot price. Duration tiers or fixed packages break that, and the
+    caller then keeps the slot price (returns None).
+    """
+    from decimal import Decimal as D
+    standard = [d for d in definitions or [] if not game_rate_key(str(d.get('game_variant') or ''))]
+    slot_minutes = int(slot_minutes or 0)
+    if not standard or slot_minutes <= 0:
+        return None
+
+    def cheapest(minutes):
+        prices = []
+        for definition in standard:
+            try:
+                prices.append(quote(definition, minutes, players))
+            except (ValueError, KeyError, TypeError):
+                continue
+        return min(prices) if prices else None
+
+    unit = cheapest(slot_minutes)
+    if unit is None:
+        return None
+    for k in range(2, max(1, int(max_minutes) // slot_minutes) + 1):
+        price = cheapest(k * slot_minutes)
+        if price is not None and price != unit * k:
+            return None
+    return D(unit)
