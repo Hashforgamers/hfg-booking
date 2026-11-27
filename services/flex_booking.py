@@ -193,6 +193,43 @@ def stations(vendor_id, game_id, plan, now, exclude_booking_ids=(), consoles=Non
     return ft.evaluate_consoles(consoles, busy, plan)
 
 
+def unassigned_units(vendor_id, game_id, start, end, now=None, exclude_booking_ids=()):
+    """Most stations needed at once, inside [start, end), by upcoming bookings with no station yet.
+
+    Those bookings already hold their slot units; this keeps a station free for
+    each of them when another booking picks a station ("assign at start").
+    A gamer's back-to-back slot rows never overlap, so they count once.
+    """
+    from services.slot_capacity import booking_units
+    now = now or datetime.now(ft.IST).replace(tzinfo=None)
+    rows = db.session.execute(text(f"""SELECT d.book_id,d.date,d.start_time,d.end_time,b.squad_details
+        FROM VENDOR_{int(vendor_id)}_DASHBOARD d LEFT JOIN bookings b ON b.id=d.book_id
+        WHERE d.game_id=:g AND d.book_status='upcoming' AND COALESCE(d.console_id,-1)<=0
+          AND d.date BETWEEN :a AND :b"""),
+        {"g": int(game_id), "a": start.date() - timedelta(days=1), "b": end.date()}).mappings().all()
+    excluded = {int(b) for b in exclude_booking_ids}
+    events = []
+    for row in rows:
+        if row["book_id"] is None or int(row["book_id"]) in excluded or row["date"] is None:
+            continue
+        if row["start_time"] is None or row["end_time"] is None:
+            continue
+        details = row["squad_details"] if isinstance(row["squad_details"], dict) else {}
+        if _ids(details.get("assigned_console_ids")) - _ids(details.get("released_console_ids")):
+            continue
+        left, right = ft.slot_window(row["date"], row["start_time"], row["end_time"])
+        left, right = max(left, start, now), min(right, end)
+        if right <= left:
+            continue
+        units = booking_units(details) or 1
+        events += [(left, units), (right, -units)]
+    peak = current = 0
+    for _, delta in sorted(events, key=lambda e: (e[0], e[1])):
+        current += delta
+        peak = max(peak, current)
+    return peak
+
+
 def pick_consoles(vendor_id, game_id, plan, quantity, requested=None, now=None, exclude_booking_ids=()):
     """Lock and choose ``quantity`` stations free for the whole window."""
     now = now or datetime.now(ft.IST).replace(tzinfo=None)
@@ -202,17 +239,38 @@ def pick_consoles(vendor_id, game_id, plan, quantity, requested=None, now=None, 
     lock_consoles(vendor_id, [c["id"] for c in consoles])
     evaluated = stations(vendor_id, game_id, plan, now, exclude_booking_ids, consoles)
     free = [s["console_id"] for s in evaluated if s["available"]]
+    held = unassigned_units(vendor_id, game_id, plan.start, plan.end, now, exclude_booking_ids)
     if requested:
         ids = [int(c) for c in requested]
         if len(ids) != quantity or len(set(ids)) != quantity or any(c not in free for c in ids):
             raise FlexError("The chosen station is busy during this window. Refresh and pick a free station.",
                             409, "station_busy", stations=evaluated)
+        if len(free) - held < quantity:
+            raise FlexError("Every free station is held for bookings that get their station at start.",
+                            409, "station_held", stations=evaluated)
         return ids, evaluated
-    if len(free) < quantity:
+    if len(free) - held < quantity:
+        best = max((s["max_minutes_available"] for s in evaluated), default=0)
+        message = ("No station is free for the whole window." if len(free) < quantity else
+                   "Every free station is held for bookings that get their station at start.")
+        raise FlexError(message, 409, "station_busy", stations=evaluated, max_minutes=best)
+    return free[:quantity], evaluated
+
+
+def check_capacity(vendor_id, game_id, plan, quantity, now=None):
+    """Assign-later flex booking: enough stations stay free for it, but none is picked yet."""
+    now = now or datetime.now(ft.IST).replace(tzinfo=None)
+    consoles = game_consoles(vendor_id, game_id)
+    if not consoles:
+        raise FlexError("No working stations are linked to this device type.", 409, "no_station")
+    lock_consoles(vendor_id, [c["id"] for c in consoles])
+    evaluated = stations(vendor_id, game_id, plan, now, (), consoles)
+    free = sum(1 for s in evaluated if s["available"])
+    if free - unassigned_units(vendor_id, game_id, plan.start, plan.end, now) < quantity:
         best = max((s["max_minutes_available"] for s in evaluated), default=0)
         raise FlexError("No station is free for the whole window.", 409, "station_busy",
                         stations=evaluated, max_minutes=best)
-    return free[:quantity], evaluated
+    return evaluated
 
 
 def hold_extra(vendor_id, booking_id, occurrences, units):

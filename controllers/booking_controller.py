@@ -5066,11 +5066,14 @@ def new_booking(vendor_id):
         collect_after_session = desk_mode in {"pay_at_cafe", "pay_in_cafe"}
         if collect_after_session:
             payment_type = "pay_at_cafe"
-        if desk_mode not in {'cash', 'card', 'upi', 'pay_at_cafe', 'pay_in_cafe', 'pass', 'monthly_credit'}:
+        if desk_mode not in {'cash', 'card', 'upi', 'pay_at_cafe', 'pay_in_cafe', 'pass', 'monthly_credit', 'cafe_wallet'}:
             return jsonify(message='Unsupported desk payment method. Use verified app checkout for wallets or gateway.'), 400
         from services.payment_methods import require_method
         if desk_mode in {'cash', 'card', 'upi', 'pay_at_cafe', 'pay_in_cafe'}:
             require_method(vendor_id, 'pay_at_cafe')
+        elif desk_mode == 'cafe_wallet':
+            # Gamer credit kept at this cafe (e.g. unused time returned on early release).
+            require_method(vendor_id, 'cafe_wallet')
         elif desk_mode in {'wallet', 'hash_wallet'}:
             require_method(vendor_id, 'hash_wallet')
 
@@ -5078,7 +5081,12 @@ def new_booking(vendor_id):
         is_rapid_booking = data.get("isRapidBooking")
         booking_type = data.get("bookingType") or "direct"
         user_id = data.get("userId")
-        waive_off_total = float(data.get("waiveOffAmount", 0.0))
+        # Only a discount staff typed. The server never adds a time-based waive-off
+        # (a session's price covers exactly its own minutes), and it cannot be negative.
+        waive_off_total = max(0.0, float(data.get("waiveOffAmount", 0.0) or 0.0))
+        # Station now or at start: assignLater books the device type (slot units)
+        # without a station; staff pick a free one when the session starts.
+        assign_later = data.get("assignLater") is True
         extra_controller_fare = 0.0  # Always calculated from server pricing.
         try:
             raw_controller_qty = data.get("extraControllerQty", 0)
@@ -5534,9 +5542,13 @@ def new_booking(vendor_id):
                     requested_consoles = [int(flex_previous["console_id"])]
                 if not requested_consoles and is_rapid_booking and console_id not in (None, ""):
                     requested_consoles = [int(console_id)]
-                flex_console_ids, _ = flex_booking.pick_consoles(
-                    vendor_id, available_game.id, flex_plan, slot_units_required, requested_consoles,
-                    exclude_booking_ids=[flex_previous["book_id"]] if flex_previous else ())
+                flex_now = datetime.now(IST).replace(tzinfo=None)
+                if assign_later and not requested_consoles and not flex_previous and flex_plan.start > flex_now:
+                    flex_booking.check_capacity(vendor_id, available_game.id, flex_plan, slot_units_required)
+                else:
+                    flex_console_ids, _ = flex_booking.pick_consoles(
+                        vendor_id, available_game.id, flex_plan, slot_units_required, requested_consoles,
+                        exclude_booking_ids=[flex_previous["book_id"]] if flex_previous else ())
 
         # ✅ MODIFIED: Use BookingService.create_booking with booking_mode
         bookings = []
@@ -5758,18 +5770,40 @@ def new_booking(vendor_id):
             if round(float(data.get("deskSubtotal", -1)) * 100) != expected:
                 raise ValueError("The desk rate changed. Refresh and review the new price.")
         if selected_desk_card:
-            from services.desk_consoles import reserve as reserve_desk_consoles, windows as desk_windows
+            from services.desk_consoles import reserve as reserve_desk_consoles, windows as desk_windows, available as desk_available
             quantity = int(normalized_squad_details.get("player_count",1)) if squad_enabled and uses_multi_slot_units else 1
             desk_spans = [(flex_plan.start, flex_plan.end)] if flex_plan else desk_windows(booked_date_obj,runtime_slot_map.values())
-            desk_console_ids = reserve_desk_consoles(vendor_id,available_game.id,selected_desk_card["definition"],
-                desk_spans,quantity,data.get("deskConsoleIds") or data.get("flexConsoleIds"))
+            desk_now = datetime.now(IST).replace(tzinfo=None)
+            requested_desk = data.get("deskConsoleIds") or data.get("flexConsoleIds")
+            if assign_later and not requested_desk and min(start for start, _ in desk_spans) > desk_now:
+                # Hold the device type only; the start dialog offers this rate card's free consoles.
+                if len(desk_available(vendor_id,available_game.id,selected_desk_card["definition"],desk_spans,lock=True)) < quantity:
+                    raise ValueError('The selected consoles are unavailable or incompatible. Refresh and choose available consoles.')
+                pool = [int(c) for c in selected_desk_card["definition"].get("console_ids", [])]
+                if squad_enabled:
+                    normalized_squad_details["desk_console_pool"] = pool
+                for booking in bookings:
+                    details = dict(booking.squad_details or {})
+                    details["desk_console_pool"] = pool
+                    booking.squad_details = details
+            else:
+                desk_console_ids = reserve_desk_consoles(vendor_id,available_game.id,selected_desk_card["definition"],
+                    desk_spans,quantity,requested_desk)
+                for booking in bookings:
+                    details = dict(booking.squad_details or {})
+                    details["desk_console_ids"] = desk_console_ids
+                    details["assigned_console_ids"] = desk_console_ids
+                    booking.squad_details = details
+        if assign_later:
+            if squad_enabled:
+                normalized_squad_details["assign_later"] = True
             for booking in bookings:
                 details = dict(booking.squad_details or {})
-                details["desk_console_ids"] = desk_console_ids
-                details["assigned_console_ids"] = desk_console_ids
+                details["assign_later"] = True
                 booking.squad_details = details
         if flex_plan and not selected_desk_card:
-            # A flex window holds its stations from creation, like a linked desk rate.
+            # A flex window holds its stations from creation, like a linked desk rate
+            # (none yet when staff chose to assign the station at start).
             desk_console_ids = list(flex_console_ids)
             if squad_enabled:
                 normalized_squad_details["assigned_console_ids"] = desk_console_ids
@@ -5860,6 +5894,8 @@ def new_booking(vendor_id):
         actor = resolve_transaction_actor(request, default_source="dashboard")
         payment_use_case = normalize_payment_use_case(payment_type, actor["source_channel"])
         settlement_status = resolve_settlement_status(payment_use_case)
+        if desk_mode == 'cafe_wallet':
+            settlement_status = "completed"  # debited from the gamer's cafe wallet below
         credit_account = None
         if payment_use_case == "monthly_credit":
             credit_account = MonthlyCreditAccount.query.filter_by(
@@ -5903,6 +5939,9 @@ def new_booking(vendor_id):
                 payment_use_case = 'hash_global_pass' if desk_pass.cafe_pass.vendor_id is None else 'cafe_specific_pass'
             elif desk_mode in {'wallet', 'hash_wallet'} and final_amount > 0:
                 BookingService.debit_wallet(user.id, booking.id, final_amount)
+            elif desk_mode == 'cafe_wallet' and final_amount > 0:
+                from services.cafe_booking_wallet import move as cafe_wallet_move
+                cafe_wallet_move(vendor_id, user.id, booking.id, final_amount)
 
             gst = calculate_gst_breakdown(vendor_id, final_amount)
             app_fee_amount = resolve_app_fee_amount(
@@ -5969,6 +6008,9 @@ def new_booking(vendor_id):
 
         # Handle extra controller fare
         if extra_controller_fare > 0:
+            if desk_mode == 'cafe_wallet':
+                from services.cafe_booking_wallet import move as cafe_wallet_move
+                cafe_wallet_move(vendor_id, user.id, bookings[0].id, extra_controller_fare, component='controller')
             gst = calculate_gst_breakdown(vendor_id, extra_controller_fare)
             app_fee_amount = resolve_app_fee_amount(
                 extra_controller_fare,
@@ -11132,7 +11174,8 @@ def get_time_wallet(vendor_id, user_id):
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-NON_GAMING_BOOKING_TYPES = {"extra", "additional_meals", "extra_controller", "settlement_waive_off"}
+NON_GAMING_BOOKING_TYPES = {"extra", "additional_meals", "extra_controller", "settlement_waive_off",
+                            "early_release_credit", "early_release_refund"}
 VOID_SETTLEMENTS = {"cancelled", "canceled", "refunded", "reversed", "rejected"}
 
 

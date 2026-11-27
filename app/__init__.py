@@ -103,6 +103,8 @@ def create_app():
     app.register_blueprint(cafe_checkout_blueprint, url_prefix='/api')
     from controllers.flex_booking_controller import flex_blueprint
     app.register_blueprint(flex_blueprint, url_prefix='/api')
+    from controllers.early_release_controller import early_release_blueprint
+    app.register_blueprint(early_release_blueprint, url_prefix='/api')
     from services.cafe_payment_policy import enforce_cafe_payment_policy
     app.before_request(enforce_cafe_payment_policy)
 
