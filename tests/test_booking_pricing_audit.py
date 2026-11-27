@@ -203,3 +203,29 @@ def test_overnight_slot_minutes():
                               dict(datetime=datetime, timedelta=timedelta, Slot=object))
     assert scope['calculate_slot_minutes'](SimpleNamespace(start_time=clock_time(23, 30), end_time=clock_time(0, 30))) == 60
     assert scope['calculate_slot_minutes'](SimpleNamespace(start_time=clock_time(10), end_time=clock_time(11))) == 60
+
+
+# ---- 8. time-wallet credit is what the gamer paid --------------------------------------
+
+def paid_helper():
+    from decimal import ROUND_HALF_UP
+    src = (ROOT / 'controllers/booking_controller.py').read_text()
+    scope = dict(Decimal=Decimal, ROUND_HALF_UP=ROUND_HALF_UP)
+    exec(src.split('NON_GAMING_BOOKING_TYPES = ', 1)[1].split('VOID_SETTLEMENTS', 1)[0].join(['NON_GAMING_BOOKING_TYPES = ', '']), scope)
+    exec('VOID_SETTLEMENTS = ' + src.split('VOID_SETTLEMENTS = ', 1)[1].split('\n', 1)[0], scope)
+    return compile_functions('controllers/booking_controller.py', {'paid_gaming_amount'}, scope)['paid_gaming_amount']
+
+
+def test_time_wallet_credit_uses_the_paid_slot_amount():
+    paid = paid_helper()
+    # PC squad of 3 at Rs 60 with 10% squad discount + Rs 50 food share: slot line paid Rs 212.
+    lines = [dict(booking_type='direct', settlement_status='completed', amount=212, meals_amount=50),
+             dict(booking_type='extra', settlement_status='completed', amount=90),
+             dict(booking_type='additional_meals', settlement_status='pending', amount=40),
+             dict(booking_type='extra_controller', settlement_status='paid', amount=60),
+             dict(booking_type='settlement_waive_off', settlement_status='completed', amount=-20)]
+    assert paid(lines) == 162.0          # not the Rs 60 slot price
+    assert paid([dict(booking_type='pay_at_cafe', amount=160, controller_amount=60)]) == 100.0
+    assert paid([dict(booking_type='direct', amount=0)]) == 0.0          # pass booking: nothing paid
+    assert paid([dict(booking_type='direct', amount=100, settlement_status='refunded')]) is None
+    assert paid([]) is None

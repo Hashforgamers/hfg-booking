@@ -11113,6 +11113,32 @@ def get_time_wallet(vendor_id, user_id):
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+NON_GAMING_BOOKING_TYPES = {"extra", "additional_meals", "extra_controller", "settlement_waive_off"}
+VOID_SETTLEMENTS = {"cancelled", "canceled", "refunded", "reversed", "rejected"}
+
+
+def paid_gaming_amount(lines):
+    """What a booking's gaming time actually cost the gamer, or None with no gaming line.
+
+    lines: the booking's transactions as dicts. Only the slot lines count
+    (not extra time, food, controllers or a bill-wide waiver), net of their
+    food/controller share, so squad pricing, squad discount, rate card,
+    staff waive-off, voucher and passes (Rs 0) are all already applied.
+    """
+    total, found = Decimal("0"), False
+    for line in lines or []:
+        kind = str(line.get("booking_type") or "").strip().lower()
+        if kind in NON_GAMING_BOOKING_TYPES:
+            continue
+        if str(line.get("settlement_status") or "").strip().lower() in VOID_SETTLEMENTS:
+            continue
+        found = True
+        amount = Decimal(str(line.get("amount") or 0))
+        amount -= Decimal(str(line.get("meals_amount") or 0)) + Decimal(str(line.get("controller_amount") or 0))
+        total += max(amount, Decimal("0"))
+    return float(total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)) if found else None
+
+
 @booking_blueprint.route('/vendor/<int:vendor_id>/time-wallet/credit-unused', methods=['POST'])
 def credit_unused_slots_to_wallet(vendor_id):
     """
@@ -11153,7 +11179,21 @@ def credit_unused_slots_to_wallet(vendor_id):
                 continue
 
             booked_date = resolve_booking_booked_date(booking)
-            slot_amount = float(get_effective_price_for_schedule(vendor_id, game, booked_date, slot))
+            paid_lines = (
+                Transaction.query
+                .filter(Transaction.booking_id == booking.id, Transaction.vendor_id == vendor_id)
+                .all()
+            )
+            slot_amount = paid_gaming_amount([{
+                "booking_type": tx.booking_type,
+                "settlement_status": tx.settlement_status,
+                "amount": tx.amount,
+                "meals_amount": tx.meals_amount,
+                "controller_amount": tx.controller_amount,
+            } for tx in paid_lines])
+            if slot_amount is None:
+                # No booking transaction to read (legacy rows): the scheduled price.
+                slot_amount = float(get_effective_price_for_schedule(vendor_id, game, booked_date, slot))
             account.balance_minutes = int(account.balance_minutes or 0) + slot_minutes
             account.balance_amount = float(account.balance_amount or 0) + slot_amount
             credited_minutes += slot_minutes
